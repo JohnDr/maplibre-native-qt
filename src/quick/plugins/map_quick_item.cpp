@@ -64,6 +64,17 @@ void MapQuickItem::setStyle(const QString &style) {
         return;
     }
     d->m_style = style;
+
+    // Apply immediately when the map already exists. Otherwise the new style
+    // would only take effect on the next launch (initialize() reads m_style).
+    if (d->m_map != nullptr) {
+        if (d->m_styleLoaded) {
+            d->m_styleLoaded = false;
+            emit styleLoadedChanged();
+        }
+        d->m_map->setStyleUrl(style);
+        update();
+    }
 }
 
 double MapQuickItem::zoomLevel() const {

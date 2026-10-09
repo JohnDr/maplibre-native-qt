@@ -19,16 +19,31 @@
 
 #include <QMapLibre/Utils>
 
-// Small QML helper that owns the persisted application scale and can relaunch
-// the process. The scale itself is applied through QT_SCALE_FACTOR before
-// QGuiApplication is constructed, so changing it requires a restart.
-class AppScaleController : public QObject {
+// Small QML helper that owns the persisted application state:
+//   - the application scale (applied through QT_SCALE_FACTOR before
+//     QGuiApplication is constructed, so changing it requires a restart), and
+//   - arbitrary key/value state (window geometry, map camera) backed by
+//     QSettings.
+class AppStateController : public QObject {
     Q_OBJECT
 public:
-    explicit AppScaleController(double appliedScale, QObject *parent = nullptr)
-        : QObject(parent), m_appliedScale(appliedScale) {}
+    AppStateController(double appliedScale, bool explicitScale, QObject *parent = nullptr)
+        : QObject(parent), m_appliedScale(appliedScale), m_explicitScale(explicitScale) {}
 
-    Q_INVOKABLE double appliedScale() const { return m_appliedScale; }
+    [[nodiscard]] Q_INVOKABLE double appliedScale() const { return m_appliedScale; }
+
+    // True when the applied scale was explicitly set (via --scale, a persisted
+    // value or the in-app control), as opposed to the untouched default of 1.0.
+    [[nodiscard]] Q_INVOKABLE bool hasExplicitScale() const { return m_explicitScale; }
+
+    Q_INVOKABLE QVariant value(const QString &key) const {
+        return QSettings().value(key);
+    }
+
+    Q_INVOKABLE void setValue(const QString &key, const QVariant &valueToStore) {
+        QSettings settings;
+        settings.setValue(key, valueToStore);
+    }
 
     Q_INVOKABLE void applyAndRestart(double scale) {
         if (scale <= 0.0) {
@@ -46,6 +61,7 @@ public:
 
 private:
     double m_appliedScale;
+    bool m_explicitScale;
 };
 
 int main(int argc, char *argv[]) {
@@ -56,12 +72,14 @@ int main(int argc, char *argv[]) {
     // Qt reads QT_SCALE_FACTOR (and the high-DPI policy) during its construction.
     // Precedence: --scale <v>  ->  persisted QSettings  ->  leave OS/native scaling.
     double requestedScale = 0.0;
+    bool scaleFromCommandLine = false;
     for (int i = 1; i + 1 < argc; ++i) {
         if (qstrcmp(argv[i], "--scale") == 0) {
             bool ok = false;
             const double value = QString::fromUtf8(argv[i + 1]).toDouble(&ok);
             if (ok && value > 0.0) {
                 requestedScale = value;
+                scaleFromCommandLine = true;
             }
         }
     }
@@ -75,10 +93,15 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+    if (scaleFromCommandLine) {
+        // Explicit command-line request: remember it for future runs.
+        QSettings().setValue(QStringLiteral("ui/scaleFactor"), requestedScale);
+    }
     if (requestedScale > 0.0) {
         qputenv("QT_SCALE_FACTOR", QByteArray::number(requestedScale, 'f', 2));
     }
     const double appliedScale = requestedScale > 0.0 ? requestedScale : 1.0;
+    const bool explicitScale = requestedScale > 0.0;
 
     // Enable verbose logging for debugging
     QLoggingCategory::setFilterRules(
@@ -90,11 +113,6 @@ int main(int argc, char *argv[]) {
     auto graphicsApi = static_cast<QSGRendererInterface::GraphicsApi>(rendererType);
     QQuickWindow::setGraphicsApi(graphicsApi);
 
-    if (rendererType == QMapLibre::Vulkan) {
-        // Enable Vulkan debug output
-        qputenv("QT_VULKAN_DEBUG_OUTPUT", "1");
-    }
-
     const QGuiApplication app(argc, argv);
 
     qDebug() << "Platform:" << QGuiApplication::platformName();
@@ -102,11 +120,11 @@ int main(int argc, char *argv[]) {
     qDebug() << "Renderer Type:" << rendererType;
     qDebug() << "Application scale:" << appliedScale;
 
-    AppScaleController appScale(appliedScale);
+    AppStateController appState(appliedScale, explicitScale);
 
     // Check if location services are available
     QQmlApplicationEngine engine;
-    engine.rootContext()->setContextProperty(QStringLiteral("appScale"), &appScale);
+    engine.rootContext()->setContextProperty(QStringLiteral("appState"), &appState);
 
     qDebug() << "Starting QML engine...";
 

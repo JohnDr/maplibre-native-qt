@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Quick REQUIRED)
+find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 REQUIRED)
 qt_standard_project_setup()
 
 if(QT_KNOWN_POLICY_QTP0002)
@@ -41,6 +41,7 @@ target_link_libraries(
     QMapLibreExampleQuickStandalone
     PRIVATE
         Qt::Quick
+        Qt::QuickControls2
         QMapLibre::Core
 )
 
