@@ -32,6 +32,21 @@ Window {
     property bool globe3D: false
     readonly property real tilt3DPitch: 60
 
+    // 3D buildings opacity: Liberty's "building-3d" layer is 0.8 by default.
+    property bool buildingsOpaque: false
+    // The 3D-buildings opacity override only applies to styles that actually
+    // contain a "building-3d" fill-extrusion layer (the OpenFreeMap styles).
+    // It is added/removed dynamically so styles without it (e.g. Open Waters)
+    // don't log "Unable to add layer building-3d" / "Layer not found".
+    property var buildingLayerParam: null
+
+    // True while any modal dialog is open. The map's gesture handlers are
+    // disabled then, so touch is handled by the dialog (otherwise dragging a
+    // list inside a dialog scrolled the map behind it).
+    readonly property bool dialogOpen:
+        presetsDialog.visible || settingsDialog.visible || mapDialog.visible
+        || nameDialog.visible || addMapDialog.visible
+
     // ---- Camera presets ---------------------------------------------------------
     // Each entry: { name: string, center: [lat, lon], zoom: real, globe3D: bool }
     property var presets: []
@@ -46,7 +61,7 @@ Window {
         { "name": "Liberty (OSM)", "url": "https://tiles.openfreemap.org/styles/liberty" },
         { "name": "Bright (OSM)", "url": "https://tiles.openfreemap.org/styles/bright" },
         { "name": "Positron (OSM)", "url": "https://tiles.openfreemap.org/styles/positron" },
-        { "name": "MapLibre Demo", "url": "https://demotiles.maplibre.org/style.json" }
+        { "name": "Open Waters", "url": "https://tiles.openwaters.io/seamap/style.json" }
     ]
 
     // QSettings returns stored booleans as strings ("true"/"false").
@@ -92,6 +107,29 @@ Window {
     // Zoom in/out buttons (anchored at the map centre).
     function zoomBy(steps) {
         map.scale(Math.pow(2, steps), Qt.point(map.width / 2, map.height / 2));
+    }
+
+    // Adds the 3D-buildings opacity override for styles that have the layer,
+    // removes it otherwise.
+    function syncBuildingOverride() {
+        const supported = window.styleUrl.indexOf("openfreemap.org") !== -1;
+        if (supported && window.buildingLayerParam === null) {
+            window.buildingLayerParam = buildingLayerComponent.createObject(map);
+            map.addStyleParameter(window.buildingLayerParam);
+        } else if (!supported && window.buildingLayerParam !== null) {
+            map.removeStyleParameter(window.buildingLayerParam);
+            window.buildingLayerParam.destroy();
+            window.buildingLayerParam = null;
+        }
+    }
+
+    Component {
+        id: buildingLayerComponent
+        LayerParameter {
+            styleId: "building-3d"
+            type: "fill-extrusion"
+            paint: ({ "fill-extrusion-opacity": window.buildingsOpaque ? 1.0 : 0.8 })
+        }
     }
 
     // ---- Camera presets ---------------------------------------------------------
@@ -168,7 +206,14 @@ Window {
             }
         }
         if (parsed !== null && parsed.length > 0) {
-            mapStyles = parsed;
+            // Migrate the old "MapLibre Demo" (demotiles) entry to Open Waters.
+            mapStyles = parsed.map(function(m) {
+                if (m && m.url === "https://demotiles.maplibre.org/style.json") {
+                    return { "name": "Open Waters", "url": "https://tiles.openwaters.io/seamap/style.json" };
+                }
+                return m;
+            });
+            saveMapStyles();
         } else {
             mapStyles = defaultMapStyles.slice();
             saveMapStyles();
@@ -204,10 +249,13 @@ Window {
 
     // ---- Persisted state --------------------------------------------------------
     function saveState() {
-        appState.setValue("window/width", window.width);
-        appState.setValue("window/height", window.height);
-        appState.setValue("window/x", window.x);
-        appState.setValue("window/y", window.y);
+        // On Android the window is full-screen; don't persist window geometry.
+        if (Qt.platform.os !== "android") {
+            appState.setValue("window/width", window.width);
+            appState.setValue("window/height", window.height);
+            appState.setValue("window/x", window.x);
+            appState.setValue("window/y", window.y);
+        }
         appState.setValue("map/coordinate", map.coordinate);
         appState.setValue("map/zoomLevel", map.zoomLevel);
         appState.setValue("map/globe3D", window.globe3D);
@@ -218,18 +266,22 @@ Window {
     }
 
     function restoreState() {
-        const w = appState.value("window/width");
-        const h = appState.value("window/height");
-        if (w !== undefined && h !== undefined && w > 0 && h > 0) {
-            window.width = w;
-            window.height = h;
-        }
+        // On Android the window is full-screen; don't restore window geometry
+        // (a stale persisted size would leave the map not filling the screen).
+        if (Qt.platform.os !== "android") {
+            const w = appState.value("window/width");
+            const h = appState.value("window/height");
+            if (w !== undefined && h !== undefined && w > 0 && h > 0) {
+                window.width = w;
+                window.height = h;
+            }
 
-        const x = appState.value("window/x");
-        const y = appState.value("window/y");
-        if (x !== undefined && y !== undefined && isOnScreen(x, y, window.width, window.height)) {
-            window.x = x;
-            window.y = y;
+            const x = appState.value("window/x");
+            const y = appState.value("window/y");
+            if (x !== undefined && y !== undefined && isOnScreen(x, y, window.width, window.height)) {
+                window.x = x;
+                window.y = y;
+            }
         }
 
         const coordinate = appState.value("map/coordinate");
@@ -250,6 +302,11 @@ Window {
         const storedStyle = appState.value("map/styleUrl");
         if (storedStyle !== undefined && storedStyle !== null && storedStyle !== "") {
             window.styleUrl = storedStyle;
+        }
+        if (window.styleUrl === "https://demotiles.maplibre.org/style.json") {
+            // follow the MapLibre Demo -> Open Waters change
+            window.styleUrl = "https://tiles.openwaters.io/seamap/style.json";
+            appState.setValue("map/styleUrl", window.styleUrl);
         }
 
         window.darkMode = asBool(appState.value("ui/darkMode"));
@@ -272,8 +329,12 @@ Window {
         return false;
     }
 
-    Component.onCompleted: restoreState()
+    Component.onCompleted: {
+        restoreState();
+        syncBuildingOverride();
+    }
     onClosing: saveState()
+    onStyleUrlChanged: syncBuildingOverride()
 
     // Persist the scale as soon as the user changes it, so it survives an abrupt
     // exit too (the value is applied on the next start). The untouched default
@@ -311,12 +372,16 @@ Window {
         zoomLevel: 4
         coordinate: [59.91, 10.75]
 
+        // The 3D-buildings opacity override is added dynamically in C++/QML via
+        // syncBuildingOverride() (see the Component at the top level).
+
         // Two-finger pinch: zoom about the centroid (the point between the
         // fingers stays put). Scale-only, like the upstream example.
         PinchHandler {
             id: pinch
             target: null
             acceptedDevices: PointerDevice.TouchScreen
+            enabled: !window.dialogOpen
             onScaleChanged: (delta) => {
                 if (delta > 0.25 && delta < 4.0) {
                     map.scale(delta, pinch.centroid.position)
@@ -333,6 +398,7 @@ Window {
             target: null
             minimumPointCount: 1
             maximumPointCount: 1
+            enabled: !window.dialogOpen
             onTranslationChanged: (delta) => {
                 if (Math.abs(delta.x) < 200 && Math.abs(delta.y) < 200) {
                     map.pan(Qt.point(delta.x, delta.y))
@@ -347,6 +413,7 @@ Window {
             target: null
             acceptedButtons: Qt.RightButton
             acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+            enabled: !window.dialogOpen
             onTranslationChanged: (delta) => {
                 map.scale(Math.pow(2.0, -delta.y / 250.0), zoomDrag.centroid.position)
             }
@@ -354,6 +421,7 @@ Window {
 
         WheelHandler {
             id: wheel
+            enabled: !window.dialogOpen
             acceptedDevices: Qt.platform.pluginName === "cocoa" || Qt.platform.pluginName === "wayland"
                             ? PointerDevice.Mouse | PointerDevice.TouchPad
                             : PointerDevice.Mouse
@@ -525,7 +593,7 @@ Window {
         parent: Overlay.overlay
         anchors.centerIn: parent
         modal: true
-        width: 420
+        width: Math.min(420, Overlay.overlay.width - 40)
         title: "Settings"
 
         ColumnLayout {
@@ -584,8 +652,8 @@ Window {
         parent: Overlay.overlay
         anchors.centerIn: parent
         modal: true
-        width: 380
-        height: 440
+        width: Math.min(380, Overlay.overlay.width - 40)
+        height: Math.min(440, Overlay.overlay.height - 40)
         title: "Presets"
 
         ColumnLayout {
@@ -647,7 +715,7 @@ Window {
         parent: Overlay.overlay
         anchors.centerIn: parent
         modal: true
-        width: 320
+        width: Math.min(320, Overlay.overlay.width - 40)
         title: "Add preset"
         standardButtons: Dialog.Ok | Dialog.Cancel
         onOpened: {
@@ -674,8 +742,8 @@ Window {
         parent: Overlay.overlay
         anchors.centerIn: parent
         modal: true
-        width: 440
-        height: 480
+        width: Math.min(440, Overlay.overlay.width - 40)
+        height: Math.min(480, Overlay.overlay.height - 40)
         title: "Maps"
 
         ColumnLayout {
@@ -729,7 +797,7 @@ Window {
         parent: Overlay.overlay
         anchors.centerIn: parent
         modal: true
-        width: 420
+        width: Math.min(420, Overlay.overlay.width - 40)
         title: "Add map"
         standardButtons: Dialog.Ok | Dialog.Cancel
         onOpened: {
@@ -866,6 +934,51 @@ Window {
                 anchors.fill: parent
                 onClicked: window.zoomBy(-1)
             }
+        }
+    }
+
+    // ---- 3D buildings opacity toggle (Material buildings icon) ------------------
+    Rectangle {
+        id: buildingsButton
+        z: 10
+        width: 44
+        height: 44
+        radius: width / 2
+        anchors.top: zoomButtons.bottom
+        anchors.topMargin: 8
+        anchors.right: parent.right
+        anchors.rightMargin: 8
+        color: window.buildingsOpaque ? "#2d7ef7" : "#cc000000"
+
+        Canvas {
+            anchors.centerIn: parent
+            width: 24
+            height: 24
+            onPaint: {
+                const ctx = getContext("2d");
+                ctx.reset();
+                const bx = width * 0.28;
+                const by = height * 0.12;
+                const bw = width * 0.44;
+                const bh = height * 0.76;
+                ctx.strokeStyle = "white";
+                ctx.lineWidth = 2;
+                ctx.lineJoin = "round";
+                ctx.strokeRect(bx, by, bw, bh);
+                ctx.fillStyle = "white";
+                for (let r = 0; r < 3; ++r) {
+                    for (let c = 0; c < 2; ++c) {
+                        ctx.fillRect(bx + bw * (0.22 + c * 0.36),
+                                     by + bh * (0.12 + r * 0.28),
+                                     bw * 0.2, bh * 0.12);
+                    }
+                }
+            }
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: window.buildingsOpaque = !window.buildingsOpaque
         }
     }
 }

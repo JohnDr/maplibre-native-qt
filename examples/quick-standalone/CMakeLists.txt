@@ -87,6 +87,18 @@ elseif(${CMAKE_SYSTEM_NAME} MATCHES "Android")
     include(${android_openssl_SOURCE_DIR}/android_openssl.cmake)
 
     add_android_openssl_libraries(QMapLibreExampleQuickStandalone)
+
+    # Bundle Qt's WebP imageformats plugin, which the Qt CI deployment omits by
+    # default. Without it QImage/QImageReader cannot decode WebP, so WebP raster
+    # tiles fail (e.g. the Open Waters elevation/terrain source).
+    if(DEFINED ENV{QT_ROOT_DIR})
+        set(_qmaplibre_webp_plugin
+            "$ENV{QT_ROOT_DIR}/plugins/imageformats/libplugins_imageformats_qwebp_${ANDROID_ABI}.so")
+        if(EXISTS "${_qmaplibre_webp_plugin}")
+            set_property(TARGET QMapLibreExampleQuickStandalone APPEND PROPERTY
+                QT_ANDROID_EXTRA_LIBS "${_qmaplibre_webp_plugin}")
+        endif()
+    endif()
 endif()
 
 # Packaging
