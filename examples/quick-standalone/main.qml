@@ -311,9 +311,8 @@ Window {
         zoomLevel: 4
         coordinate: [59.91, 10.75]
 
-        // Two-finger pinch: zoom about the centroid. Incremental deltas are
-        // guarded against the one-frame spike that happens when a finger is
-        // added/removed and the centroid jumps between the fingers.
+        // Two-finger pinch: zoom about the centroid (the point between the
+        // fingers stays put). Scale-only, like the upstream example.
         PinchHandler {
             id: pinch
             target: null
@@ -323,23 +322,22 @@ Window {
                     map.scale(delta, pinch.centroid.position)
                 }
             }
+        }
+
+        // Single-finger / left-mouse pan, implemented as a one-point
+        // PinchHandler. Unlike a DragHandler it resets its translation baseline
+        // each time it (re)activates, so when a pinch ends it does not apply a
+        // stale translation to the remaining finger (which made the map jump).
+        PinchHandler {
+            id: panHandler
+            target: null
+            minimumPointCount: 1
+            maximumPointCount: 1
             onTranslationChanged: (delta) => {
-                if (Math.abs(delta.x) < 80 && Math.abs(delta.y) < 80) {
+                if (Math.abs(delta.x) < 200 && Math.abs(delta.y) < 200) {
                     map.pan(Qt.point(delta.x, delta.y))
                 }
             }
-        }
-
-        // Pan with one finger or the left mouse button. maximumPointCount: 1
-        // stops this handler the moment a second finger touches, so it cannot
-        // pan at the same time as the pinch. That simultaneous pan+pinch is what
-        // made a normal two-finger pinch jump (a sequential pinch was fine).
-        DragHandler {
-            id: drag
-            target: null
-            acceptedButtons: Qt.LeftButton
-            maximumPointCount: 1
-            onTranslationChanged: (delta) => map.pan(delta)
         }
 
         // Mouse / trackpad: right drag zooms smoothly toward the cursor.
