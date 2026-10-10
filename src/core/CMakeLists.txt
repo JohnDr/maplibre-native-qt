@@ -7,6 +7,36 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
 endif()
 set(MLN_CORE_PATH "${PROJECT_SOURCE_DIR}/vendor/maplibre-native" CACHE STRING "MapLibre Native Core source path" FORCE)
 
+# Apply downstream patches to the vendored MapLibre Native sources. These add
+# support for newer style-spec properties (icon-overlap/text-overlap,
+# data-driven line-dasharray, color-relief resampling) that upstream does not
+# implement yet. Patches are applied idempotently: a clean checkout gets them
+# applied, an already-patched tree is left untouched.
+find_package(Git QUIET)
+file(GLOB MLN_CORE_PATCHES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/patches/maplibre-native-*.patch")
+if(GIT_FOUND AND MLN_CORE_PATCHES)
+    list(SORT MLN_CORE_PATCHES)
+    foreach(mln_core_patch IN LISTS MLN_CORE_PATCHES)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${mln_core_patch}"
+            WORKING_DIRECTORY "${MLN_CORE_PATH}"
+            RESULT_VARIABLE mln_core_patch_applied
+            OUTPUT_QUIET ERROR_QUIET
+        )
+        if(NOT mln_core_patch_applied EQUAL 0)
+            message(STATUS "Applying MapLibre Native patch: ${mln_core_patch}")
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" apply --whitespace=nowarn "${mln_core_patch}"
+                WORKING_DIRECTORY "${MLN_CORE_PATH}"
+                RESULT_VARIABLE mln_core_patch_result
+            )
+            if(NOT mln_core_patch_result EQUAL 0)
+                message(FATAL_ERROR "Failed to apply MapLibre Native patch: ${mln_core_patch}")
+            endif()
+        endif()
+    endforeach()
+endif()
+
 # Build MapLibre Native Core
 add_subdirectory(
     ${MLN_CORE_PATH}  # Source directory
@@ -217,7 +247,7 @@ install(
 )
 
 install(
-    DIRECTORY ${MLN_CORE_PATH}/include/mbgl
+    DIRECTORY ${MLN_CORE_PATH}/include/mln
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 

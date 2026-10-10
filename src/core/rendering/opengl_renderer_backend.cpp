@@ -4,8 +4,8 @@
 
 #include "opengl_renderer_backend_p.hpp"
 
-#include <mbgl/gfx/backend_scope.hpp>
-#include <mbgl/gl/renderable_resource.hpp>
+#include <mln/gfx/backend_scope.hpp>
+#include <mln/gl/renderable_resource.hpp>
 
 #include <QtGlobal>
 
@@ -17,13 +17,13 @@ namespace QMapLibre {
 
 /*! \cond PRIVATE */
 
-class QtOpenGLRenderableResource final : public mbgl::gl::RenderableResource {
+class QtOpenGLRenderableResource final : public mln::gl::RenderableResource {
 public:
     explicit QtOpenGLRenderableResource(OpenGLRendererBackend &backend_)
         : backend(backend_) {}
 
     void bind() override {
-        assert(mbgl::gfx::BackendScope::exists());
+        assert(mln::gfx::BackendScope::exists());
         backend.restoreFramebufferBinding();
         backend.setViewport(0, 0, backend.getSize());
 
@@ -45,9 +45,9 @@ private:
     OpenGLRendererBackend &backend;
 };
 
-OpenGLRendererBackend::OpenGLRendererBackend(const mbgl::gfx::ContextMode mode)
-    : mbgl::gl::RendererBackend(mode),
-      mbgl::gfx::Renderable({0, 0}, std::make_unique<QtOpenGLRenderableResource>(*this)) {}
+OpenGLRendererBackend::OpenGLRendererBackend(const mln::gfx::ContextMode mode)
+    : mln::gl::RendererBackend(mode),
+      mln::gfx::Renderable({0, 0}, std::make_unique<QtOpenGLRenderableResource>(*this)) {}
 
 OpenGLRendererBackend::~OpenGLRendererBackend() {
     const QOpenGLContext *glContext = QOpenGLContext::currentContext();
@@ -90,7 +90,7 @@ void OpenGLRendererBackend::restoreFramebufferBinding() {
     setFramebufferBinding(m_fbo);
 }
 
-void OpenGLRendererBackend::updateRenderer(const mbgl::Size &newSize, uint32_t fbo) {
+void OpenGLRendererBackend::updateRenderer(const mln::Size &newSize, uint32_t fbo) {
     size = newSize;
     const auto width = static_cast<GLsizei>(newSize.width);
     const auto height = static_cast<GLsizei>(newSize.height);
@@ -217,7 +217,7 @@ void OpenGLRendererBackend::updateRenderer(const mbgl::Size &newSize, uint32_t f
     }
 }
 
-mbgl::gl::ProcAddress OpenGLRendererBackend::getExtensionFunctionPointer(const char *name) {
+mln::gl::ProcAddress OpenGLRendererBackend::getExtensionFunctionPointer(const char *name) {
     const QOpenGLContext *glContext = QOpenGLContext::currentContext();
     return glContext->getProcAddress(name);
 }
@@ -244,7 +244,7 @@ unsigned int OpenGLRendererBackend::getFramebufferTextureId() const {
     return m_colorTexture;
 }
 
-void OpenGLRendererBackend::setExternalDrawable(unsigned int textureId, const mbgl::Size &textureSize) {
+void OpenGLRendererBackend::setExternalDrawable(unsigned int textureId, const mln::Size &textureSize) {
     // Handle reset case (textureId == 0 means reset to default)
     if (textureId == 0) {
         const QOpenGLContext *glContext = QOpenGLContext::currentContext();

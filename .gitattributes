@@ -1,0 +1,3 @@
+# Vendored-source patches must keep LF endings so `git apply` works regardless
+# of the platform's core.autocrlf setting.
+patches/*.patch text eol=lf

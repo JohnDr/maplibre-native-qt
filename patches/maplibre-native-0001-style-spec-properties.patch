@@ -1,0 +1,64 @@
+diff --git a/src/mln/style/layers/color_relief_layer.cpp b/src/mln/style/layers/color_relief_layer.cpp
+index 7427f46b940f..2cf15dd7675e 100644
+--- a/src/mln/style/layers/color_relief_layer.cpp
++++ b/src/mln/style/layers/color_relief_layer.cpp
+@@ -180,6 +180,11 @@ Value ColorReliefLayer::serialize() const {
+ }
+ 
+ std::optional<Error> ColorReliefLayer::setPropertyInternal(const std::string& name, const Convertible& value) {
++    // Newer style-spec `resampling` (texture filtering). Native color-relief
++    // currently always samples linearly, so accept the property without
++    // rejecting the whole layer.
++    if (name == "resampling") return std::nullopt;
++
+     const auto it = layerProperties.find(name.c_str());
+     if (it == layerProperties.end()) return Error{"layer '" + getID() + "' doesn't support property '" + name + "'"};
+ 
+diff --git a/src/mln/style/layers/line_layer.cpp b/src/mln/style/layers/line_layer.cpp
+index 9e08e3d9458a..e6d15bf313da 100644
+--- a/src/mln/style/layers/line_layer.cpp
++++ b/src/mln/style/layers/line_layer.cpp
+@@ -647,7 +647,10 @@ std::optional<Error> LineLayer::setPropertyInternal(const std::string& name, con
+     }
+     if (property == Property::LineDasharray) {
+         Error error;
+-        const auto& typedValue = convert<PropertyValue<std::vector<float>>>(value, error, false, false);
++        // Allow data-driven line-dasharray: the line bucket evaluates the
++        // evaluated property per feature, so styles that vary the dash pattern
++        // per feature (e.g. hazard areas) are supported.
++        const auto& typedValue = convert<PropertyValue<std::vector<float>>>(value, error, true, false);
+         if (!typedValue) {
+             return error;
+         }
+diff --git a/src/mln/style/layers/symbol_layer.cpp b/src/mln/style/layers/symbol_layer.cpp
+index dd5ccf081467..bdc6c40ea8e2 100644
+--- a/src/mln/style/layers/symbol_layer.cpp
++++ b/src/mln/style/layers/symbol_layer.cpp
+@@ -1418,6 +1418,27 @@ Value SymbolLayer::serialize() const {
+ }
+ 
+ std::optional<Error> SymbolLayer::setPropertyInternal(const std::string& name, const Convertible& value) {
++    // Newer style-spec overlap properties. Native models these with the boolean
++    // icon-allow-overlap / text-allow-overlap, so map them instead of rejecting
++    // the layer (which would otherwise be dropped by the style parser).
++    if (name == "icon-overlap" || name == "text-overlap") {
++        bool allowOverlap = true;
++        Error overlapError;
++        if (auto stringValue = convert<std::string>(value, overlapError)) {
++            allowOverlap = (*stringValue != "never");
++        } else if (auto boolValue = convert<bool>(value, overlapError)) {
++            allowOverlap = *boolValue;
++        } else {
++            return std::nullopt;
++        }
++        if (name == "icon-overlap") {
++            setIconAllowOverlap(PropertyValue<bool>(allowOverlap));
++        } else {
++            setTextAllowOverlap(PropertyValue<bool>(allowOverlap));
++        }
++        return std::nullopt;
++    }
++
+     const auto it = layerProperties.find(name.c_str());
+     if (it == layerProperties.end()) return Error{"layer '" + getID() + "' doesn't support property '" + name + "'"};
+ 
