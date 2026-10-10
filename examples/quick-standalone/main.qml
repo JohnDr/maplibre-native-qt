@@ -408,11 +408,12 @@ Window {
 
         // Mouse / trackpad: right drag zooms smoothly toward the cursor.
         // Wheel clicks remain the stepped zoom below.
-        DragHandler {
+        PinchHandler {
             id: zoomDrag
             target: null
             acceptedButtons: Qt.RightButton
-            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+            minimumPointCount: 1
+            maximumPointCount: 1
             enabled: !window.dialogOpen
             onTranslationChanged: (delta) => {
                 map.scale(Math.pow(2.0, -delta.y / 250.0), zoomDrag.centroid.position)
