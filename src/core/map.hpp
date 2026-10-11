@@ -79,6 +79,15 @@ public:
         NorthLeftwards,
     };
 
+    // Determines the map projection. Globe is not rendered yet; selecting it
+    // records the request until the globe renderer lands. Values must match
+    // mln::ProjectionType (enforced in the .cpp) and MapQuickItem::ProjectionType.
+    enum ProjectionType {
+        Mercator, // Default
+        Globe,
+    };
+    Q_ENUM(ProjectionType)
+
     explicit Map(QObject *parent = nullptr,
                  const Settings &settings = Settings(),
                  const QSize &size = QSize(),
@@ -116,6 +125,9 @@ public:
 
     [[nodiscard]] NorthOrientation northOrientation() const;
     void setNorthOrientation(NorthOrientation);
+
+    [[nodiscard]] ProjectionType projectionType() const;
+    void setProjectionType(ProjectionType type);
 
     [[nodiscard]] Coordinate coordinate() const;
     void setCoordinate(const Coordinate &coordinate);
@@ -223,6 +235,8 @@ signals:
     void mapLoadingFailed(Map::MapLoadingFailure, const QString &reason);
     void copyrightsChanged(const QString &copyrightsHtml);
 
+    void projectionTypeChanged(ProjectionType type);
+
     void staticRenderFinished(const QString &error);
 
 private:
@@ -235,5 +249,6 @@ private:
 
 Q_DECLARE_METATYPE(QMapLibre::Map::MapChange);
 Q_DECLARE_METATYPE(QMapLibre::Map::MapLoadingFailure);
+Q_DECLARE_METATYPE(QMapLibre::Map::ProjectionType);
 
 #endif // QMAPLIBRE_MAP_H

@@ -90,6 +90,11 @@ static_assert(mln::underlying_type(QMapLibre::Map::NorthLeftwards) ==
                   mln::underlying_type(mln::NorthOrientation::Leftwards),
               "error");
 
+// mln::ProjectionType
+static_assert(mln::underlying_type(QMapLibre::Map::Mercator) == mln::underlying_type(mln::ProjectionType::Mercator),
+              "error");
+static_assert(mln::underlying_type(QMapLibre::Map::Globe) == mln::underlying_type(mln::ProjectionType::Globe), "error");
+
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -893,6 +898,25 @@ Map::NorthOrientation Map::northOrientation() const {
 */
 void Map::setNorthOrientation(NorthOrientation orientation) {
     d_ptr->mapObj->setNorthOrientation(static_cast<mln::NorthOrientation>(orientation));
+}
+
+/*!
+    \brief Get the map projection type.
+    \return The map projection type.
+*/
+Map::ProjectionType Map::projectionType() const {
+    return static_cast<Map::ProjectionType>(d_ptr->mapObj->getProjectionType());
+}
+
+/*!
+    \brief Set the map projection type.
+    \param type The map projection type. Globe is not rendered yet; it is
+    recorded and rendered once the globe work lands.
+*/
+void Map::setProjectionType(ProjectionType type) {
+    const auto previous = projectionType();
+    d_ptr->mapObj->setProjectionType(static_cast<mln::ProjectionType>(type));
+    if (previous != type) emit projectionTypeChanged(type);
 }
 
 /*!

@@ -31,6 +31,10 @@ class MapQuickItem : public QQuickItem {
     // proxy (e.g. a "GPU ready" heuristic) that can race ahead of the
     // actual native style-load completion - see onMapChanged().
     Q_PROPERTY(bool styleLoaded READ styleLoaded NOTIFY styleLoadedChanged)
+    // Globe is not rendered yet; selecting it records the request until the
+    // globe renderer lands. Exposed on this element so QML can write
+    // `projectionType: MapLibre.Globe`.
+    Q_PROPERTY(ProjectionType projectionType READ projectionType WRITE setProjectionType NOTIFY projectionTypeChanged)
 
 public:
     enum SyncState : int {
@@ -39,6 +43,13 @@ public:
         CameraOptionsSync = 1 << 1,
     };
     Q_DECLARE_FLAGS(SyncStates, SyncState);
+
+    // Values must match QMapLibre::Map::ProjectionType (enforced in the .cpp).
+    enum ProjectionType {
+        Mercator, // Default
+        Globe,
+    };
+    Q_ENUM(ProjectionType)
 
     explicit MapQuickItem(QQuickItem *parent = nullptr);
     ~MapQuickItem() override;
@@ -55,6 +66,9 @@ public:
 
     [[nodiscard]] bool styleLoaded() const;
 
+    [[nodiscard]] ProjectionType projectionType() const;
+    void setProjectionType(ProjectionType type);
+
     Q_INVOKABLE void pan(const QPointF &offset);
     Q_INVOKABLE void scale(double scale, const QPointF &center);
     Q_INVOKABLE void easeTo(const QVariantMap &camera, const QVariantMap &animation = QVariantMap());
@@ -68,6 +82,7 @@ signals:
     void coordinateChanged();
     void zoomLevelChanged();
     void styleLoadedChanged();
+    void projectionTypeChanged();
 
 protected:
     void componentComplete() override;

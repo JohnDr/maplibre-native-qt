@@ -1,0 +1,568 @@
+diff --git a/include/mln/shaders/gl/fill.hpp b/include/mln/shaders/gl/fill.hpp
+index b2eedbfaf3bd..8169fad9f758 100644
+--- a/include/mln/shaders/gl/fill.hpp
++++ b/include/mln/shaders/gl/fill.hpp
+@@ -49,7 +49,7 @@ opacity = unpack_mix_vec2(a_opacity, u_opacity_t);
+ lowp float opacity = u_opacity;
+ #endif
+ 
+-    gl_Position = u_matrix * vec4(a_pos, 0, 1);
++    gl_Position = projectTile(a_pos);
+ }
+ )";
+     static constexpr const char* fragment = R"(layout (std140) uniform FillEvaluatedPropsUBO {
+diff --git a/include/mln/shaders/gl/fill_outline.hpp b/include/mln/shaders/gl/fill_outline.hpp
+index 04c3f29b478a..457f80ccc712 100644
+--- a/include/mln/shaders/gl/fill_outline.hpp
++++ b/include/mln/shaders/gl/fill_outline.hpp
+@@ -63,7 +63,7 @@ opacity = unpack_mix_vec2(a_opacity, u_opacity_t);
+ lowp float opacity = u_opacity;
+ #endif
+ 
+-    gl_Position = u_matrix * vec4(a_pos, 0, 1);
++    gl_Position = projectTile(a_pos);
+     v_pos = (gl_Position.xy / gl_Position.w + 1.0) / 2.0 * u_world_size;
+ }
+ )";
+diff --git a/include/mln/shaders/gl/fill_outline_pattern.hpp b/include/mln/shaders/gl/fill_outline_pattern.hpp
+index d4bd9b832a73..5c45ac0d456e 100644
+--- a/include/mln/shaders/gl/fill_outline_pattern.hpp
++++ b/include/mln/shaders/gl/fill_outline_pattern.hpp
+@@ -94,7 +94,7 @@ mediump vec4 pattern_to = u_pattern_to;
+     float fromScale = u_from_scale;
+     float toScale = u_to_scale;
+ 
+-    gl_Position = u_matrix * vec4(a_pos, 0, 1);
++    gl_Position = projectTile(a_pos);
+ 
+     vec2 display_size_a = vec2((pattern_br_a.x - pattern_tl_a.x) / pixelRatio, (pattern_br_a.y - pattern_tl_a.y) / pixelRatio);
+     vec2 display_size_b = vec2((pattern_br_b.x - pattern_tl_b.x) / pixelRatio, (pattern_br_b.y - pattern_tl_b.y) / pixelRatio);
+diff --git a/include/mln/shaders/gl/fill_outline_triangulated.hpp b/include/mln/shaders/gl/fill_outline_triangulated.hpp
+index abc4e5edd467..306a7aeca86e 100644
+--- a/include/mln/shaders/gl/fill_outline_triangulated.hpp
++++ b/include/mln/shaders/gl/fill_outline_triangulated.hpp
+@@ -82,7 +82,7 @@ void main() {
+     mediump vec2 dist = outset * a_extrude * scale;
+ 
+     vec4 projected_extrude = u_matrix * vec4(dist / u_ratio, 0.0, 0.0);
+-    gl_Position = u_matrix * vec4(pos, 0.0, 1.0) + projected_extrude;
++    gl_Position = projectTile(pos) + projected_extrude;
+ 
+     // calculate how much the perspective view squishes or stretches the extrude
+     float extrude_length_without_perspective = length(dist);
+diff --git a/include/mln/shaders/gl/fill_pattern.hpp b/include/mln/shaders/gl/fill_pattern.hpp
+index ebb91ae0cac7..c9a70ffcd082 100644
+--- a/include/mln/shaders/gl/fill_pattern.hpp
++++ b/include/mln/shaders/gl/fill_pattern.hpp
+@@ -95,7 +95,7 @@ mediump vec4 pattern_to = u_pattern_to;
+ 
+     vec2 display_size_a = vec2((pattern_br_a.x - pattern_tl_a.x) / pixelRatio, (pattern_br_a.y - pattern_tl_a.y) / pixelRatio);
+     vec2 display_size_b = vec2((pattern_br_b.x - pattern_tl_b.x) / pixelRatio, (pattern_br_b.y - pattern_tl_b.y) / pixelRatio);
+-    gl_Position = u_matrix * vec4(a_pos, 0, 1);
++    gl_Position = projectTile(a_pos);
+ 
+     v_pos_a = get_pattern_pos(u_pixel_coord_upper, u_pixel_coord_lower, fromScale * display_size_a, tileZoomRatio, a_pos);
+     v_pos_b = get_pattern_pos(u_pixel_coord_upper, u_pixel_coord_lower, toScale * display_size_b, tileZoomRatio, a_pos);
+diff --git a/include/mln/shaders/gl/prelude.hpp b/include/mln/shaders/gl/prelude.hpp
+index b155acc45842..70cb7c73f4be 100644
+--- a/include/mln/shaders/gl/prelude.hpp
++++ b/include/mln/shaders/gl/prelude.hpp
+@@ -83,6 +83,21 @@ vec2 get_pattern_pos(const vec2 pixel_coord_upper, const vec2 pixel_coord_lower,
+     vec2 offset = mod(mod(mod(pixel_coord_upper, pattern_size) * 256.0, pattern_size) * 256.0 + pixel_coord_lower, pattern_size);
+     return (tile_units_to_pixels * pos + offset) / pattern_size;
+ }
++
++layout (std140) uniform ProjectionUBO {
++    highp mat4 u_projection_matrix;
++    highp mat4 u_projection_fallback_matrix;
++    highp vec4 u_projection_tile_mercator_coords;
++    highp vec4 u_projection_clipping_plane;
++    highp float u_projection_transition;
++    lowp float projection_pad1;
++    lowp float projection_pad2;
++    lowp float projection_pad3;
++};
++
++vec4 projectTile(vec2 pos) {
++    return u_projection_matrix * vec4(pos, 0.0, 1.0);
++}
+ )";
+     static constexpr const char* fragment = R"(#ifdef GL_ES
+ precision mediump float;
+diff --git a/include/mln/shaders/mtl/common.hpp b/include/mln/shaders/mtl/common.hpp
+index 91746bf41f84..82befed28d17 100644
+--- a/include/mln/shaders/mtl/common.hpp
++++ b/include/mln/shaders/mtl/common.hpp
+@@ -238,6 +238,10 @@ struct alignas(16) ProjectionUBO {
+ };
+ static_assert(sizeof(ProjectionUBO) == 11 * 16, "wrong size");
+ 
++inline float4 projectTile(float2 pos, device const ProjectionUBO& projection) {
++    return projection.matrix * float4(pos, 0.0, 1.0);
++}
++
+ enum {
+     idGlobalPaintParamsUBO,
+     idGlobalUBOIndex,
+diff --git a/include/mln/shaders/mtl/fill.hpp b/include/mln/shaders/mtl/fill.hpp
+index 94d4a1f9cfed..eeaf34d70205 100644
+--- a/include/mln/shaders/mtl/fill.hpp
++++ b/include/mln/shaders/mtl/fill.hpp
+@@ -177,12 +177,13 @@ struct FragmentStage {
+ 
+ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+                                 device const uint32_t& uboIndex [[buffer(idGlobalUBOIndex)]],
+-                                device const FillDrawableUnionUBO* drawableVector [[buffer(idFillDrawableUBO)]]) {
++                                device const FillDrawableUnionUBO* drawableVector [[buffer(idFillDrawableUBO)]],
++                                device const ProjectionUBO* projectionVector [[buffer(idProjectionUBO)]]) {
+ 
+     device const FillDrawableUBO& drawable = drawableVector[uboIndex].fillDrawableUBO;
+ 
+     return {
+-        .position = drawable.matrix * float4(float2(vertx.position), 0.0f, 1.0f),
++        .position = projectTile(float2(vertx.position), projectionVector[uboIndex]),
+ #if !defined(HAS_UNIFORM_u_color)
+         .color    = half4(unpack_mix_color(vertx.color, drawable.color_t)),
+ #endif
+@@ -248,11 +249,12 @@ struct FragmentStage {
+ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+                                 device const GlobalPaintParamsUBO& paintParams [[buffer(idGlobalPaintParamsUBO)]],
+                                 device const uint32_t& uboIndex [[buffer(idGlobalUBOIndex)]],
+-                                device const FillDrawableUnionUBO* drawableVector [[buffer(idFillDrawableUBO)]]) {
++                                device const FillDrawableUnionUBO* drawableVector [[buffer(idFillDrawableUBO)]],
++                                device const ProjectionUBO* projectionVector [[buffer(idProjectionUBO)]]) {
+ 
+     device const FillOutlineDrawableUBO& drawable = drawableVector[uboIndex].fillOutlineDrawableUBO;
+ 
+-    const float4 position = drawable.matrix * float4(float2(vertx.position), 0.0f, 1.0f);
++    const float4 position = projectTile(float2(vertx.position), projectionVector[uboIndex]);
+     return {
+         .position       = position,
+         .pos            = (position.xy / position.w + 1.0) / 2.0 * paintParams.world_size,
+@@ -341,6 +343,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+                                 device const GlobalPaintParamsUBO& paintParams [[buffer(idGlobalPaintParamsUBO)]],
+                                 device const uint32_t& uboIndex [[buffer(idGlobalUBOIndex)]],
+                                 device const FillDrawableUnionUBO* drawableVector [[buffer(idFillDrawableUBO)]],
++                                device const ProjectionUBO* projectionVector [[buffer(idProjectionUBO)]],
+                                 device const FillTilePropsUnionUBO* tilePropsVector [[buffer(idFillTilePropsUBO)]],
+                                 device const FillEvaluatedPropsUBO& props [[buffer(idFillEvaluatedPropsUBO)]]) {
+ 
+@@ -374,7 +377,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+     const float2 postion = float2(vertx.position);
+ 
+     return {
+-        .position       = drawable.matrix * float4(postion, 0, 1),
++        .position       = projectTile(postion, projectionVector[uboIndex]),
+         .v_pos_a        = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, fromScale * display_size_a, tileZoomRatio, postion),
+         .v_pos_b        = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, toScale * display_size_b, tileZoomRatio, postion),
+ #if !defined(HAS_UNIFORM_u_pattern_from)
+@@ -485,6 +488,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+                                 device const GlobalPaintParamsUBO& paintParams [[buffer(idGlobalPaintParamsUBO)]],
+                                 device const uint32_t& uboIndex [[buffer(idGlobalUBOIndex)]],
+                                 device const FillDrawableUnionUBO* drawableVector [[buffer(idFillDrawableUBO)]],
++                                device const ProjectionUBO* projectionVector [[buffer(idProjectionUBO)]],
+                                 device const FillTilePropsUnionUBO* tilePropsVector [[buffer(idFillTilePropsUBO)]],
+                                 device const FillEvaluatedPropsUBO& props [[buffer(idFillEvaluatedPropsUBO)]]) {
+ 
+@@ -520,7 +524,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+     const float2 display_size_a = float2((pattern_br_a.x - pattern_tl_a.x) / pixelRatio, (pattern_br_a.y - pattern_tl_a.y) / pixelRatio);
+     const float2 display_size_b = float2((pattern_br_b.x - pattern_tl_b.x) / pixelRatio, (pattern_br_b.y - pattern_tl_b.y) / pixelRatio);
+     const float2 pos2 = float2(vertx.position);
+-    const float4 position = drawable.matrix * float4(pos2, 0, 1);
++    const float4 position = projectTile(pos2, projectionVector[uboIndex]);
+ 
+     return {
+         .position       = position,
+@@ -620,7 +624,8 @@ struct FragmentStage {
+ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+                                 device const GlobalPaintParamsUBO& paintParams [[buffer(idGlobalPaintParamsUBO)]],
+                                 device const uint32_t& uboIndex [[buffer(idGlobalUBOIndex)]],
+-                                device const FillDrawableUnionUBO* drawableVector [[buffer(idFillDrawableUBO)]]) {
++                                device const FillDrawableUnionUBO* drawableVector [[buffer(idFillDrawableUBO)]],
++                                device const ProjectionUBO* projectionVector [[buffer(idProjectionUBO)]]) {
+ 
+     device const FillOutlineTriangulatedDrawableUBO& drawable = drawableVector[uboIndex].fillOutlineTriangulatedDrawableUBO;
+ 
+@@ -645,7 +650,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+     const float2 dist = outset * a_extrude * LINE_NORMAL_SCALE;
+ 
+     const float4 projected_extrude = drawable.matrix * float4(dist / drawable.ratio, 0.0, 0.0);
+-    const float4 position = drawable.matrix * float4(pos, 0.0, 1.0) + projected_extrude;
++    const float4 position = projectTile(pos, projectionVector[uboIndex]) + projected_extrude;
+ 
+     // calculate how much the perspective view squishes or stretches the extrude
+     const float extrude_length_without_perspective = length(dist);
+diff --git a/include/mln/shaders/vulkan/common.hpp b/include/mln/shaders/vulkan/common.hpp
+index 3f986a6dfbd4..bd5025e1c082 100644
+--- a/include/mln/shaders/vulkan/common.hpp
++++ b/include/mln/shaders/vulkan/common.hpp
+@@ -122,6 +122,21 @@ layout(set = GLOBAL_SET_INDEX, binding = 1) uniform GlobalPlatformParamsUBO {
+ } platformParams;
+ #endif
+ 
++struct ProjectionUBO {
++    mat4 matrix;
++    mat4 fallback_matrix;
++    vec4 tile_mercator_coords;
++    vec4 clipping_plane;
++    float projection_transition;
++    float pad1;
++    float pad2;
++    float pad3;
++};
++
++vec4 projectTile(vec2 pos, ProjectionUBO projection) {
++    return projection.matrix * vec4(pos, 0.0, 1.0);
++}
++
+ void applySurfaceTransform() {
+ #ifdef USE_SURFACE_TRANSFORM
+     const mat2 rotation = {
+diff --git a/include/mln/shaders/vulkan/fill.hpp b/include/mln/shaders/vulkan/fill.hpp
+index 3baa14c5adcf..b147e7126140 100644
+--- a/include/mln/shaders/vulkan/fill.hpp
++++ b/include/mln/shaders/vulkan/fill.hpp
+@@ -53,6 +53,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillDrawableUBO) readonly buff
+     FillDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ #if !defined(HAS_UNIFORM_u_color)
+ layout(location = 0) out vec4 frag_color;
+ #endif
+@@ -72,7 +76,7 @@ void main() {
+     frag_opacity = unpack_mix_float(in_opacity, drawable.opacity_t);
+ #endif
+ 
+-    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
++    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ }
+ )";
+@@ -156,6 +160,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillDrawableUBO) readonly buff
+     FillOutlineDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ #if !defined(HAS_UNIFORM_u_outline_color)
+ layout(location = 0) out vec4 frag_color;
+ #endif
+@@ -177,7 +185,7 @@ void main() {
+     frag_opacity = unpack_mix_float(in_opacity, drawable.opacity_t);
+ #endif
+ 
+-    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
++    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+     frag_position = (gl_Position.xy / gl_Position.w + 1.0) / 2.0 * paintParams.world_size;
+@@ -277,6 +285,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillDrawableUBO) readonly buff
+     FillPatternDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ struct FillPatternTilePropsUBO {
+     vec4 pattern_from;
+     vec4 pattern_to;
+@@ -349,7 +361,7 @@ void main() {
+     frag_pos_a = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, fromScale * display_size_a, tileZoomRatio, in_position),
+     frag_pos_b = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, toScale * display_size_b, tileZoomRatio, in_position),
+ 
+-    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
++    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ }
+ )";
+@@ -489,6 +501,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillDrawableUBO) readonly buff
+     FillOutlinePatternDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ struct FillOutlinePatternTilePropsUBO {
+     vec4 pattern_from;
+     vec4 pattern_to;
+@@ -560,7 +576,7 @@ void main() {
+     const vec2 display_size_b = vec2((pattern_br_b.x - pattern_tl_b.x) / pixelRatio, (pattern_br_b.y - pattern_tl_b.y) / pixelRatio);
+ 
+     const vec2 position2 = in_position.xy;
+-    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
++    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+     frag_pos_a = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, fromScale * display_size_a, tileZoomRatio, position2),
+@@ -695,6 +711,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillDrawableUBO) readonly buff
+     FillOutlineTriangulatedDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ layout(location = 0) out float frag_width2;
+ layout(location = 1) out vec2 frag_normal;
+ layout(location = 2) out float frag_gamma_scale;
+@@ -727,7 +747,7 @@ void main() {
+     mediump vec2 dist = outset * a_extrude * LINE_NORMAL_SCALE;
+ 
+     vec4 projected_extrude = drawable.matrix * vec4(dist / drawable.ratio, 0.0, 0.0);
+-    gl_Position = drawable.matrix * vec4(pos, 0.0, 1.0) + projected_extrude;
++    gl_Position = projectTile(pos, projectionVector.projection_ubo[constant.ubo_index]) + projected_extrude;
+     applySurfaceTransform();
+ 
+     // calculate how much the perspective view squishes or stretches the extrude
+diff --git a/include/mln/shaders/webgpu/common.hpp b/include/mln/shaders/webgpu/common.hpp
+index bfb2ac4050b6..99cb3bcf9549 100644
+--- a/include/mln/shaders/webgpu/common.hpp
++++ b/include/mln/shaders/webgpu/common.hpp
+@@ -83,6 +83,21 @@ fn get_pattern_pos(pixel_coord_upper: vec2<f32>, pixel_coord_lower: vec2<f32>,
+     let offset = gl_mod(offset_b, pattern_size);
+     return (tile_units_to_pixels * pos + offset) / pattern_size;
+ }
++
++struct ProjectionUBO {
++    matrix: mat4x4<f32>,
++    fallback_matrix: mat4x4<f32>,
++    tile_mercator_coords: vec4<f32>,
++    clipping_plane: vec4<f32>,
++    projection_transition: f32,
++    pad1: f32,
++    pad2: f32,
++    pad3: f32,
++};
++
++fn projectTile(pos: vec2<f32>, projection: ProjectionUBO) -> vec4<f32> {
++    return projection.matrix * vec4<f32>(pos, 0.0, 1.0);
++}
+ )";
+ };
+ 
+diff --git a/include/mln/shaders/webgpu/fill.hpp b/include/mln/shaders/webgpu/fill.hpp
+index eac6ce3cbfce..ed864245084f 100644
+--- a/include/mln/shaders/webgpu/fill.hpp
++++ b/include/mln/shaders/webgpu/fill.hpp
+@@ -60,6 +60,7 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillDrawableUnionUBO>;
++@group(0) @binding(4) var<storage, read> projectionVector: array<ProjectionUBO>;
+ @group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ 
+ @vertex
+@@ -68,7 +69,7 @@ fn main(in: VertexInput) -> VertexOutput {
+ 
+     // Transform position using the matrix
+     let drawable = drawableVector[globalIndex.value].fill;
+-    let clip = drawable.matrix * vec4<f32>(f32(in.position.x), f32(in.position.y), 0.0, 1.0);
++    let clip = projectTile(vec2<f32>(f32(in.position.x), f32(in.position.y)), projectionVector[globalIndex.value]);
+     out.position = clip;
+ 
+     var color: vec4<f32>;
+@@ -197,6 +198,7 @@ struct GlobalIndexUBO {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillOutlineDrawableUnionUBO>;
++@group(0) @binding(4) var<storage, read> projectionVector: array<ProjectionUBO>;
+ @group(0) @binding(6) var<uniform> props: FillOutlineEvaluatedPropsUBO;
+ 
+ @vertex
+@@ -205,7 +207,7 @@ fn main(in: VertexInput) -> VertexOutput {
+ 
+     // Transform position using the matrix
+     let drawable = drawableVector[globalIndex.value].fill;
+-    let clip = drawable.matrix * vec4<f32>(f32(in.position.x), f32(in.position.y), 0.0, 1.0);
++    let clip = projectTile(vec2<f32>(f32(in.position.x), f32(in.position.y)), projectionVector[globalIndex.value]);
+     let invW = 1.0 / clip.w;
+     let ndcXY = clip.xy * invW;
+     out.position = clip;
+@@ -353,6 +355,7 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillPatternDrawableUBO>;
++@group(0) @binding(4) var<storage, read> projectionVector: array<ProjectionUBO>;
+ @group(0) @binding(5) var<storage, read> tilePropsVector: array<FillPatternTilePropsUBO>;
+ @group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+@@ -398,7 +401,7 @@ fn main(in: VertexInput) -> VertexOutput {
+     );
+ 
+     let pos = vec2<f32>(f32(in.position.x), f32(in.position.y));
+-    let clip = drawable.matrix * vec4<f32>(pos, 0.0, 1.0);
++    let clip = projectTile(pos, projectionVector[globalIndex.value]);
+     out.position = clip;
+     out.v_pos_a = get_pattern_pos(
+         drawable.pixel_coord_upper,
+@@ -600,6 +603,7 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillOutlinePatternDrawableUBO>;
++@group(0) @binding(4) var<storage, read> projectionVector: array<ProjectionUBO>;
+ @group(0) @binding(5) var<storage, read> tilePropsVector: array<FillOutlinePatternTilePropsUBO>;
+ @group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+@@ -645,7 +649,7 @@ fn main(in: VertexInput) -> VertexOutput {
+     );
+ 
+     let pos = vec2<f32>(f32(in.position.x), f32(in.position.y));
+-    let clip = drawable.matrix * vec4<f32>(pos, 0.0, 1.0);
++    let clip = projectTile(pos, projectionVector[globalIndex.value]);
+     let invW = 1.0 / clip.w;
+     let ndcXY = clip.xy * invW;
+ 
+@@ -820,6 +824,7 @@ struct GlobalIndexUBO {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillOutlineTriangulatedDrawableUnionUBO>;
++@group(0) @binding(4) var<storage, read> projectionVector: array<ProjectionUBO>;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -848,7 +853,7 @@ fn main(in: VertexInput) -> VertexOutput {
+     let extrude_vec = dist / ratio;
+ 
+     let projected_extrude = matrix * vec4<f32>(extrude_vec, 0.0, 0.0);
+-    let base = matrix * vec4<f32>(pos, 0.0, 1.0);
++    let base = projectTile(pos, projectionVector[globalIndex.value]);
+     let clip = base + projected_extrude;
+     out.position = clip;
+ 
+diff --git a/shaders/_prelude.vertex.glsl b/shaders/_prelude.vertex.glsl
+index 505f97b0ba58..fed17f722e06 100644
+--- a/shaders/_prelude.vertex.glsl
++++ b/shaders/_prelude.vertex.glsl
+@@ -73,3 +73,18 @@ vec2 get_pattern_pos(const vec2 pixel_coord_upper, const vec2 pixel_coord_lower,
+     vec2 offset = mod(mod(mod(pixel_coord_upper, pattern_size) * 256.0, pattern_size) * 256.0 + pixel_coord_lower, pattern_size);
+     return (tile_units_to_pixels * pos + offset) / pattern_size;
+ }
++
++layout (std140) uniform ProjectionUBO {
++    highp mat4 u_projection_matrix;
++    highp mat4 u_projection_fallback_matrix;
++    highp vec4 u_projection_tile_mercator_coords;
++    highp vec4 u_projection_clipping_plane;
++    highp float u_projection_transition;
++    lowp float projection_pad1;
++    lowp float projection_pad2;
++    lowp float projection_pad3;
++};
++
++vec4 projectTile(vec2 pos) {
++    return u_projection_matrix * vec4(pos, 0.0, 1.0);
++}
+diff --git a/shaders/fill.vertex.glsl b/shaders/fill.vertex.glsl
+index f77883221c9a..1cec2bda37d3 100644
+--- a/shaders/fill.vertex.glsl
++++ b/shaders/fill.vertex.glsl
+@@ -25,5 +25,5 @@ void main() {
+     #pragma mapbox: initialize highp vec4 color
+     #pragma mapbox: initialize lowp float opacity
+ 
+-    gl_Position = u_matrix * vec4(a_pos, 0, 1);
++    gl_Position = projectTile(a_pos);
+ }
+diff --git a/shaders/fill_outline.vertex.glsl b/shaders/fill_outline.vertex.glsl
+index 50dadb4c3ddb..537f84ac98e3 100644
+--- a/shaders/fill_outline.vertex.glsl
++++ b/shaders/fill_outline.vertex.glsl
+@@ -39,6 +39,6 @@ void main() {
+     #pragma mapbox: initialize highp vec4 outline_color
+     #pragma mapbox: initialize lowp float opacity
+ 
+-    gl_Position = u_matrix * vec4(a_pos, 0, 1);
++    gl_Position = projectTile(a_pos);
+     v_pos = (gl_Position.xy / gl_Position.w + 1.0) / 2.0 * u_world_size;
+ }
+diff --git a/shaders/fill_outline_pattern.vertex.glsl b/shaders/fill_outline_pattern.vertex.glsl
+index ebedb8cd0fce..7fb01336031f 100644
+--- a/shaders/fill_outline_pattern.vertex.glsl
++++ b/shaders/fill_outline_pattern.vertex.glsl
+@@ -63,7 +63,7 @@ void main() {
+     float fromScale = u_from_scale;
+     float toScale = u_to_scale;
+ 
+-    gl_Position = u_matrix * vec4(a_pos, 0, 1);
++    gl_Position = projectTile(a_pos);
+ 
+     vec2 display_size_a = vec2((pattern_br_a.x - pattern_tl_a.x) / pixelRatio, (pattern_br_a.y - pattern_tl_a.y) / pixelRatio);
+     vec2 display_size_b = vec2((pattern_br_b.x - pattern_tl_b.x) / pixelRatio, (pattern_br_b.y - pattern_tl_b.y) / pixelRatio);
+diff --git a/shaders/fill_outline_triangulated.vertex.glsl b/shaders/fill_outline_triangulated.vertex.glsl
+index a2ca7e574151..14d4e2fab273 100644
+--- a/shaders/fill_outline_triangulated.vertex.glsl
++++ b/shaders/fill_outline_triangulated.vertex.glsl
+@@ -72,7 +72,7 @@ void main() {
+     mediump vec2 dist = outset * a_extrude * scale;
+ 
+     vec4 projected_extrude = u_matrix * vec4(dist / u_ratio, 0.0, 0.0);
+-    gl_Position = u_matrix * vec4(pos, 0.0, 1.0) + projected_extrude;
++    gl_Position = projectTile(pos) + projected_extrude;
+ 
+     // calculate how much the perspective view squishes or stretches the extrude
+     float extrude_length_without_perspective = length(dist);
+diff --git a/shaders/fill_pattern.vertex.glsl b/shaders/fill_pattern.vertex.glsl
+index 574ac994e248..82c49c22c1c6 100644
+--- a/shaders/fill_pattern.vertex.glsl
++++ b/shaders/fill_pattern.vertex.glsl
+@@ -64,7 +64,7 @@ void main() {
+ 
+     vec2 display_size_a = vec2((pattern_br_a.x - pattern_tl_a.x) / pixelRatio, (pattern_br_a.y - pattern_tl_a.y) / pixelRatio);
+     vec2 display_size_b = vec2((pattern_br_b.x - pattern_tl_b.x) / pixelRatio, (pattern_br_b.y - pattern_tl_b.y) / pixelRatio);
+-    gl_Position = u_matrix * vec4(a_pos, 0, 1);
++    gl_Position = projectTile(a_pos);
+ 
+     v_pos_a = get_pattern_pos(u_pixel_coord_upper, u_pixel_coord_lower, fromScale * display_size_a, tileZoomRatio, a_pos);
+     v_pos_b = get_pattern_pos(u_pixel_coord_upper, u_pixel_coord_lower, toScale * display_size_b, tileZoomRatio, a_pos);
+diff --git a/src/mln/shaders/gl/shader_info.cpp b/src/mln/shaders/gl/shader_info.cpp
+index 7cabf87f538a..27611e179fa9 100644
+--- a/src/mln/shaders/gl/shader_info.cpp
++++ b/src/mln/shaders/gl/shader_info.cpp
+@@ -112,6 +112,7 @@ const std::vector<TextureInfo> DebugShaderInfo::textures = {
+ using FillShaderInfo = ShaderInfo<BuiltIn::FillShader, gfx::Backend::Type::OpenGL>;
+ 
+ const std::vector<UniformBlockInfo> FillShaderInfo::uniformBlocks = {
++    UniformBlockInfo{"ProjectionUBO", idProjectionUBO},
+     UniformBlockInfo{"FillDrawableUBO", idFillDrawableUBO},
+     UniformBlockInfo{"FillEvaluatedPropsUBO", idFillEvaluatedPropsUBO},
+ };
+@@ -127,6 +128,7 @@ using FillOutlineShaderInfo = ShaderInfo<BuiltIn::FillOutlineShader, gfx::Backen
+ 
+ const std::vector<UniformBlockInfo> FillOutlineShaderInfo::uniformBlocks = {
+     UniformBlockInfo{"GlobalPaintParamsUBO", idGlobalPaintParamsUBO},
++    UniformBlockInfo{"ProjectionUBO", idProjectionUBO},
+     UniformBlockInfo{"FillOutlineDrawableUBO", idFillDrawableUBO},
+     UniformBlockInfo{"FillEvaluatedPropsUBO", idFillEvaluatedPropsUBO},
+ };
+@@ -142,6 +144,7 @@ using FillPatternShaderInfo = ShaderInfo<BuiltIn::FillPatternShader, gfx::Backen
+ 
+ const std::vector<UniformBlockInfo> FillPatternShaderInfo::uniformBlocks = {
+     UniformBlockInfo{"GlobalPaintParamsUBO", idGlobalPaintParamsUBO},
++    UniformBlockInfo{"ProjectionUBO", idProjectionUBO},
+     UniformBlockInfo{"FillPatternDrawableUBO", idFillDrawableUBO},
+     UniformBlockInfo{"FillPatternTilePropsUBO", idFillTilePropsUBO},
+     UniformBlockInfo{"FillEvaluatedPropsUBO", idFillEvaluatedPropsUBO},
+@@ -161,6 +164,7 @@ using FillOutlinePatternShaderInfo = ShaderInfo<BuiltIn::FillOutlinePatternShade
+ 
+ const std::vector<UniformBlockInfo> FillOutlinePatternShaderInfo::uniformBlocks = {
+     UniformBlockInfo{"GlobalPaintParamsUBO", idGlobalPaintParamsUBO},
++    UniformBlockInfo{"ProjectionUBO", idProjectionUBO},
+     UniformBlockInfo{"FillOutlinePatternDrawableUBO", idFillDrawableUBO},
+     UniformBlockInfo{"FillOutlinePatternTilePropsUBO", idFillTilePropsUBO},
+     UniformBlockInfo{"FillEvaluatedPropsUBO", idFillEvaluatedPropsUBO},
+@@ -181,6 +185,7 @@ using FillOutlineTriangulatedShaderInfo =
+ 
+ const std::vector<UniformBlockInfo> FillOutlineTriangulatedShaderInfo::uniformBlocks = {
+     UniformBlockInfo{"GlobalPaintParamsUBO", idGlobalPaintParamsUBO},
++    UniformBlockInfo{"ProjectionUBO", idProjectionUBO},
+     UniformBlockInfo{"FillOutlineTriangulatedDrawableUBO", idFillDrawableUBO},
+     UniformBlockInfo{"FillEvaluatedPropsUBO", idFillEvaluatedPropsUBO},
+ };

@@ -1,0 +1,1910 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e71097937bd9..48766e0c33df 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -541,6 +541,9 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/map/map_impl.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/map_options.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/map_projection.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/map/mercator_projection.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/map/mercator_projection.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/map/projection_base.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/transform.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/transform.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/transform_state.cpp
+diff --git a/bazel/core.bzl b/bazel/core.bzl
+index a9b8c7a061f4..93d6b63c70e3 100644
+--- a/bazel/core.bzl
++++ b/bazel/core.bzl
+@@ -194,6 +194,9 @@ MLN_CORE_SOURCE = [
+     "src/mln/map/map_impl.hpp",
+     "src/mln/map/map_options.cpp",
+     "src/mln/map/map_projection.cpp",
++    "src/mln/map/mercator_projection.cpp",
++    "src/mln/map/mercator_projection.hpp",
++    "src/mln/map/projection_base.hpp",
+     "src/mln/map/transform.cpp",
+     "src/mln/map/transform.hpp",
+     "src/mln/map/transform_state.cpp",
+diff --git a/include/mln/map/map.hpp b/include/mln/map/map.hpp
+index 1278040331d1..7e425acb7e68 100644
+--- a/include/mln/map/map.hpp
++++ b/include/mln/map/map.hpp
+@@ -11,6 +11,7 @@
+ #include <mln/map/camera.hpp>
+ #include <mln/util/geometry.hpp>
+ #include <mln/map/projection_mode.hpp>
++#include <mln/map/projection_type.hpp>
+ #include <mln/storage/resource_options.hpp>
+ #include <mln/util/client_options.hpp>
+ #include <mln/util/action_journal_options.hpp>
+@@ -115,6 +116,10 @@ public:
+     void setProjectionMode(const ProjectionMode&);
+     ProjectionMode getProjectionMode() const;
+ 
++    // Map projection (Mercator / Globe). Only Mercator is rendered today.
++    void setProjectionType(ProjectionType);
++    ProjectionType getProjectionType() const;
++
+     // Projection
+     ScreenCoordinate pixelForLatLng(const LatLng&) const;
+     LatLng latLngForPixel(const ScreenCoordinate&) const;
+diff --git a/include/mln/map/map_options.hpp b/include/mln/map/map_options.hpp
+index b3cc72ad52d7..a6a10a712447 100644
+--- a/include/mln/map/map_options.hpp
++++ b/include/mln/map/map_options.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/map/mode.hpp>
++#include <mln/map/projection_type.hpp>
+ #include <mln/util/geo.hpp>
+ #include <mln/util/size.hpp>
+ 
+@@ -149,6 +150,25 @@ public:
+      */
+     bool fastPFOREnabled() const;
+ 
++    /**
++     * @brief Sets the map projection. By default, it is set to
++     * ProjectionType::Mercator (the flat Web Mercator map).
++     *
++     * Selecting ProjectionType::Globe records the request to render the world
++     * on a sphere; only Mercator is rendered today.
++     *
++     * @param projection Map projection.
++     * @return MapOptions for chaining options together.
++     */
++    MapOptions& withProjectionType(ProjectionType projection);
++
++    /**
++     * @brief Gets the previously set (or default) map projection.
++     *
++     * @return Map projection.
++     */
++    ProjectionType projectionType() const;
++
+ private:
+     class Impl;
+     std::unique_ptr<Impl> impl_;
+diff --git a/include/mln/map/projection_type.hpp b/include/mln/map/projection_type.hpp
+new file mode 100644
+index 000000000000..4b8b540eb751
+--- /dev/null
++++ b/include/mln/map/projection_type.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++
++namespace mln {
++
++/**
++ * @brief The map projection used to render the world.
++ *
++ * This is the projection *seam* only: selecting a projection is recorded on
++ * the map, but only `Mercator` is rendered today. `Globe` will draw the world
++ * on a sphere once the globe work lands (see the globe design proposal).
++ *
++ * Note: distinct from @ref ProjectionMode, which controls the (unrelated)
++ * axonometric skew rendering.
++ */
++enum class ProjectionType : int {
++    /** Web Mercator, the flat default. */
++    Mercator = 0,
++    /** Globe: the world rendered as a sphere, morphing back to Mercator at
++        high zoom. Not rendered yet. */
++    Globe,
++};
++
++} // namespace mln
+diff --git a/include/mln/renderer/layer_tweaker.hpp b/include/mln/renderer/layer_tweaker.hpp
+index 54f4f7d25b9d..54482985a863 100644
+--- a/include/mln/renderer/layer_tweaker.hpp
++++ b/include/mln/renderer/layer_tweaker.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <mln/map/projection_base.hpp>
+ #include <mln/shaders/layer_ubo.hpp>
+ #include <mln/shaders/shader_source.hpp>
+ #include <mln/util/immutable.hpp>
+@@ -9,12 +10,15 @@
+ #include <array>
+ #include <memory>
+ #include <string>
++#include <vector>
+ 
+ namespace mln {
+ 
+ namespace gfx {
++class Context;
+ class Drawable;
+ class UniformBuffer;
++class UniformBufferArray;
+ using UniformBufferPtr = std::shared_ptr<UniformBuffer>;
+ } // namespace gfx
+ 
+@@ -58,10 +62,30 @@ public:
+                               const gfx::Drawable& drawable,
+                               bool aligned = false);
+ 
++    /// The projection contract for this tile: `getTileMatrix` plus the per-tile projection fields.
++    static ProjectionData getProjectionData(const UnwrappedTileID&,
++                                            const PaintParameters&,
++                                            const std::array<float, 2>& translation,
++                                            style::TranslateAnchorType,
++                                            bool nearClipped,
++                                            bool inViewportPixelUnits,
++                                            const gfx::Drawable& drawable,
++                                            bool aligned = false);
++
++    static shaders::ProjectionUBO toProjectionUBO(const ProjectionData&);
++
+ protected:
+     /// Determine whether this tweaker should apply to the given drawable
+     bool checkTweakDrawable(const gfx::Drawable&) const;
+ 
++#if MLN_UBO_CONSOLIDATION
++    /// Upload the per-drawable projection blocks of this layer, indexed like the drawable UBO array
++    void uploadProjectionUBOs(gfx::UniformBufferArray& layerUniforms,
++                              const std::vector<shaders::ProjectionUBO>&,
++                              gfx::Context&);
++    gfx::UniformBufferPtr projectionUniformBuffer;
++#endif
++
+     /// Multiplies with the projection matrix (either default, near clipped or aligned) for the given drawable
+     static void multiplyWithProjectionMatrix(/*in-out*/ mat4& matrix,
+                                              const PaintParameters& parameters,
+diff --git a/include/mln/shaders/layer_ubo.hpp b/include/mln/shaders/layer_ubo.hpp
+index ba6e8b77a2e9..15a58cfbb90d 100644
+--- a/include/mln/shaders/layer_ubo.hpp
++++ b/include/mln/shaders/layer_ubo.hpp
+@@ -50,6 +50,22 @@ struct alignas(16) GlobalPaintParamsUBO {
+ };
+ static_assert(sizeof(GlobalPaintParamsUBO) == 3 * 16);
+ 
++//
++// Projection (per drawable; see ProjectionData)
++
++struct alignas(16) ProjectionUBO {
++    /*   0 */ std::array<float, 4 * 4> matrix;
++    /*  64 */ std::array<float, 4 * 4> fallback_matrix;
++    /* 128 */ std::array<float, 4> tile_mercator_coords;
++    /* 144 */ std::array<float, 4> clipping_plane;
++    /* 160 */ float projection_transition;
++    /* 164 */ float pad1;
++    /* 168 */ float pad2;
++    /* 172 */ float pad3;
++    /* 176 */
++};
++static_assert(sizeof(ProjectionUBO) == 11 * 16);
++
+ #if MLN_RENDER_BACKEND_VULKAN
+ struct alignas(16) GlobalPlatformParamsUBO {
+     /*  0 */ std::array<float, 4> surfaceRotation;
+diff --git a/include/mln/shaders/mtl/common.hpp b/include/mln/shaders/mtl/common.hpp
+index a3f8e2703240..6d464c18bc7a 100644
+--- a/include/mln/shaders/mtl/common.hpp
++++ b/include/mln/shaders/mtl/common.hpp
+@@ -225,6 +225,19 @@ struct alignas(16) GlobalPaintParamsUBO {
+ };
+ static_assert(sizeof(GlobalPaintParamsUBO) == 3 * 16, "wrong size");
+ 
++struct alignas(16) ProjectionUBO {
++    /*   0 */ float4x4 matrix;
++    /*  64 */ float4x4 fallback_matrix;
++    /* 128 */ float4 tile_mercator_coords;
++    /* 144 */ float4 clipping_plane;
++    /* 160 */ float projection_transition;
++    /* 164 */ float pad1;
++    /* 168 */ float pad2;
++    /* 172 */ float pad3;
++    /* 176 */
++};
++static_assert(sizeof(ProjectionUBO) == 11 * 16, "wrong size");
++
+ enum {
+     idGlobalPaintParamsUBO,
+     idGlobalUBOIndex,
+@@ -234,6 +247,7 @@ enum {
+ enum {
+     idDrawableReservedVertexOnlyUBO = globalUBOCount,
+     idDrawableReservedFragmentOnlyUBO,
++    idProjectionUBO,
+     drawableReservedUBOCount
+ };
+ 
+diff --git a/include/mln/shaders/shader_defines.hpp b/include/mln/shaders/shader_defines.hpp
+index 9cf6a7cdbf07..1f85d1bdf265 100644
+--- a/include/mln/shaders/shader_defines.hpp
++++ b/include/mln/shaders/shader_defines.hpp
+@@ -14,6 +14,7 @@ static constexpr uint32_t layerSSBOStartId = globalUBOCount;
+ enum {
+     idDrawableReservedVertexOnlyUBO = layerSSBOStartId,
+     idDrawableReservedFragmentOnlyUBO,
++    idProjectionUBO,
+     drawableReservedUBOCount
+ };
+ 
+diff --git a/include/mln/shaders/vulkan/common.hpp b/include/mln/shaders/vulkan/common.hpp
+index bd1818ca6e44..6a8c8920f563 100644
+--- a/include/mln/shaders/vulkan/common.hpp
++++ b/include/mln/shaders/vulkan/common.hpp
+@@ -95,13 +95,14 @@ vec2 unpack_uint(uint value) {
+ #define DRAWABLE_IMAGE_SET_INDEX            3
+ 
+ #define layerSSBOStartId                    0
+-#define layerUBOStartId                     3
++#define layerUBOStartId                     4
+ #define drawableSSBOStartId                 0
+ #define drawableUBOStartId                  4
+ 
+ #define idDrawableReservedVertexOnlyUBO     layerSSBOStartId
+ #define idDrawableReservedFragmentOnlyUBO   idDrawableReservedVertexOnlyUBO + 1
+-#define drawableReservedUBOCount            idDrawableReservedFragmentOnlyUBO + 1
++#define idProjectionUBO                     idDrawableReservedFragmentOnlyUBO + 1
++#define drawableReservedUBOCount            idProjectionUBO + 1
+ 
+ layout(set = GLOBAL_SET_INDEX, binding = 0) uniform GlobalPaintParamsUBO {
+     vec2 pattern_atlas_texsize;
+@@ -146,13 +147,14 @@ void applySurfaceTransform() {
+ #define DRAWABLE_IMAGE_SET_INDEX            3
+ 
+ #define layerSSBOStartId                    0
+-#define layerUBOStartId                     3
++#define layerUBOStartId                     4
+ #define drawableSSBOStartId                 0
+ #define drawableUBOStartId                  4
+ 
+ #define idDrawableReservedVertexOnlyUBO     layerSSBOStartId
+ #define idDrawableReservedFragmentOnlyUBO   idDrawableReservedVertexOnlyUBO + 1
+-#define drawableReservedUBOCount            idDrawableReservedFragmentOnlyUBO + 1
++#define idProjectionUBO                     idDrawableReservedFragmentOnlyUBO + 1
++#define drawableReservedUBOCount            idProjectionUBO + 1
+ 
+ layout(set = GLOBAL_SET_INDEX, binding = 0) uniform GlobalPaintParamsUBO {
+     vec2 pattern_atlas_texsize;
+diff --git a/include/mln/shaders/webgpu/background.hpp b/include/mln/shaders/webgpu/background.hpp
+index ad3da732543e..dd5bb8ce76b7 100644
+--- a/include/mln/shaders/webgpu/background.hpp
++++ b/include/mln/shaders/webgpu/background.hpp
+@@ -51,7 +51,7 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<BackgroundDrawableUnionUBO>;
+-@group(0) @binding(4) var<uniform> props: BackgroundPropsUBO;
++@group(0) @binding(5) var<uniform> props: BackgroundPropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -76,7 +76,7 @@ struct BackgroundPropsUBO {
+     pad3: f32,
+ };
+ 
+-@group(0) @binding(4) var<uniform> props: BackgroundPropsUBO;
++@group(0) @binding(5) var<uniform> props: BackgroundPropsUBO;
+ 
+ @fragment
+ fn main() -> @location(0) vec4<f32> {
+@@ -138,7 +138,7 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<BackgroundPatternDrawableUnionUBO>;
+-@group(0) @binding(4) var<uniform> props: BackgroundPatternPropsUBO;
++@group(0) @binding(5) var<uniform> props: BackgroundPatternPropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -202,7 +202,7 @@ struct GlobalPaintParamsUBO {
+ };
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+-@group(0) @binding(4) var<uniform> props: BackgroundPatternPropsUBO;
++@group(0) @binding(5) var<uniform> props: BackgroundPatternPropsUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var pattern_texture: texture_2d<f32>;
+ 
+diff --git a/include/mln/shaders/webgpu/circle.hpp b/include/mln/shaders/webgpu/circle.hpp
+index 42aa721999af..17c5e2ab05ee 100644
+--- a/include/mln/shaders/webgpu/circle.hpp
++++ b/include/mln/shaders/webgpu/circle.hpp
+@@ -64,7 +64,7 @@ struct GlobalIndexUBO {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<CircleDrawableUBO>;
+-@group(0) @binding(4) var<uniform> props: CircleEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: CircleEvaluatedPropsUBO;
+ )";
+ 
+     static constexpr auto vertex = R"(
+diff --git a/include/mln/shaders/webgpu/collision.hpp b/include/mln/shaders/webgpu/collision.hpp
+index f0256f696318..d2fa5299cdec 100644
+--- a/include/mln/shaders/webgpu/collision.hpp
++++ b/include/mln/shaders/webgpu/collision.hpp
+@@ -53,7 +53,7 @@ struct GlobalPaintParamsUBO {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<uniform> drawable: CollisionDrawableUBO;
+-@group(0) @binding(4) var<uniform> tile_props: CollisionTilePropsUBO;
++@group(0) @binding(5) var<uniform> tile_props: CollisionTilePropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -155,7 +155,7 @@ struct CollisionTilePropsUBO {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<uniform> drawable: CollisionDrawableUBO;
+-@group(0) @binding(4) var<uniform> tile_props: CollisionTilePropsUBO;
++@group(0) @binding(5) var<uniform> tile_props: CollisionTilePropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -204,7 +204,7 @@ struct CollisionTilePropsUBO {
+     pad1: f32,
+ };
+ 
+-@group(0) @binding(4) var<uniform> tile_props: CollisionTilePropsUBO;
++@group(0) @binding(5) var<uniform> tile_props: CollisionTilePropsUBO;
+ 
+ @fragment
+ fn main(in: FragmentInput) -> @location(0) vec4<f32> {
+diff --git a/include/mln/shaders/webgpu/color_relief.hpp b/include/mln/shaders/webgpu/color_relief.hpp
+index 824cf33a797e..4093f325b34e 100644
+--- a/include/mln/shaders/webgpu/color_relief.hpp
++++ b/include/mln/shaders/webgpu/color_relief.hpp
+@@ -43,7 +43,7 @@ struct ColorReliefTilePropsUBO {
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<ColorReliefDrawableUBO>;
+-@group(0) @binding(4) var<storage, read> tilePropsVector: array<ColorReliefTilePropsUBO>;
++@group(0) @binding(5) var<storage, read> tilePropsVector: array<ColorReliefTilePropsUBO>;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -91,8 +91,8 @@ struct ColorReliefEvaluatedPropsUBO {
+ };
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+-@group(0) @binding(4) var<storage, read> tilePropsVector: array<ColorReliefTilePropsUBO>;
+-@group(0) @binding(5) var<uniform> props: ColorReliefEvaluatedPropsUBO;
++@group(0) @binding(5) var<storage, read> tilePropsVector: array<ColorReliefTilePropsUBO>;
++@group(0) @binding(6) var<uniform> props: ColorReliefEvaluatedPropsUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var dem_texture: texture_2d<f32>;
+ @group(1) @binding(2) var elevation_stops_texture: texture_2d<f32>;
+diff --git a/include/mln/shaders/webgpu/fill.hpp b/include/mln/shaders/webgpu/fill.hpp
+index 2a51e4f0abbf..eac6ce3cbfce 100644
+--- a/include/mln/shaders/webgpu/fill.hpp
++++ b/include/mln/shaders/webgpu/fill.hpp
+@@ -60,7 +60,7 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillDrawableUnionUBO>;
+-@group(0) @binding(5) var<uniform> props: FillEvaluatedPropsUBO;
++@group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -102,7 +102,7 @@ struct FillEvaluatedPropsUBO {
+     to_scale: f32,
+ };
+ 
+-@group(0) @binding(5) var<uniform> props: FillEvaluatedPropsUBO;
++@group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ 
+ struct FragmentInput {
+     @location(0) color: vec4<f32>,
+@@ -197,7 +197,7 @@ struct GlobalIndexUBO {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillOutlineDrawableUnionUBO>;
+-@group(0) @binding(5) var<uniform> props: FillOutlineEvaluatedPropsUBO;
++@group(0) @binding(6) var<uniform> props: FillOutlineEvaluatedPropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -242,7 +242,7 @@ struct FillOutlineEvaluatedPropsUBO {
+     to_scale: f32,
+ };
+ 
+-@group(0) @binding(5) var<uniform> props: FillOutlineEvaluatedPropsUBO;
++@group(0) @binding(6) var<uniform> props: FillOutlineEvaluatedPropsUBO;
+ 
+ struct FragmentInput {
+     @location(0) color: vec4<f32>,
+@@ -353,8 +353,8 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillPatternDrawableUBO>;
+-@group(0) @binding(4) var<storage, read> tilePropsVector: array<FillPatternTilePropsUBO>;
+-@group(0) @binding(5) var<uniform> props: FillEvaluatedPropsUBO;
++@group(0) @binding(5) var<storage, read> tilePropsVector: array<FillPatternTilePropsUBO>;
++@group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ 
+ @vertex
+@@ -465,8 +465,8 @@ struct GlobalIndexUBO {
+     pad0: vec3<u32>,
+ };
+ 
+-@group(0) @binding(4) var<storage, read> tilePropsVector: array<FillPatternTilePropsUBO>;
+-@group(0) @binding(5) var<uniform> props: FillEvaluatedPropsUBO;
++@group(0) @binding(5) var<storage, read> tilePropsVector: array<FillPatternTilePropsUBO>;
++@group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var pattern_texture: texture_2d<f32>;
+@@ -600,8 +600,8 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillOutlinePatternDrawableUBO>;
+-@group(0) @binding(4) var<storage, read> tilePropsVector: array<FillOutlinePatternTilePropsUBO>;
+-@group(0) @binding(5) var<uniform> props: FillEvaluatedPropsUBO;
++@group(0) @binding(5) var<storage, read> tilePropsVector: array<FillOutlinePatternTilePropsUBO>;
++@group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ 
+ @vertex
+@@ -717,8 +717,8 @@ struct GlobalIndexUBO {
+     pad0: vec3<u32>,
+ };
+ 
+-@group(0) @binding(4) var<storage, read> tilePropsVector: array<FillOutlinePatternTilePropsUBO>;
+-@group(0) @binding(5) var<uniform> props: FillEvaluatedPropsUBO;
++@group(0) @binding(5) var<storage, read> tilePropsVector: array<FillOutlinePatternTilePropsUBO>;
++@group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var pattern_texture: texture_2d<f32>;
+@@ -893,7 +893,7 @@ struct GlobalPaintParamsUBO {
+ };
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+-@group(0) @binding(5) var<uniform> props: FillEvaluatedPropsUBO;
++@group(0) @binding(6) var<uniform> props: FillEvaluatedPropsUBO;
+ 
+ @fragment
+ fn main(in: FragmentInput) -> @location(0) vec4<f32> {
+diff --git a/include/mln/shaders/webgpu/fill_extrusion.hpp b/include/mln/shaders/webgpu/fill_extrusion.hpp
+index 79ffe8a8fe33..b29fb86a9e61 100644
+--- a/include/mln/shaders/webgpu/fill_extrusion.hpp
++++ b/include/mln/shaders/webgpu/fill_extrusion.hpp
+@@ -69,7 +69,7 @@ struct GlobalIndexUBO {
+ };
+ 
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillExtrusionDrawableUBO>;
+-@group(0) @binding(5) var<uniform> props: FillExtrusionPropsUBO;
++@group(0) @binding(6) var<uniform> props: FillExtrusionPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ 
+ @vertex
+@@ -231,8 +231,8 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<FillExtrusionPatternDrawableUBO>;
+-@group(0) @binding(4) var<storage, read> tilePropsVector: array<FillExtrusionPatternTilePropsUBO>;
+-@group(0) @binding(5) var<uniform> props: FillExtrusionPropsUBO;
++@group(0) @binding(5) var<storage, read> tilePropsVector: array<FillExtrusionPatternTilePropsUBO>;
++@group(0) @binding(6) var<uniform> props: FillExtrusionPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ 
+ @vertex
+@@ -371,8 +371,8 @@ struct GlobalIndexUBO {
+     pad0: vec3<u32>,
+ };
+ 
+-@group(0) @binding(4) var<storage, read> tilePropsVector: array<FillExtrusionPatternTilePropsUBO>;
+-@group(0) @binding(5) var<uniform> props: FillExtrusionPropsUBO;
++@group(0) @binding(5) var<storage, read> tilePropsVector: array<FillExtrusionPatternTilePropsUBO>;
++@group(0) @binding(6) var<uniform> props: FillExtrusionPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var pattern_texture: texture_2d<f32>;
+diff --git a/include/mln/shaders/webgpu/heatmap.hpp b/include/mln/shaders/webgpu/heatmap.hpp
+index bd29a51c1225..65c065e62f28 100644
+--- a/include/mln/shaders/webgpu/heatmap.hpp
++++ b/include/mln/shaders/webgpu/heatmap.hpp
+@@ -53,7 +53,7 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<HeatmapDrawableUBO>;
+-@group(0) @binding(4) var<uniform> props: HeatmapEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: HeatmapEvaluatedPropsUBO;
+ 
+ const ZERO: f32 = 1.0 / 255.0 / 16.0;
+ const GAUSS_COEF: f32 = 0.3989422804014327;
+@@ -108,7 +108,7 @@ struct HeatmapEvaluatedPropsUBO {
+ 
+ const GAUSS_COEF: f32 = 0.3989422804014327;
+ 
+-@group(0) @binding(4) var<uniform> props: HeatmapEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: HeatmapEvaluatedPropsUBO;
+ 
+ @fragment
+ fn main(in: FragmentInput) -> @location(0) vec4<f32> {
+diff --git a/include/mln/shaders/webgpu/heatmap_texture.hpp b/include/mln/shaders/webgpu/heatmap_texture.hpp
+index 989096fad8dc..b6e6bf03aaf2 100644
+--- a/include/mln/shaders/webgpu/heatmap_texture.hpp
++++ b/include/mln/shaders/webgpu/heatmap_texture.hpp
+@@ -40,7 +40,7 @@ struct GlobalPaintParamsUBO {
+ };
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+-@group(0) @binding(4) var<uniform> ubo: HeatmapTextureUBO;
++@group(0) @binding(5) var<uniform> ubo: HeatmapTextureUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -69,7 +69,7 @@ struct HeatmapTextureUBO {
+     pad3: f32,
+ };
+ 
+-@group(0) @binding(4) var<uniform> ubo: HeatmapTextureUBO;
++@group(0) @binding(5) var<uniform> ubo: HeatmapTextureUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var heatmap_texture: texture_2d<f32>;
+ @group(1) @binding(2) var color_ramp_texture: texture_2d<f32>;
+diff --git a/include/mln/shaders/webgpu/hillshade.hpp b/include/mln/shaders/webgpu/hillshade.hpp
+index 33def9100a88..499846bff84e 100644
+--- a/include/mln/shaders/webgpu/hillshade.hpp
++++ b/include/mln/shaders/webgpu/hillshade.hpp
+@@ -86,7 +86,7 @@ struct HillshadeEvaluatedPropsUBO {
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(3) var<storage, read> tilePropsVector: array<HillshadeTilePropsUBO>;
+-@group(0) @binding(4) var<uniform> props: HillshadeEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: HillshadeEvaluatedPropsUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var hillshade_texture: texture_2d<f32>;
+ 
+diff --git a/include/mln/shaders/webgpu/hillshade_prepare.hpp b/include/mln/shaders/webgpu/hillshade_prepare.hpp
+index a03caf29752b..8f9920c0effb 100644
+--- a/include/mln/shaders/webgpu/hillshade_prepare.hpp
++++ b/include/mln/shaders/webgpu/hillshade_prepare.hpp
+@@ -37,7 +37,7 @@ struct HillshadePrepareTilePropsUBO {
+ };
+ 
+ @group(0) @binding(2) var<uniform> drawable: HillshadePrepareDrawableUBO;
+-@group(0) @binding(4) var<uniform> tileProps: HillshadePrepareTilePropsUBO;
++@group(0) @binding(5) var<uniform> tileProps: HillshadePrepareTilePropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -63,7 +63,7 @@ struct HillshadePrepareTilePropsUBO {
+     maxzoom: f32,
+ };
+ 
+-@group(0) @binding(4) var<uniform> tileProps: HillshadePrepareTilePropsUBO;
++@group(0) @binding(5) var<uniform> tileProps: HillshadePrepareTilePropsUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var dem_texture: texture_2d<f32>;
+ 
+diff --git a/include/mln/shaders/webgpu/line.hpp b/include/mln/shaders/webgpu/line.hpp
+index 9563b7ff5714..e1860f628dfa 100644
+--- a/include/mln/shaders/webgpu/line.hpp
++++ b/include/mln/shaders/webgpu/line.hpp
+@@ -84,7 +84,7 @@ struct LineDrawableEntry {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<LineDrawableEntry>;
+-@group(0) @binding(4) var<uniform> props: LineEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: LineEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ 
+ @vertex
+@@ -303,7 +303,7 @@ struct LineGradientDrawableEntry {
+ 
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<LineGradientDrawableEntry>;
+-@group(0) @binding(4) var<uniform> props: LineEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: LineEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ 
+ @vertex
+@@ -526,7 +526,7 @@ struct LinePatternTilePropsEntry {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<LinePatternDrawableEntry>;
+ @group(0) @binding(3) var<storage, read> tilePropsVector: array<LinePatternTilePropsEntry>;
+-@group(0) @binding(4) var<uniform> props: LineEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: LineEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ 
+ @vertex
+@@ -838,7 +838,7 @@ struct LineSDFTilePropsEntry {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<LineSDFDrawableEntry>;
+ @group(0) @binding(3) var<storage, read> tilePropsVector: array<LineSDFTilePropsEntry>;
+-@group(0) @binding(4) var<uniform> props: LineEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: LineEvaluatedPropsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ 
+ @vertex
+diff --git a/include/mln/shaders/webgpu/raster.hpp b/include/mln/shaders/webgpu/raster.hpp
+index 1c94cfa5dffd..d1cf2fb770d8 100644
+--- a/include/mln/shaders/webgpu/raster.hpp
++++ b/include/mln/shaders/webgpu/raster.hpp
+@@ -52,7 +52,7 @@ struct GlobalIndexUBO {
+ 
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<RasterDrawableUBO>;
+-@group(0) @binding(4) var<uniform> props: RasterEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: RasterEvaluatedPropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -91,7 +91,7 @@ struct RasterEvaluatedPropsUBO {
+     pad2: f32,
+ };
+ 
+-@group(0) @binding(4) var<uniform> props: RasterEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: RasterEvaluatedPropsUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var image0: texture_2d<f32>;
+ @group(1) @binding(2) var image1: texture_2d<f32>;
+diff --git a/include/mln/shaders/webgpu/symbol.hpp b/include/mln/shaders/webgpu/symbol.hpp
+index 91d6208f0f6d..db8c8a1b38b1 100644
+--- a/include/mln/shaders/webgpu/symbol.hpp
++++ b/include/mln/shaders/webgpu/symbol.hpp
+@@ -222,7 +222,7 @@ struct FragmentInput {
+ 
+ @group(0) @binding(3) var<storage, read> tilePropsVector: array<SymbolTilePropsUBO>;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+-@group(0) @binding(4) var<uniform> props: SymbolEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: SymbolEvaluatedPropsUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var image: texture_2d<f32>;
+ 
+@@ -299,7 +299,7 @@ struct VertexOutput {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+ @group(0) @binding(2) var<storage, read> drawableVector: array<SymbolDrawableUBO>;
+-@group(0) @binding(4) var<uniform> props: SymbolEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: SymbolEvaluatedPropsUBO;
+ 
+ @vertex
+ fn main(in: VertexInput) -> VertexOutput {
+@@ -426,7 +426,7 @@ struct FragmentInput {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(3) var<storage, read> tilePropsVector: array<SymbolTilePropsUBO>;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+-@group(0) @binding(4) var<uniform> props: SymbolEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: SymbolEvaluatedPropsUBO;
+ @group(1) @binding(0) var texture_sampler: sampler;
+ @group(1) @binding(1) var glyph_atlas: texture_2d<f32>;
+ 
+@@ -683,7 +683,7 @@ struct FragmentInput {
+ @group(0) @binding(0) var<uniform> paintParams: GlobalPaintParamsUBO;
+ @group(0) @binding(3) var<storage, read> tilePropsVector: array<SymbolTilePropsUBO>;
+ @group(0) @binding(1) var<uniform> globalIndex: GlobalIndexUBO;
+-@group(0) @binding(4) var<uniform> props: SymbolEvaluatedPropsUBO;
++@group(0) @binding(5) var<uniform> props: SymbolEvaluatedPropsUBO;
+ @group(1) @binding(0) var glyph_sampler: sampler;
+ @group(1) @binding(1) var glyph_image: texture_2d<f32>;
+ @group(1) @binding(2) var icon_sampler: sampler;
+diff --git a/metrics/ignores/platform-all.json b/metrics/ignores/platform-all.json
+index 3bbc30b46bde..fa405ee2b8dc 100644
+--- a/metrics/ignores/platform-all.json
++++ b/metrics/ignores/platform-all.json
+@@ -111,18 +111,18 @@
+     "render-tests/fill-extrusion-opacity/literal": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/fill-extrusion-opacity/default": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/fill-extrusion-opacity/function": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+-    "render-tests/fill-extrusion-vertical-gradient/default" : "https://github.com/mapbox/mapbox-gl-js/pull/9202",
++    "render-tests/fill-extrusion-vertical-gradient/default": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/fill-extrusion-vertical-gradient/false": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/fill-extrusion-base/zoom-and-property-function": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/fill-extrusion-base/property-function": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/extent/1024-symbol": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/projection/perspective": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+-    "render-tests/feature-state/promote-id-fill":"https://github.com/mapbox/mapbox-gl-js/pull/9202",
++    "render-tests/feature-state/promote-id-fill": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/feature-state/promote-id-symbol": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/feature-state/promote-id-line": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/feature-state/promote-id-circle": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+     "render-tests/feature-state/promote-id-fill-extrusion": "https://github.com/mapbox/mapbox-gl-js/pull/9202",
+-    "render-tests/line-pattern/with-dasharray":"https://github.com/mapbox/mapbox-gl-js/pull/9189",
++    "render-tests/line-pattern/with-dasharray": "https://github.com/mapbox/mapbox-gl-js/pull/9189",
+     "render-tests/symbol-sort-key/placement-tile-boundary-right-then-left": "https://github.com/mapbox/mapbox-gl-js/pull/9054",
+     "render-tests/tile-mode/streets-v11": "ignored due to flaky metrics results"
+ }
+diff --git a/src/mln/map/map.cpp b/src/mln/map/map.cpp
+index 566a6be27a67..d65f57ed3344 100644
+--- a/src/mln/map/map.cpp
++++ b/src/mln/map/map.cpp
+@@ -407,7 +407,8 @@ MapOptions Map::getMapOptions() const {
+                          .withCrossSourceCollisions(impl->crossSourceCollisions)
+                          .withNorthOrientation(impl->transform.getNorthOrientation())
+                          .withSize(impl->transform.getState().getSize())
+-                         .withPixelRatio(impl->pixelRatio));
++                         .withPixelRatio(impl->pixelRatio)
++                         .withProjectionType(impl->transform.getProjectionType()));
+ }
+ 
+ // MARK: - Projection mode
+@@ -421,6 +422,17 @@ ProjectionMode Map::getProjectionMode() const {
+     return impl->transform.getProjectionMode();
+ }
+ 
++// MARK: - Projection type
++
++void Map::setProjectionType(ProjectionType type) {
++    impl->transform.setProjectionType(type);
++    impl->onUpdate();
++}
++
++ProjectionType Map::getProjectionType() const {
++    return impl->transform.getProjectionType();
++}
++
+ // MARK: - Projection
+ 
+ ScreenCoordinate Map::pixelForLatLng(const LatLng& latLng) const {
+diff --git a/src/mln/map/map_impl.cpp b/src/mln/map/map_impl.cpp
+index 64ee606e45ed..5cd858e8bff7 100644
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -59,6 +59,7 @@ Map::Impl::Impl(RendererFrontend& frontend_,
+       style(std::make_unique<style::Style>(fileSource, pixelRatio, frontend_.getThreadPool())),
+       annotationManager(*style) {
+     transform.setNorthOrientation(mapOptions.northOrientation());
++    transform.setProjectionType(mapOptions.projectionType());
+     style->impl->setObserver(this);
+     rendererFrontend.setObserver(*this);
+     transform.resize(mapOptions.size());
+diff --git a/src/mln/map/map_options.cpp b/src/mln/map/map_options.cpp
+index 042393b4ef8d..0a54a7885144 100644
+--- a/src/mln/map/map_options.cpp
++++ b/src/mln/map/map_options.cpp
+@@ -12,6 +12,7 @@ public:
+     Size size = {64, 64};
+     float pixelRatio = 1.0;
+     bool fastPFOREnabled = false;
++    ProjectionType projectionType = ProjectionType::Mercator;
+ };
+ 
+ // These requires the complete type of Impl.
+@@ -92,4 +93,13 @@ bool MapOptions::fastPFOREnabled() const {
+     return impl_->fastPFOREnabled;
+ }
+ 
++MapOptions& MapOptions::withProjectionType(ProjectionType projection) {
++    impl_->projectionType = projection;
++    return *this;
++}
++
++ProjectionType MapOptions::projectionType() const {
++    return impl_->projectionType;
++}
++
+ } // namespace mln
+diff --git a/src/mln/map/mercator_projection.cpp b/src/mln/map/mercator_projection.cpp
+new file mode 100644
+index 000000000000..54f5db35fa02
+--- /dev/null
++++ b/src/mln/map/mercator_projection.cpp
+@@ -0,0 +1,51 @@
++#include <mln/map/mercator_projection.hpp>
++#include <mln/tile/tile_id.hpp>
++#include <mln/util/constants.hpp>
++#include <mln/util/projection.hpp>
++
++namespace mln {
++
++Point<double> MercatorProjection::project(const LatLng& latLng, double scale) const {
++    return Projection::project(latLng, scale);
++}
++
++LatLng MercatorProjection::unproject(const Point<double>& point, double scale, LatLng::WrapMode wrapMode) const {
++    return Projection::unproject(point, scale, wrapMode);
++}
++
++void MercatorProjection::tileMatrix(mat4& matrix, const UnwrappedTileID& tileID, double scale) const {
++    const uint64_t tileScale = 1ull << tileID.canonical.z;
++    const double s = Projection::worldSize(scale) / tileScale;
++
++    matrix::identity(matrix);
++    matrix::translate(matrix,
++                      matrix,
++                      static_cast<int64_t>(tileID.canonical.x + tileID.wrap * static_cast<int64_t>(tileScale)) * s,
++                      static_cast<int64_t>(tileID.canonical.y) * s,
++                      0);
++    matrix::scale(matrix, matrix, s / util::EXTENT, s / util::EXTENT, 1);
++}
++
++ProjectionData MercatorProjection::getProjectionData(const UnwrappedTileID& tileID,
++                                                     double scale,
++                                                     const mat4& projMatrix) const {
++    mat4 mainMatrix;
++    tileMatrix(mainMatrix, tileID, scale);
++    matrix::multiply(mainMatrix, projMatrix, mainMatrix);
++    return getProjectionData(tileID, mainMatrix);
++}
++
++ProjectionData MercatorProjection::getProjectionData(const UnwrappedTileID& tileID, const mat4& mainMatrix) const {
++    const double tileScale = static_cast<double>(1ull << tileID.canonical.z);
++    return {.mainMatrix = mainMatrix,
++            .tileMercatorCoords = {{tileID.canonical.x / tileScale,
++                                    tileID.canonical.y / tileScale,
++                                    1.0 / tileScale / util::EXTENT,
++                                    1.0 / tileScale / util::EXTENT}},
++            .clippingPlane = {{0, 0, 0, 0}},
++            .projectionTransition = 0,
++            .fallbackMatrix = mainMatrix,
++            .clipAntimeridian = false};
++}
++
++} // namespace mln
+diff --git a/src/mln/map/mercator_projection.hpp b/src/mln/map/mercator_projection.hpp
+new file mode 100644
+index 000000000000..660f3ac37b2f
+--- /dev/null
++++ b/src/mln/map/mercator_projection.hpp
+@@ -0,0 +1,18 @@
++#pragma once
++
++#include <mln/map/projection_base.hpp>
++
++namespace mln {
++
++class MercatorProjection final : public ProjectionBase {
++public:
++    Point<double> project(const LatLng&, double scale) const override;
++    LatLng unproject(const Point<double>&, double scale, LatLng::WrapMode) const override;
++
++    void tileMatrix(mat4&, const UnwrappedTileID&, double scale) const override;
++
++    ProjectionData getProjectionData(const UnwrappedTileID&, double scale, const mat4& projMatrix) const override;
++    ProjectionData getProjectionData(const UnwrappedTileID&, const mat4& mainMatrix) const override;
++};
++
++} // namespace mln
+diff --git a/src/mln/map/projection_base.hpp b/src/mln/map/projection_base.hpp
+new file mode 100644
+index 000000000000..bcc7861845c7
+--- /dev/null
++++ b/src/mln/map/projection_base.hpp
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <mln/util/geo.hpp>
++#include <mln/util/geometry.hpp>
++#include <mln/util/mat4.hpp>
++
++namespace mln {
++
++class UnwrappedTileID;
++
++struct ProjectionData {
++    mat4 mainMatrix{};
++    vec4 tileMercatorCoords{};
++    vec4 clippingPlane{};
++    double projectionTransition = 0;
++    mat4 fallbackMatrix{};
++    bool clipAntimeridian = false;
++};
++
++class ProjectionBase {
++public:
++    virtual ~ProjectionBase() = default;
++
++    virtual Point<double> project(const LatLng&, double scale) const = 0;
++    virtual LatLng unproject(const Point<double>&, double scale, LatLng::WrapMode) const = 0;
++
++    virtual void tileMatrix(mat4&, const UnwrappedTileID&, double scale) const = 0;
++
++    virtual ProjectionData getProjectionData(const UnwrappedTileID&, double scale, const mat4& projMatrix) const = 0;
++    virtual ProjectionData getProjectionData(const UnwrappedTileID&, const mat4& mainMatrix) const = 0;
++};
++
++} // namespace mln
+diff --git a/src/mln/map/transform.cpp b/src/mln/map/transform.cpp
+index c91a20a94934..26e5d2a8a942 100644
+--- a/src/mln/map/transform.cpp
++++ b/src/mln/map/transform.cpp
+@@ -582,6 +582,16 @@ ProjectionMode Transform::getProjectionMode() const {
+         .withYSkew(state.getYSkew());
+ }
+ 
++// MARK: - Projection type
++
++void Transform::setProjectionType(ProjectionType type) {
++    state.setProjectionType(type);
++}
++
++ProjectionType Transform::getProjectionType() const {
++    return state.getProjectionType();
++}
++
+ // MARK: - Transition
+ 
+ void Transform::startTransition(const CameraOptions& camera,
+diff --git a/src/mln/map/transform.hpp b/src/mln/map/transform.hpp
+index d9ec6acf284a..ecb43fa65e1a 100644
+--- a/src/mln/map/transform.hpp
++++ b/src/mln/map/transform.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <mln/map/camera.hpp>
+ #include <mln/map/projection_mode.hpp>
++#include <mln/map/projection_type.hpp>
+ #include <mln/map/map_observer.hpp>
+ #include <mln/map/mode.hpp>
+ #include <mln/map/transform_state.hpp>
+@@ -110,6 +111,10 @@ public:
+     void setProjectionMode(const ProjectionMode&);
+     ProjectionMode getProjectionMode() const;
+ 
++    // Map projection (Mercator / Globe). Only Mercator is rendered today.
++    void setProjectionType(ProjectionType);
++    ProjectionType getProjectionType() const;
++
+     // Transitions
+     bool inTransition() const;
+     void updateTransitions(const TimePoint& now);
+diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
+index 537a318eb67d..a0375d189cb4 100644
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -1,4 +1,5 @@
+ #include <mln/map/transform_state.hpp>
++#include <mln/map/mercator_projection.hpp>
+ #include <mln/math/angles.hpp>
+ #include <mln/math/clamp.hpp>
+ #include <mln/math/log2.hpp>
+@@ -44,6 +45,7 @@ double roundForAccuracy(double x) {
+ 
+ TransformState::TransformState(ConstrainMode constrainMode_, ViewportMode viewportMode_)
+     : bounds(LatLngBounds()),
++      projection(std::make_shared<MercatorProjection>()),
+       constrainMode(constrainMode_),
+       viewportMode(viewportMode_) {}
+ 
+@@ -105,6 +107,9 @@ void TransformState::setProperties(const TransformStateProperties& properties) {
+     if (properties.viewPortMode) {
+         setViewportMode(*properties.viewPortMode);
+     }
++    if (properties.projectionType) {
++        setProjectionType(*properties.projectionType);
++    }
+     if (properties.frustumOffset) {
+         setFrustumOffset(*properties.frustumOffset);
+     }
+@@ -113,16 +118,19 @@ void TransformState::setProperties(const TransformStateProperties& properties) {
+ // MARK: - Matrix
+ 
+ void TransformState::matrixFor(mat4& matrix, const UnwrappedTileID& tileID) const {
+-    const uint64_t tileScale = 1ull << tileID.canonical.z;
+-    const double s = Projection::worldSize(scale) / tileScale;
++    projection->tileMatrix(matrix, tileID, scale);
++}
++
++ProjectionData TransformState::getProjectionData(const UnwrappedTileID& tileID, const mat4& projMatrix) const {
++    return projection->getProjectionData(tileID, scale, projMatrix);
++}
+ 
+-    matrix::identity(matrix);
+-    matrix::translate(matrix,
+-                      matrix,
+-                      int64_t(tileID.canonical.x + tileID.wrap * static_cast<int64_t>(tileScale)) * s,
+-                      int64_t(tileID.canonical.y) * s,
+-                      0);
+-    matrix::scale(matrix, matrix, s / util::EXTENT, s / util::EXTENT, 1);
++ProjectionData TransformState::getProjectionData(const UnwrappedTileID& tileID) const {
++    return getProjectionData(tileID, getProjectionMatrix());
++}
++
++ProjectionData TransformState::getProjectionDataForMatrix(const UnwrappedTileID& tileID, const mat4& mainMatrix) const {
++    return projection->getProjectionData(tileID, mainMatrix);
+ }
+ 
+ void TransformState::getProjMatrix(mat4& projMatrix, uint16_t nearZ, bool aligned) const {
+@@ -467,6 +475,19 @@ void TransformState::setViewportMode(ViewportMode val) {
+     }
+ }
+ 
++// MARK: - Projection type
++
++ProjectionType TransformState::getProjectionType() const {
++    return projectionType;
++}
++
++void TransformState::setProjectionType(ProjectionType val) {
++    if (projectionType != val) {
++        projectionType = val;
++        requestMatricesUpdate = true;
++    }
++}
++
+ // MARK: - Camera options
+ 
+ CameraOptions TransformState::getCameraOptions(const std::optional<EdgeInsets>& padding) const {
+@@ -769,7 +790,7 @@ ScreenCoordinate TransformState::latLngToScreenCoordinate(const LatLng& latLng,
+         return {};
+     }
+ 
+-    Point<double> pt = Projection::project(latLng, scale) / util::tileSize_D;
++    Point<double> pt = projection->project(latLng, scale) / util::tileSize_D;
+     vec4 c = {{pt.x, pt.y, 0, 1}};
+     matrix::transformMat4(p, c, getCoordMatrix());
+     return {p[0] / p[3], size.height - p[1] / p[3]};
+@@ -811,7 +832,7 @@ TileCoordinate TransformState::screenCoordinateToTileCoordinate(const ScreenCoor
+ 
+ LatLng TransformState::screenCoordinateToLatLng(const ScreenCoordinate& point, LatLng::WrapMode wrapMode) const {
+     auto coord = screenCoordinateToTileCoordinate(point, 0);
+-    return Projection::unproject(coord.p, 1. / util::tileSize_D, wrapMode);
++    return projection->unproject(coord.p, 1. / util::tileSize_D, wrapMode);
+ }
+ 
+ mat4 TransformState::coordinatePointMatrix(const mat4& projMatrix) const {
+diff --git a/src/mln/map/transform_state.hpp b/src/mln/map/transform_state.hpp
+index 4ef5d1aefb92..67b395d0e126 100644
+--- a/src/mln/map/transform_state.hpp
++++ b/src/mln/map/transform_state.hpp
+@@ -2,6 +2,8 @@
+ 
+ #include <mln/map/camera.hpp>
+ #include <mln/map/mode.hpp>
++#include <mln/map/projection_base.hpp>
++#include <mln/map/projection_type.hpp>
+ #include <mln/util/camera.hpp>
+ #include <mln/util/constants.hpp>
+ #include <mln/util/geo.hpp>
+@@ -13,6 +15,7 @@
+ #include <cstdint>
+ #include <array>
+ #include <limits>
++#include <memory>
+ #include <optional>
+ 
+ namespace mln {
+@@ -97,6 +100,10 @@ struct TransformStateProperties {
+         viewPortMode = val;
+         return *this;
+     }
++    TransformStateProperties& withProjectionType(const std::optional<ProjectionType>& val) {
++        projectionType = val;
++        return *this;
++    }
+     TransformStateProperties withFrustumOffset(const std::optional<EdgeInsets>& val) {
+         frustumOffset = val;
+         return *this;
+@@ -121,6 +128,7 @@ struct TransformStateProperties {
+     std::optional<ConstrainMode> constrain;
+     std::optional<NorthOrientation> northOrientation;
+     std::optional<ViewportMode> viewPortMode;
++    std::optional<ProjectionType> projectionType;
+     std::optional<EdgeInsets> frustumOffset;
+ };
+ 
+@@ -133,6 +141,9 @@ public:
+     // Matrix
+     void matrixFor(mat4&, const UnwrappedTileID&) const;
+     void getProjMatrix(mat4& matrix, uint16_t nearZ = 1, bool aligned = false) const;
++    ProjectionData getProjectionData(const UnwrappedTileID&, const mat4& projMatrix) const;
++    ProjectionData getProjectionData(const UnwrappedTileID&) const;
++    ProjectionData getProjectionDataForMatrix(const UnwrappedTileID&, const mat4& mainMatrix) const;
+ 
+     // Dimensions
+     Size getSize() const;
+@@ -154,6 +165,10 @@ public:
+     ViewportMode getViewportMode() const;
+     void setViewportMode(ViewportMode val);
+ 
++    // Map projection (Mercator / Globe). Only Mercator is rendered today.
++    ProjectionType getProjectionType() const;
++    void setProjectionType(ProjectionType val);
++
+     CameraOptions getCameraOptions(const std::optional<EdgeInsets>&) const;
+ 
+     // EdgeInsects
+@@ -299,8 +314,11 @@ private:
+     const mat4& getInvertedMatrix() const;
+ 
+ private:
++    std::shared_ptr<const ProjectionBase> projection;
++
+     ConstrainMode constrainMode;
+     ViewportMode viewportMode;
++    ProjectionType projectionType = ProjectionType::Mercator;
+ 
+     // animation state
+     bool rotating = false;
+diff --git a/src/mln/renderer/layer_tweaker.cpp b/src/mln/renderer/layer_tweaker.cpp
+index f9e4ad80c79c..01866fc6b530 100644
+--- a/src/mln/renderer/layer_tweaker.cpp
++++ b/src/mln/renderer/layer_tweaker.cpp
+@@ -1,5 +1,8 @@
+ #include <mln/renderer/layer_tweaker.hpp>
+ 
++#include <mln/gfx/context.hpp>
++#include <mln/gfx/drawable.hpp>
++
+ #include <mln/map/transform_state.hpp>
+ #include <mln/style/layer_properties.hpp>
+ #include <mln/renderer/render_tree.hpp>
+@@ -7,6 +10,7 @@
+ #include <mln/shaders/layer_ubo.hpp>
+ #include <mln/util/mat4.hpp>
+ #include <mln/util/containers.hpp>
++#include <mln/util/convert.hpp>
+ 
+ #if MLN_RENDER_BACKEND_METAL
+ #include <mln/util/monotonic_timer.hpp>
+@@ -44,6 +48,44 @@ mat4 LayerTweaker::getTileMatrix(const UnwrappedTileID& tileID,
+         tileID, tileMatrix, translation, anchor, parameters.state, inViewportPixelUnits);
+ }
+ 
++ProjectionData LayerTweaker::getProjectionData(const UnwrappedTileID& tileID,
++                                               const PaintParameters& parameters,
++                                               const std::array<float, 2>& translation,
++                                               style::TranslateAnchorType anchor,
++                                               bool nearClipped,
++                                               bool inViewportPixelUnits,
++                                               const gfx::Drawable& drawable,
++                                               bool aligned) {
++    return parameters.state.getProjectionDataForMatrix(
++        tileID,
++        getTileMatrix(tileID, parameters, translation, anchor, nearClipped, inViewportPixelUnits, drawable, aligned));
++}
++
++shaders::ProjectionUBO LayerTweaker::toProjectionUBO(const ProjectionData& data) {
++    return {.matrix = util::cast<float>(data.mainMatrix),
++            .fallback_matrix = util::cast<float>(data.fallbackMatrix),
++            .tile_mercator_coords = util::cast<float>(data.tileMercatorCoords),
++            .clipping_plane = util::cast<float>(data.clippingPlane),
++            .projection_transition = static_cast<float>(data.projectionTransition),
++            .pad1 = 0,
++            .pad2 = 0,
++            .pad3 = 0};
++}
++
++#if MLN_UBO_CONSOLIDATION
++void LayerTweaker::uploadProjectionUBOs(gfx::UniformBufferArray& layerUniforms,
++                                        const std::vector<shaders::ProjectionUBO>& ubos,
++                                        gfx::Context& context) {
++    const size_t size = sizeof(shaders::ProjectionUBO) * ubos.size();
++    if (!projectionUniformBuffer || projectionUniformBuffer->getSize() < size) {
++        projectionUniformBuffer = context.createUniformBuffer(ubos.data(), size, false, true);
++    } else {
++        projectionUniformBuffer->update(ubos.data(), size);
++    }
++    layerUniforms.set(shaders::idProjectionUBO, projectionUniformBuffer);
++}
++#endif
++
+ void LayerTweaker::updateProperties(Immutable<style::LayerProperties> newProps) {
+     evaluatedProperties = std::move(newProps);
+     propertiesUpdated = true;
+diff --git a/src/mln/renderer/layers/background_layer_tweaker.cpp b/src/mln/renderer/layers/background_layer_tweaker.cpp
+index e21c67ab638d..8b9ac132e73b 100644
+--- a/src/mln/renderer/layers/background_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/background_layer_tweaker.cpp
+@@ -76,6 +76,7 @@ void BackgroundLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPara
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
+     std::vector<BackgroundDrawableUnionUBO> drawableUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -89,8 +90,15 @@ void BackgroundLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPara
+                               context.getGenericShader(parameters.shaders, std::string(BackgroundPatternShaderName))));
+ 
+         const UnwrappedTileID tileID = drawable.getTileID()->toUnwrapped();
+-        const auto matrix = getTileMatrix(
++        const auto projection = getProjectionData(
+             tileID, parameters, {0.f, 0.f}, TranslateAnchorType::Viewport, false, false, drawable);
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, context);
++#endif
+ 
+ #if !MLN_UBO_CONSOLIDATION
+         auto& drawableUniforms = drawable.mutableUniformBuffers();
+@@ -156,6 +164,7 @@ void BackgroundLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPara
+     }
+ 
+     layerUniforms.set(idBackgroundDrawableUBO, drawableUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/circle_layer_tweaker.cpp b/src/mln/renderer/layers/circle_layer_tweaker.cpp
+index a88e31eefa01..01fb646b5760 100644
+--- a/src/mln/renderer/layers/circle_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/circle_layer_tweaker.cpp
+@@ -61,6 +61,7 @@ void CircleLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamete
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
+     std::vector<CircleDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -80,8 +81,15 @@ void CircleLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamete
+         const auto anchor = evaluated.get<CircleTranslateAnchor>();
+         constexpr bool inViewportPixelUnits = false; // from RenderTile::translatedMatrix
+         constexpr bool nearClipped = false;
+-        const auto matrix = getTileMatrix(
++        const auto projection = getProjectionData(
+             tileID, parameters, translation, anchor, nearClipped, inViewportPixelUnits, drawable);
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, context);
++#endif
+ 
+         const auto pixelsToTileUnits = tileID.pixelsToTileUnits(1.0f, zoom);
+         const auto extrudeScale = pitchWithMap ? std::array<float, 2>{pixelsToTileUnits, pixelsToTileUnits}
+@@ -125,6 +133,7 @@ void CircleLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamete
+     }
+ 
+     layerUniforms.set(idCircleDrawableUBO, drawableUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/collision_layer_tweaker.cpp b/src/mln/renderer/layers/collision_layer_tweaker.cpp
+index 5d1cbbc4378b..f367489e58d7 100644
+--- a/src/mln/renderer/layers/collision_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/collision_layer_tweaker.cpp
+@@ -48,8 +48,10 @@ void CollisionLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParam
+         const auto anchor = data.translateAnchor;
+         constexpr bool nearClipped = false;
+         constexpr bool inViewportPixelUnits = false;
+-        const auto matrix = getTileMatrix(
++        const auto projection = getProjectionData(
+             tileID, parameters, translate, anchor, nearClipped, inViewportPixelUnits, drawable);
++        const auto& matrix = projection.mainMatrix;
++        const auto projectionUBO = toProjectionUBO(projection);
+ 
+         // extrude scale
+         const auto pixelRatio = tileID.pixelsToTileUnits(1.0f, static_cast<float>(parameters.state.getZoom()));
+@@ -68,6 +70,7 @@ void CollisionLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParam
+         auto& drawableUniforms = drawable.mutableUniformBuffers();
+         drawableUniforms.createOrUpdate(idCollisionDrawableUBO, &drawableUBO, context);
+         drawableUniforms.createOrUpdate(idCollisionTilePropsUBO, &tilePropsUBO, context);
++        drawableUniforms.createOrUpdate(idProjectionUBO, &projectionUBO, context);
+     });
+ }
+ 
+diff --git a/src/mln/renderer/layers/color_relief_layer_tweaker.cpp b/src/mln/renderer/layers/color_relief_layer_tweaker.cpp
+index 764961916993..6cb9ea42f19e 100644
+--- a/src/mln/renderer/layers/color_relief_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/color_relief_layer_tweaker.cpp
+@@ -38,6 +38,7 @@ void ColorReliefLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPar
+     int i = 0;
+     std::vector<ColorReliefDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<ColorReliefTilePropsUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -46,9 +47,11 @@ void ColorReliefLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPar
+         }
+ 
+         const UnwrappedTileID tileID = drawable.getTileID()->toUnwrapped();
++        const auto projection = parameters.projectionDataForTile(tileID);
+ 
+ #if MLN_UBO_CONSOLIDATION
+-        drawableUBOVector[i].matrix = util::cast<float>(parameters.matrixForTile(tileID));
++        drawableUBOVector[i].matrix = util::cast<float>(projection.mainMatrix);
++        projectionUBOVector[i] = toProjectionUBO(projection);
+ 
+         // Get tile props from drawable data (set during creation)
+         if (const auto& drawableData = drawable.getData()) {
+@@ -60,10 +63,12 @@ void ColorReliefLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPar
+         drawable.setUBOIndex(i++);
+ #else
+         ColorReliefDrawableUBO drawableUBO;
+-        drawableUBO.matrix = util::cast<float>(parameters.matrixForTile(tileID));
++        drawableUBO.matrix = util::cast<float>(projection.mainMatrix);
++        const auto projectionUBO = toProjectionUBO(projection);
+ 
+         auto& drawableUniforms = drawable.mutableUniformBuffers();
+         drawableUniforms.createOrUpdate(idColorReliefDrawableUBO, &drawableUBO, context);
++        drawableUniforms.createOrUpdate(idProjectionUBO, &projectionUBO, context);
+         // Tile props UBO is set during drawable creation, doesn't change per frame
+ #endif
+     });
+@@ -87,6 +92,7 @@ void ColorReliefLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPar
+ 
+     layerUniforms.set(idColorReliefDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idColorReliefTilePropsUBO, tilePropsUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/fill_extrusion_layer_tweaker.cpp b/src/mln/renderer/layers/fill_extrusion_layer_tweaker.cpp
+index 014ce746e2fc..d030823b6371 100644
+--- a/src/mln/renderer/layers/fill_extrusion_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/fill_extrusion_layer_tweaker.cpp
+@@ -68,6 +68,7 @@ void FillExtrusionLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintP
+     int i = 0;
+     std::vector<FillExtrusionDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<FillExtrusionTilePropsUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -87,8 +88,15 @@ void FillExtrusionLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintP
+         const auto anchor = evaluated.get<FillExtrusionTranslateAnchor>();
+         constexpr bool inViewportPixelUnits = false; // from RenderTile::translatedMatrix
+         constexpr bool nearClipped = true;
+-        const auto matrix = getTileMatrix(
++        const auto projection = getProjectionData(
+             tileID, parameters, translation, anchor, nearClipped, inViewportPixelUnits, drawable);
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, context);
++#endif
+ 
+         const auto tileRatio = 1 / tileID.pixelsToTileUnits(1, state.getIntegerZoom());
+         const auto zoomScale = state.zoomScale(tileID.canonical.z);
+@@ -171,6 +179,7 @@ void FillExtrusionLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintP
+ 
+     layerUniforms.set(idFillExtrusionDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idFillExtrusionTilePropsUBO, tilePropsUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/fill_layer_tweaker.cpp b/src/mln/renderer/layers/fill_layer_tweaker.cpp
+index 260ed2cad061..cf10dee3140b 100644
+--- a/src/mln/renderer/layers/fill_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/fill_layer_tweaker.cpp
+@@ -61,6 +61,7 @@ void FillLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+     int i = 0;
+     std::vector<FillDrawableUnionUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<FillTilePropsUnionUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -85,8 +86,15 @@ void FillLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+ 
+         constexpr bool inViewportPixelUnits = false; // from RenderTile::translatedMatrix
+         constexpr bool nearClipped = false;
+-        const auto matrix = getTileMatrix(
++        const auto projection = getProjectionData(
+             tileID, parameters, translation, anchor, nearClipped, inViewportPixelUnits, drawable);
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, context);
++#endif
+ 
+         // from FillPatternProgram::layoutUniformValues
+         const auto tileRatio = 1.0f / tileID.pixelsToTileUnits(1.0f, intZoom);
+@@ -265,6 +273,7 @@ void FillLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+ 
+     layerUniforms.set(idFillDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idFillTilePropsUBO, tilePropsUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/heatmap_layer_tweaker.cpp b/src/mln/renderer/layers/heatmap_layer_tweaker.cpp
+index 3141be94d76d..22c726c1b38f 100644
+--- a/src/mln/renderer/layers/heatmap_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/heatmap_layer_tweaker.cpp
+@@ -48,6 +48,7 @@ void HeatmapLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamet
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
+     std::vector<HeatmapDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -66,8 +67,15 @@ void HeatmapLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamet
+ 
+         constexpr bool nearClipped = false;
+         constexpr bool inViewportPixelUnits = false;
+-        const auto matrix = getTileMatrix(
++        const auto projection = getProjectionData(
+             tileID, parameters, {0.f, 0.f}, TranslateAnchorType::Viewport, nearClipped, inViewportPixelUnits, drawable);
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, context);
++#endif
+ 
+ #if MLN_UBO_CONSOLIDATION
+         drawableUBOVector[i] = {
+@@ -99,6 +107,7 @@ void HeatmapLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamet
+     }
+ 
+     layerUniforms.set(idHeatmapDrawableUBO, drawableUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/hillshade_layer_tweaker.cpp b/src/mln/renderer/layers/hillshade_layer_tweaker.cpp
+index 7bbe5c4ace84..c0fe6192e795 100644
+--- a/src/mln/renderer/layers/hillshade_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/hillshade_layer_tweaker.cpp
+@@ -163,6 +163,7 @@ void HillshadeLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParam
+     int i = 0;
+     std::vector<HillshadeDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<HillshadeTilePropsUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -172,8 +173,15 @@ void HillshadeLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParam
+ 
+         const UnwrappedTileID tileID = drawable.getTileID()->toUnwrapped();
+ 
+-        const auto matrix = getTileMatrix(
++        const auto projection = getProjectionData(
+             tileID, parameters, {0.f, 0.f}, TranslateAnchorType::Viewport, false, false, drawable, true);
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, parameters.context);
++#endif
+ 
+ #if MLN_UBO_CONSOLIDATION
+         drawableUBOVector[i] = {
+@@ -226,6 +234,7 @@ void HillshadeLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParam
+ 
+     layerUniforms.set(idHillshadeDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idHillshadeTilePropsUBO, tilePropsUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/line_layer_tweaker.cpp b/src/mln/renderer/layers/line_layer_tweaker.cpp
+index 3535dae6325c..ec610852def0 100644
+--- a/src/mln/renderer/layers/line_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/line_layer_tweaker.cpp
+@@ -199,6 +199,7 @@ void LineLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+     int i = 0;
+     std::vector<LineDrawableUnionUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<LineTilePropsUnionUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -224,8 +225,15 @@ void LineLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+         const auto anchor = evaluated.get<LineTranslateAnchor>();
+         constexpr bool nearClipped = false;
+         constexpr bool inViewportPixelUnits = false; // from RenderTile::translatedMatrix
+-        const auto matrix = getTileMatrix(
++        const auto projection = getProjectionData(
+             tileID, parameters, translation, anchor, nearClipped, inViewportPixelUnits, drawable);
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, context);
++#endif
+ 
+ #if !MLN_UBO_CONSOLIDATION
+         auto& drawableUniforms = drawable.mutableUniformBuffers();
+@@ -416,6 +424,7 @@ void LineLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+ 
+     layerUniforms.set(idLineDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idLineTilePropsUBO, tilePropsUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/raster_layer_tweaker.cpp b/src/mln/renderer/layers/raster_layer_tweaker.cpp
+index b3b97e65c767..f81ac2ee69fd 100644
+--- a/src/mln/renderer/layers/raster_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/raster_layer_tweaker.cpp
+@@ -72,6 +72,7 @@ void RasterLayerTweaker::execute([[maybe_unused]] LayerGroupBase& layerGroup,
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
+     std::vector<RasterDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+@@ -79,14 +80,15 @@ void RasterLayerTweaker::execute([[maybe_unused]] LayerGroupBase& layerGroup,
+             return;
+         }
+ 
+-        mat4 matrix;
++        ProjectionData projection;
+         if (!drawable.getTileID()) {
+             // this is an image drawable
+             if (const auto& data = drawable.getData()) {
+                 const gfx::ImageDrawableData& imageData = static_cast<const gfx::ImageDrawableData&>(*data);
+-                matrix = imageData.matrix;
++                mat4 imageMatrix = imageData.matrix;
+                 multiplyWithProjectionMatrix(
+-                    /*in-out*/ matrix, parameters, drawable, /*nearClipped*/ false, /*aligned*/ true);
++                    /*in-out*/ imageMatrix, parameters, drawable, /*nearClipped*/ false, /*aligned*/ true);
++                projection = parameters.state.getProjectionDataForMatrix(UnwrappedTileID(0, 0, 0), imageMatrix);
+             } else {
+                 Log::Error(Event::General, "Invalid raster layer drawable: neither tile id nor image data is set.");
+                 return;
+@@ -94,15 +96,22 @@ void RasterLayerTweaker::execute([[maybe_unused]] LayerGroupBase& layerGroup,
+         } else {
+             // this is a tile drawable
+             const UnwrappedTileID tileID = drawable.getTileID()->toUnwrapped();
+-            matrix = getTileMatrix(tileID,
+-                                   parameters,
+-                                   {0.f, 0.f},
+-                                   TranslateAnchorType::Viewport,
+-                                   false,
+-                                   false,
+-                                   drawable,
+-                                   !parameters.state.isChanging());
++            projection = getProjectionData(tileID,
++                                           parameters,
++                                           {0.f, 0.f},
++                                           TranslateAnchorType::Viewport,
++                                           false,
++                                           false,
++                                           drawable,
++                                           !parameters.state.isChanging());
+         }
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, parameters.context);
++#endif
+ 
+ #if MLN_UBO_CONSOLIDATION
+         drawableUBOVector[i] = {
+@@ -130,6 +139,7 @@ void RasterLayerTweaker::execute([[maybe_unused]] LayerGroupBase& layerGroup,
+     }
+ 
+     layerUniforms.set(idRasterDrawableUBO, drawableUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/symbol_layer_tweaker.cpp b/src/mln/renderer/layers/symbol_layer_tweaker.cpp
+index 152cd7d3b5b4..b5d03e98aaee 100644
+--- a/src/mln/renderer/layers/symbol_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/symbol_layer_tweaker.cpp
+@@ -93,6 +93,7 @@ void SymbolLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamete
+     int i = 0;
+     std::vector<SymbolDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<SymbolTilePropsUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
++    std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+ 
+     const auto camDist = state.getCameraToCenterDistance();
+@@ -124,19 +125,29 @@ void SymbolLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamete
+         // from RenderTile::translatedMatrix
+         const auto translate = isText ? evaluated.get<style::TextTranslate>() : evaluated.get<style::IconTranslate>();
+ 
+-        mat4 matrix;
++        ProjectionData projection;
+ 
+         if (isScreenSpace) {
+-            matrix::ortho(matrix, 0, util::EXTENT, -util::EXTENT, 0, 0, 1);
+-            matrix::translate(matrix, matrix, 0, -util::EXTENT, 0);
+-            matrix::translate(matrix, matrix, translate[0], translate[1], 0);
++            mat4 screenMatrix;
++            matrix::ortho(screenMatrix, 0, util::EXTENT, -util::EXTENT, 0, 0, 1);
++            matrix::translate(screenMatrix, screenMatrix, 0, -util::EXTENT, 0);
++            matrix::translate(screenMatrix, screenMatrix, translate[0], translate[1], 0);
++            projection = parameters.state.getProjectionDataForMatrix(tileID, screenMatrix);
+         } else {
+             constexpr bool nearClipped = false;
+             constexpr bool inViewportPixelUnits = false;
+             const auto anchor = isText ? evaluated.get<style::TextTranslateAnchor>()
+                                        : evaluated.get<style::IconTranslateAnchor>();
+-            matrix = getTileMatrix(tileID, parameters, translate, anchor, nearClipped, inViewportPixelUnits, drawable);
++            projection = getProjectionData(
++                tileID, parameters, translate, anchor, nearClipped, inViewportPixelUnits, drawable);
+         }
++        const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++        projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++        const auto projectionUBO = toProjectionUBO(projection);
++        drawable.mutableUniformBuffers().createOrUpdate(idProjectionUBO, &projectionUBO, context);
++#endif
+ 
+         // from symbol_program, makeValues
+         const auto currentZoom = static_cast<float>(parameters.state.getZoom());
+@@ -233,6 +244,7 @@ void SymbolLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParamete
+ 
+     layerUniforms.set(idSymbolDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idSymbolTilePropsUBO, tilePropsUniformBuffer);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/paint_parameters.cpp b/src/mln/renderer/paint_parameters.cpp
+index 1af20a01bbb8..a55243c508b2 100644
+--- a/src/mln/renderer/paint_parameters.cpp
++++ b/src/mln/renderer/paint_parameters.cpp
+@@ -111,10 +111,11 @@ void PaintParameters::updateStencilBufferAvailability() {
+ #endif
+ 
+ mat4 PaintParameters::matrixForTile(const UnwrappedTileID& tileID, bool aligned) const {
+-    mat4 matrix;
+-    state.matrixFor(matrix, tileID);
+-    matrix::multiply(matrix, aligned ? transformParams.alignedProjMatrix : transformParams.projMatrix, matrix);
+-    return matrix;
++    return projectionDataForTile(tileID, aligned).mainMatrix;
++}
++
++ProjectionData PaintParameters::projectionDataForTile(const UnwrappedTileID& tileID, bool aligned) const {
++    return state.getProjectionData(tileID, aligned ? transformParams.alignedProjMatrix : transformParams.projMatrix);
+ }
+ 
+ gfx::DepthMode PaintParameters::depthModeForSublayer([[maybe_unused]] uint8_t n, gfx::DepthMaskType mask) const {
+diff --git a/src/mln/renderer/paint_parameters.hpp b/src/mln/renderer/paint_parameters.hpp
+index c09ca9537259..95345e38488b 100644
+--- a/src/mln/renderer/paint_parameters.hpp
++++ b/src/mln/renderer/paint_parameters.hpp
+@@ -96,6 +96,7 @@ public:
+     gfx::ColorMode colorModeForRenderPass() const;
+ 
+     mat4 matrixForTile(const UnwrappedTileID&, bool aligned = false) const;
++    ProjectionData projectionDataForTile(const UnwrappedTileID&, bool aligned = false) const;
+ 
+     // Stencil handling
+ public:
+diff --git a/src/mln/renderer/render_tile.cpp b/src/mln/renderer/render_tile.cpp
+index 60133050c661..e1c7759c7ac1 100644
+--- a/src/mln/renderer/render_tile.cpp
++++ b/src/mln/renderer/render_tile.cpp
+@@ -135,10 +135,8 @@ void RenderTile::prepare(const SourcePrepareParameters& parameters) {
+     // nearClippedMatrix has near plane moved further, to enhance depth buffer
+     // precision
+     const auto& transform = parameters.transform;
+-    transform.state.matrixFor(matrix, id);
+-    transform.state.matrixFor(nearClippedMatrix, id);
+-    matrix::multiply(matrix, transform.projMatrix, matrix);
+-    matrix::multiply(nearClippedMatrix, transform.nearClippedProjMatrix, nearClippedMatrix);
++    matrix = transform.state.getProjectionData(id, transform.projMatrix).mainMatrix;
++    nearClippedMatrix = transform.state.getProjectionData(id, transform.nearClippedProjMatrix).mainMatrix;
+ }
+ 
+ void RenderTile::setFeatureState(const LayerFeatureStates& states) {
+diff --git a/src/mln/renderer/sources/render_tile_source.cpp b/src/mln/renderer/sources/render_tile_source.cpp
+index a10d76b3c7b8..76c86a2907e2 100644
+--- a/src/mln/renderer/sources/render_tile_source.cpp
++++ b/src/mln/renderer/sources/render_tile_source.cpp
+@@ -103,6 +103,7 @@ public:
+ #if MLN_UBO_CONSOLIDATION
+         int i = 0;
+         std::vector<LineDrawableUnionUBO> drawableUBOVector(layerGroup.getDrawableCount());
++        std::vector<shaders::ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+         visitLayerGroupDrawables(layerGroup, [&](gfx::Drawable& drawable) {
+             if (!drawable.getTileID().has_value()) {
+@@ -114,8 +115,15 @@ public:
+             mat4 tileMatrix;
+             parameters.state.matrixFor(/*out*/ tileMatrix, tileID);
+ 
+-            const auto matrix = LayerTweaker::getTileMatrix(
++            const auto projection = getProjectionData(
+                 tileID, parameters, {{0, 0}}, style::TranslateAnchorType::Viewport, false, false, drawable, false);
++            const auto& matrix = projection.mainMatrix;
++#if MLN_UBO_CONSOLIDATION
++            projectionUBOVector[i] = toProjectionUBO(projection);
++#else
++            const auto projectionUBO = toProjectionUBO(projection);
++            drawable.mutableUniformBuffers().createOrUpdate(shaders::idProjectionUBO, &projectionUBO, context);
++#endif
+ 
+ #if MLN_UBO_CONSOLIDATION
+             drawableUBOVector[i].lineDrawableUBO = {
+@@ -150,6 +158,7 @@ public:
+             drawableUniformBuffer->update(drawableUBOVector.data(), drawableUBOVectorSize);
+         }
+         layerUniforms.set(idLineDrawableUBO, drawableUniformBuffer);
++        uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
+ #endif
+     }
+ 
+diff --git a/src/mln/text/placement.cpp b/src/mln/text/placement.cpp
+index 2834336fece9..44569a86ab08 100644
+--- a/src/mln/text/placement.cpp
++++ b/src/mln/text/placement.cpp
+@@ -1504,9 +1504,7 @@ void TilePlacement::placeSymbolBucket(const BucketPlacementData& params, std::se
+         NeighborTileData(const CollisionIndex& collisionIndex, UnwrappedTileID id_, Point<float> shift_)
+             : id(id_),
+               shift(shift_),
+-              matrix() {
+-            collisionIndex.getTransformState().matrixFor(matrix, id);
+-            matrix::multiply(matrix, collisionIndex.getTransformState().getProjectionMatrix(), matrix);
++              matrix(collisionIndex.getTransformState().getProjectionData(id).mainMatrix) {
+             borders = collisionIndex.projectTileBoundaries(matrix);
+         }
+ 
+diff --git a/src/mln/tile/geometry_tile.cpp b/src/mln/tile/geometry_tile.cpp
+index 6de108030369..1909c3afaa72 100644
+--- a/src/mln/tile/geometry_tile.cpp
++++ b/src/mln/tile/geometry_tile.cpp
+@@ -517,9 +517,7 @@ void GeometryTile::queryRenderedFeatures(std::unordered_map<std::string, std::ve
+ 
+     const float queryPadding = getQueryPadding(layers);
+ 
+-    mat4 posMatrix;
+-    transformState.matrixFor(posMatrix, id.toUnwrapped());
+-    matrix::multiply(posMatrix, projMatrix, posMatrix);
++    const mat4 posMatrix = transformState.getProjectionData(id.toUnwrapped(), projMatrix).mainMatrix;
+ 
+     layoutResult->featureIndex->query(result,
+                                       queryGeometry,
+diff --git a/test/map/transform.test.cpp b/test/map/transform.test.cpp
+index 809ef6307545..c88475d9bb7e 100644
+--- a/test/map/transform.test.cpp
++++ b/test/map/transform.test.cpp
+@@ -2,9 +2,11 @@
+ 
+ #include <gmock/gmock.h>
+ #include <cmath>
++#include <mln/map/mercator_projection.hpp>
+ #include <mln/map/transform.hpp>
+ #include <mln/math/angles.hpp>
+ #include <mln/util/geo.hpp>
++#include <mln/util/projection.hpp>
+ #include <mln/util/quaternion.hpp>
+ 
+ #include <numbers>
+@@ -1243,3 +1245,112 @@ TEST(Camera, SetOrientationWithRollNoPitch) {
+     EXPECT_NEAR(pitch, pitch_, 1.0e-9);
+     EXPECT_NEAR(0.0, roll_, 1.0e-9);
+ }
++
++namespace {
++
++// The tile matrix as TransformState::matrixFor computed it before the projection seam.
++mat4 referenceTileMatrix(double scale, const UnwrappedTileID& tileID) {
++    const uint64_t tileScale = 1ull << tileID.canonical.z;
++    const double s = Projection::worldSize(scale) / tileScale;
++
++    mat4 matrix;
++    matrix::identity(matrix);
++    matrix::translate(matrix,
++                      matrix,
++                      static_cast<double>(tileID.canonical.x + tileID.wrap * static_cast<int64_t>(tileScale)) * s,
++                      static_cast<double>(tileID.canonical.y) * s,
++                      0);
++    matrix::scale(matrix, matrix, s / util::EXTENT, s / util::EXTENT, 1);
++    return matrix;
++}
++
++} // namespace
++
++TEST(MercatorProjection, MatchesStaticProjection) {
++    const MercatorProjection projection;
++    for (const double zoom : {0.0, 1.0, 3.5, 7.25, 12.0, 18.0}) {
++        const double scale = std::pow(2.0, zoom);
++        for (const double lat : {-85.0, -45.0, 0.0, 30.0, 80.0}) {
++            for (const double lon : {-180.0, -90.0, 0.0, 45.0, 179.0}) {
++                const LatLng latLng{lat, lon};
++                const Point<double> expected = Projection::project(latLng, scale);
++                const Point<double> actual = projection.project(latLng, scale);
++                EXPECT_EQ(expected.x, actual.x);
++                EXPECT_EQ(expected.y, actual.y);
++
++                const LatLng unprojected = projection.unproject(actual, scale, LatLng::Wrapped);
++                const LatLng expectedUnprojected = Projection::unproject(expected, scale, LatLng::Wrapped);
++                EXPECT_EQ(expectedUnprojected.latitude(), unprojected.latitude());
++                EXPECT_EQ(expectedUnprojected.longitude(), unprojected.longitude());
++            }
++        }
++    }
++}
++
++TEST(TransformState, ProjectionDataMatchesTileMatrix) {
++    Transform transform;
++    const std::vector<UnwrappedTileID> tileIDs{
++        {0, 0, 0}, {1, 0, 1}, {3, 5, 2}, {10, 512, 340}, {14, 16000, 8000}, {-1, CanonicalTileID{2, 1, 1}}};
++
++    for (const Size size : {Size{1, 1}, Size{512, 512}, Size{1024, 768}, Size{333, 777}}) {
++        transform.resize(size);
++        for (const double zoom : {0.0, 2.5, 6.0, 11.75, 16.0}) {
++            for (const double pitch : {0.0, 30.0, 60.0}) {
++                for (const double bearing : {0.0, 45.0, 210.0}) {
++                    for (const double roll : {0.0, 15.0}) {
++                        transform.jumpTo(CameraOptions()
++                                             .withCenter(LatLng{37.7749, -122.4194})
++                                             .withZoom(zoom)
++                                             .withPitch(pitch)
++                                             .withBearing(bearing)
++                                             .withRoll(roll));
++                        const TransformState& state = transform.getState();
++                        const double scale = state.getScale();
++
++                        for (const bool aligned : {false, true}) {
++                            mat4 projMatrix;
++                            state.getProjMatrix(projMatrix, 1, aligned);
++
++                            for (const auto& tileID : tileIDs) {
++                                const mat4 tileMatrix = referenceTileMatrix(scale, tileID);
++                                mat4 actualTileMatrix;
++                                state.matrixFor(actualTileMatrix, tileID);
++                                EXPECT_EQ(tileMatrix, actualTileMatrix);
++
++                                mat4 expected;
++                                matrix::multiply(expected, projMatrix, tileMatrix);
++                                EXPECT_EQ(expected, state.getProjectionData(tileID, projMatrix).mainMatrix);
++                            }
++                        }
++
++                        for (const auto& tileID : tileIDs) {
++                            mat4 expected;
++                            matrix::multiply(expected, state.getProjectionMatrix(), referenceTileMatrix(scale, tileID));
++                            EXPECT_EQ(expected, state.getProjectionData(tileID).mainMatrix);
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++TEST(TransformState, ProjectionDataMercatorFields) {
++    Transform transform;
++    transform.resize({512, 512});
++    transform.jumpTo(CameraOptions().withCenter(LatLng{10, 20}).withZoom(5.0).withPitch(20.0).withBearing(30.0));
++    const TransformState& state = transform.getState();
++
++    for (const auto& tileID :
++         {UnwrappedTileID{0, 0, 0}, UnwrappedTileID{3, 5, 2}, UnwrappedTileID{-1, CanonicalTileID{2, 1, 1}}}) {
++        const ProjectionData data = state.getProjectionData(tileID);
++        const double tileScale = static_cast<double>(1u << tileID.canonical.z);
++        EXPECT_EQ(data.mainMatrix, data.fallbackMatrix);
++        EXPECT_EQ(tileID.canonical.x / tileScale, data.tileMercatorCoords[0]);
++        EXPECT_EQ(tileID.canonical.y / tileScale, data.tileMercatorCoords[1]);
++        EXPECT_EQ(1.0 / tileScale / util::EXTENT, data.tileMercatorCoords[2]);
++        EXPECT_EQ(1.0 / tileScale / util::EXTENT, data.tileMercatorCoords[3]);
++        EXPECT_EQ((vec4{{0, 0, 0, 0}}), data.clippingPlane);
++        EXPECT_EQ(0.0, data.projectionTransition);
++    }
++}
+diff --git a/test/text/cross_tile_symbol_index.test.cpp b/test/text/cross_tile_symbol_index.test.cpp
+index 281eeaced35b..fcc351704b36 100644
+--- a/test/text/cross_tile_symbol_index.test.cpp
++++ b/test/text/cross_tile_symbol_index.test.cpp
+@@ -393,8 +393,7 @@ void populatePosMatrix(mat4& posMatrix, const OverscaledTileID& tileId, double l
+     TransformState transformState;
+     transformState.setSize({512, 512});
+     transformState.setLatLngZoom(LatLng(lat, lon), zoom);
+-    transformState.matrixFor(posMatrix, tileId.toUnwrapped());
+-    matrix::multiply(posMatrix, transformState.getProjectionMatrix(), posMatrix);
++    posMatrix = transformState.getProjectionData(tileId.toUnwrapped()).mainMatrix;
+ }
+ 
+ } // namespace

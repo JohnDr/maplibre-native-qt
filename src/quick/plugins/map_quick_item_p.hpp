@@ -40,6 +40,7 @@ public:
     double m_zoomLevel{};
     QString m_style;
     bool m_styleLoaded{};
+    MapQuickItem::ProjectionType m_projectionType = MapQuickItem::Mercator;
 
     QString m_mapItemsBefore; // TODO: make this a property
     QList<StyleParameter *> m_mapParameters;

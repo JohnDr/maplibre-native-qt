@@ -28,6 +28,14 @@
 #endif
 
 #include <memory>
+#include <type_traits>
+
+static_assert(std::is_same_v<std::underlying_type_t<QMapLibre::Map::ProjectionType>,
+                             std::underlying_type_t<QMapLibre::MapQuickItem::ProjectionType>>,
+              "ProjectionType underlying types must match");
+static_assert(static_cast<int>(QMapLibre::Map::Mercator) == static_cast<int>(QMapLibre::MapQuickItem::Mercator) &&
+                  static_cast<int>(QMapLibre::Map::Globe) == static_cast<int>(QMapLibre::MapQuickItem::Globe),
+              "ProjectionType values must match");
 
 namespace {
 constexpr int minSize{64};
@@ -35,6 +43,16 @@ constexpr int intervalTime{250};
 
 constexpr double minZoomLevel{0.0};
 constexpr double maxZoomLevel{20.0};
+
+QMapLibre::Map::ProjectionType projectionFromMapQuickItem(QMapLibre::MapQuickItem::ProjectionType type) {
+    switch (type) {
+        case QMapLibre::MapQuickItem::Globe:
+            return QMapLibre::Map::Globe;
+        case QMapLibre::MapQuickItem::Mercator:
+            break;
+    }
+    return QMapLibre::Map::Mercator;
+}
 } // namespace
 
 namespace QMapLibre {
@@ -92,6 +110,30 @@ bool MapQuickItem::styleLoaded() const {
     Q_D(const MapQuickItem);
 
     return d->m_styleLoaded;
+}
+
+MapQuickItem::ProjectionType MapQuickItem::projectionType() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_projectionType;
+}
+
+void MapQuickItem::setProjectionType(ProjectionType type) {
+    Q_D(MapQuickItem);
+
+    if (d->m_projectionType == type) {
+        return;
+    }
+
+    d->m_projectionType = type;
+
+    // Apply immediately when the map already exists; otherwise initialize()
+    // reads m_projectionType when it creates the map.
+    if (d->m_map != nullptr) {
+        d->m_map->setProjectionType(projectionFromMapQuickItem(type));
+    }
+
+    emit projectionTypeChanged();
 }
 
 void MapQuickItem::setZoomLevel(double zoomLevel) {
@@ -465,6 +507,8 @@ void MapQuickItemPrivate::initialize() {
     // the cache, emits MapChangeDidFinishLoadingStyle with nothing listening and the event is lost.
     QObject::connect(m_map.get(), &Map::needsRendering, q, &QQuickItem::update);
     QObject::connect(m_map.get(), &Map::mapChanged, q, &MapQuickItem::onMapChanged);
+
+    m_map->setProjectionType(projectionFromMapQuickItem(m_projectionType));
 
     // Set default style
     if (!m_style.isEmpty()) {
