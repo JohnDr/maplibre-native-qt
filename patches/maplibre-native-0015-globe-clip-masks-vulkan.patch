@@ -1,0 +1,356 @@
+diff --git a/include/mln/shaders/layer_ubo.hpp b/include/mln/shaders/layer_ubo.hpp
+index 42b364e70ed1..d395f9de58f9 100644
+--- a/include/mln/shaders/layer_ubo.hpp
++++ b/include/mln/shaders/layer_ubo.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/util/color.hpp>
++#include <mln/tile/tile_id.hpp>
+ 
+ #include <array>
+ #include <cstdint>
+@@ -66,6 +67,13 @@ struct alignas(16) ProjectionUBO {
+ };
+ static_assert(sizeof(ProjectionUBO) == 11 * 16);
+ 
++/// A globe clip mask: the tile's projection block, drawn over its pole-capped mesh.
++struct GlobeClipMask {
++    ProjectionUBO projection;
++    std::uint32_t stencilRef;
++    CanonicalTileID tile;
++};
++
+ #if MLN_RENDER_BACKEND_VULKAN
+ struct alignas(16) GlobalPlatformParamsUBO {
+     /*  0 */ std::array<float, 4> surfaceRotation;
+diff --git a/include/mln/shaders/vulkan/clipping_mask.hpp b/include/mln/shaders/vulkan/clipping_mask.hpp
+index d0c7be14e778..08d1af874fca 100644
+--- a/include/mln/shaders/vulkan/clipping_mask.hpp
++++ b/include/mln/shaders/vulkan/clipping_mask.hpp
+@@ -24,6 +24,27 @@ struct ShaderSource<BuiltIn::ClippingMaskProgram, gfx::Backend::Type::Vulkan> {
+     static constexpr auto vertex = R"(
+         layout(location = 0) in ivec2 position;
+ 
++#ifdef PROJECTION_GLOBE
++        layout(push_constant) uniform constants {
++            mat4 matrix;
++            vec4 tile_mercator_coords;
++            vec4 clipping_plane;
++        } constant;
++
++        void main() {
++            ProjectionUBO projection;
++            projection.matrix = constant.matrix;
++            projection.fallback_matrix = mat4(0.0);
++            projection.tile_mercator_coords = constant.tile_mercator_coords;
++            projection.clipping_plane = constant.clipping_plane;
++            projection.projection_transition = 1.0;
++            projection.depth_offset = 0.0;
++            projection.pad1 = 0.0;
++            projection.pad2 = 0.0;
++            gl_Position = projectTile(vec2(position), vec2(position), projection);
++            gl_Position.y *= -1.0;
++        }
++#else
+         layout(push_constant) uniform constants {
+             mat4 matrix;
+         } constant;
+@@ -32,6 +53,7 @@ struct ShaderSource<BuiltIn::ClippingMaskProgram, gfx::Backend::Type::Vulkan> {
+             gl_Position = constant.matrix * vec4(position, 0.0, 1.0);
+             gl_Position.y *= -1.0;
+         }
++#endif
+     )";
+ 
+     static constexpr auto fragment = R"(
+diff --git a/include/mln/vulkan/context.hpp b/include/mln/vulkan/context.hpp
+index c3c01ea73db2..da2341bddd4d 100644
+--- a/include/mln/vulkan/context.hpp
++++ b/include/mln/vulkan/context.hpp
+@@ -6,6 +6,7 @@
+ #include <mln/gfx/color_mode.hpp>
+ #include <mln/gfx/texture2d.hpp>
+ #include <mln/gfx/context.hpp>
++#include <mln/shaders/layer_ubo.hpp>
+ #include <mln/util/noncopyable.hpp>
+ #include <mln/util/containers.hpp>
+ #include <mln/vulkan/dynamic_texture.hpp>
+@@ -15,8 +16,10 @@
+ #include <mln/vulkan/descriptor_set.hpp>
+ #include <mln/util/util.hpp>
+ 
++#include <map>
+ #include <memory>
+ #include <optional>
++#include <tuple>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -138,6 +141,9 @@ public:
+     /// Unbind the global uniform buffers
+     void unbindGlobalUniformBuffers(gfx::RenderPass&) const noexcept override {}
+ 
++    bool renderGlobeTileClippingMasks(gfx::RenderPass& renderPass,
++                                      RenderStaticData& staticData,
++                                      const std::vector<shaders::GlobeClipMask>& masks);
+     bool renderTileClippingMasks(gfx::RenderPass& renderPass,
+                                  RenderStaticData& staticData,
+                                  const std::vector<shaders::ClipUBO>& tileUBOs);
+@@ -214,6 +220,17 @@ private:
+         PipelineInfo pipelineInfo;
+     } clipping;
+ 
++    struct GlobeClipMesh {
++        BufferResource vertices;
++        BufferResource indices;
++        uint32_t indexCount;
++    };
++    struct {
++        gfx::ShaderProgramBasePtr shader;
++        std::map<std::tuple<uint8_t, bool, bool>, GlobeClipMesh> meshes;
++        PipelineInfo pipelineInfo;
++    } globeClipping;
++
+ #if DYNAMIC_TEXTURE_VULKAN_MULTITHREADED_UPLOAD
+     std::mutex graphicsQueueSubmitMutex;
+ #endif
+diff --git a/src/mln/renderer/globe_tile_mesh.hpp b/src/mln/renderer/globe_tile_mesh.hpp
+index 56853f7d4eb3..23c69cd360c3 100644
+--- a/src/mln/renderer/globe_tile_mesh.hpp
++++ b/src/mln/renderer/globe_tile_mesh.hpp
+@@ -53,9 +53,12 @@ struct RawGlobeTileMesh {
+     SegmentVector segments;
+ };
+ 
+-inline RawGlobeTileMesh rawGlobeTileMesh(const CanonicalTileID& canonical, bool generateBorders) {
++inline RawGlobeTileMesh rawGlobeTileMesh(
++    const CanonicalTileID& canonical,
++    bool generateBorders,
++    const SubdivisionGranularityExpression& granularity = SubdivisionGranularitySetting::globe().tile) {
+     const util::TileMesh mesh = util::createTileMesh(
+-        {.granularity = SubdivisionGranularitySetting::globe().tile.getGranularityForZoomLevel(canonical.z),
++        {.granularity = granularity.getGranularityForZoomLevel(canonical.z),
+          .generateBorders = generateBorders,
+          .extendToNorthPole = canonical.y == 0,
+          .extendToSouthPole = canonical.y == (1u << canonical.z) - 1});
+diff --git a/src/mln/renderer/paint_parameters.cpp b/src/mln/renderer/paint_parameters.cpp
+index edca32167f58..f50294174553 100644
+--- a/src/mln/renderer/paint_parameters.cpp
++++ b/src/mln/renderer/paint_parameters.cpp
+@@ -4,6 +4,7 @@
+ #include <mln/gfx/cull_face_mode.hpp>
+ #include <mln/gfx/render_pass.hpp>
+ #include <mln/map/transform_state.hpp>
++#include <mln/renderer/layer_tweaker.hpp>
+ #include <mln/renderer/render_static_data.hpp>
+ #include <mln/renderer/render_source.hpp>
+ #include <mln/renderer/render_tile.hpp>
+@@ -187,11 +188,6 @@ void PaintParameters::clearStencil() {
+ }
+ 
+ bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
+-    // The clip masks are Mercator tile quads; on the globe they arrive with the tile meshes.
+-    if (state.isGlobeRendering()) {
+-        return true;
+-    }
+-
+     // We can avoid updating the mask if it already contains the same set of tiles.
+     if (!renderTiles || tileIDsCovered(renderTiles, tileClippingMaskIDs)) {
+         return true;
+@@ -283,7 +279,9 @@ bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
+ 
+ #elif MLN_RENDER_BACKEND_VULKAN
+ 
++    const bool globe = state.isGlobeRendering();
+     std::vector<shaders::ClipUBO> tileUBOs;
++    std::vector<shaders::GlobeClipMask> globeMasks;
+     for (const auto& tileRef : *renderTiles) {
+         const auto& tileID = tileRef.get().id;
+ 
+@@ -297,6 +295,13 @@ bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
+             continue;
+         }
+ 
++        if (globe) {
++            globeMasks.push_back({.projection = LayerTweaker::toProjectionUBO(projectionDataForTile(tileID)),
++                                  .stencilRef = stencilID,
++                                  .tile = tileID.canonical});
++            continue;
++        }
++
+         if (tileUBOs.empty()) {
+             tileUBOs.reserve(count);
+         }
+@@ -304,13 +309,17 @@ bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
+         tileUBOs.emplace_back(shaders::ClipUBO{matrixForTile(tileID), stencilID});
+     }
+ 
+-    if (!tileUBOs.empty()) {
++    if (!tileUBOs.empty() || !globeMasks.empty()) {
+ #if !defined(NDEBUG)
+         const auto debugGroup = renderPass->createDebugGroup("tile-clip-masks");
+ #endif
+ 
+         auto& vulkanContext = static_cast<vulkan::Context&>(context);
+-        vulkanContext.renderTileClippingMasks(*renderPass, staticData, tileUBOs);
++        if (globe) {
++            vulkanContext.renderGlobeTileClippingMasks(*renderPass, staticData, globeMasks);
++        } else {
++            vulkanContext.renderTileClippingMasks(*renderPass, staticData, tileUBOs);
++        }
+         vulkanContext.renderingStats().stencilUpdates++;
+     }
+ 
+diff --git a/src/mln/vulkan/context.cpp b/src/mln/vulkan/context.cpp
+index 86ceb0005a86..436049ce885c 100644
+--- a/src/mln/vulkan/context.cpp
++++ b/src/mln/vulkan/context.cpp
+@@ -1,6 +1,8 @@
+ #include <mln/vulkan/context.hpp>
+ 
++#include <mln/gfx/projection_variant.hpp>
+ #include <mln/gfx/shader_registry.hpp>
++#include <mln/renderer/globe_tile_mesh.hpp>
+ #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/renderer/render_static_data.hpp>
+ #include <mln/renderer/render_target.hpp>
+@@ -170,6 +172,8 @@ void Context::destroyResources() {
+ 
+     clipping.indexBuffer.reset();
+     clipping.vertexBuffer.reset();
++    globeClipping.meshes.clear();
++    globeClipping.shader.reset();
+ }
+ 
+ void Context::enqueueDeletion(DeletionTask&& function) {
+@@ -655,6 +659,120 @@ bool Context::renderTileClippingMasks(gfx::RenderPass& renderPass,
+     return true;
+ }
+ 
++bool Context::renderGlobeTileClippingMasks(gfx::RenderPass& renderPass,
++                                           RenderStaticData& staticData,
++                                           const std::vector<shaders::GlobeClipMask>& masks) {
++    using ShaderClass = shaders::ShaderSource<shaders::BuiltIn::ClippingMaskProgram, gfx::Backend::Type::Vulkan>;
++
++    if (!globeClipping.shader) {
++        if (const auto group = staticData.shaders->getShaderGroup("ClippingMaskProgram")) {
++            globeClipping.shader = std::static_pointer_cast<gfx::ShaderProgramBase>(
++                group->getOrCreateShader(*this, {}, "a_pos", gfx::ProjectionVariant::Globe));
++        }
++    }
++    if (!globeClipping.shader) {
++        assert(!"Failed to create shader for globe clip masking");
++        return false;
++    }
++
++    if (globeClipping.pipelineInfo.inputAttributes.empty()) {
++        globeClipping.pipelineInfo.usePushConstants = true;
++        globeClipping.pipelineInfo.colorBlend = false;
++        globeClipping.pipelineInfo.colorMask = vk::ColorComponentFlags();
++        globeClipping.pipelineInfo.depthTest = false;
++        globeClipping.pipelineInfo.depthWrite = false;
++        globeClipping.pipelineInfo.stencilTest = true;
++        globeClipping.pipelineInfo.stencilFunction = vk::CompareOp::eAlways;
++        globeClipping.pipelineInfo.stencilPass = vk::StencilOp::eReplace;
++        // the far side of a limb tile projects inside the disc; cull it or it overwrites the tile in front
++        globeClipping.pipelineInfo.setCullMode(gfx::CullFaceMode::backCCW());
++        globeClipping.pipelineInfo.dynamicValues.stencilWriteMask = 0b11111111;
++        globeClipping.pipelineInfo.dynamicValues.stencilRef = 0b11111111;
++        globeClipping.pipelineInfo.dynamicValues.stencilCompareMask = 0xFF;
++        globeClipping.pipelineInfo.inputBindings.push_back(
++            vk::VertexInputBindingDescription()
++                .setBinding(0)
++                .setStride(static_cast<uint32_t>(VertexAttribute::getStrideOf(ShaderClass::attributes[0].dataType)))
++                .setInputRate(vk::VertexInputRate::eVertex));
++        globeClipping.pipelineInfo.inputAttributes.push_back(
++            vk::VertexInputAttributeDescription()
++                .setBinding(0)
++                .setLocation(static_cast<uint32_t>(ShaderClass::attributes[0].index))
++                .setFormat(PipelineInfo::vulkanFormat(ShaderClass::attributes[0].dataType)));
++        globeClipping.pipelineInfo.updateVertexInputHash();
++    }
++
++    const auto& dispatcher = backend.getDispatcher();
++    auto& shaderImpl = static_cast<ShaderProgram&>(*globeClipping.shader);
++    auto& renderPassImpl = static_cast<RenderPass&>(renderPass);
++    auto& commandBuffer = renderPassImpl.getEncoder().getCommandBuffer();
++
++    globeClipping.pipelineInfo.setRenderable(renderPassImpl.getDescriptor().renderable);
++
++    const auto& pipeline = shaderImpl.getPipeline(globeClipping.pipelineInfo);
++
++    commandBuffer->bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.get(), dispatcher);
++    globeClipping.pipelineInfo.setScissorRect(
++        {0, 0, globeClipping.pipelineInfo.viewExtent.width, globeClipping.pipelineInfo.viewExtent.height});
++    globeClipping.pipelineInfo.setDynamicValues(backend, commandBuffer);
++
++    auto& renderableResource = renderPassImpl.getDescriptor().renderable.getResource<SurfaceRenderableResource>();
++    const float rad = renderableResource.getRotation();
++    const mat4 rotationMat = {
++        std::cos(rad), -std::sin(rad), 0, 0, std::sin(rad), std::cos(rad), 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++
++    struct PushConstants {
++        matf4 matrix;
++        std::array<float, 4> tileMercatorCoords;
++        std::array<float, 4> clippingPlane;
++    };
++
++    for (const auto& mask : masks) {
++        const auto& tile = mask.tile;
++        const auto key = std::make_tuple(tile.z, tile.y == 0, tile.y == (1u << tile.z) - 1);
++        auto it = globeClipping.meshes.find(key);
++        if (it == globeClipping.meshes.end()) {
++            const auto mesh = rawGlobeTileMesh(tile, false, SubdivisionGranularitySetting::globe().stencil);
++            auto vertices = createBuffer(
++                mesh.vertices.data(), mesh.vertices.size(), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, false);
++            auto indices = createBuffer(
++                mesh.indices.data(), mesh.indices.size() * sizeof(uint16_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, false);
++            it = globeClipping.meshes
++                     .emplace(key,
++                              GlobeClipMesh{.vertices = std::move(vertices),
++                                            .indices = std::move(indices),
++                                            .indexCount = static_cast<uint32_t>(mesh.indices.size())})
++                     .first;
++        }
++        const auto& mesh = it->second;
++
++        commandBuffer->setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack, mask.stencilRef, dispatcher);
++
++        const std::array<vk::Buffer, 1> vertexBuffers = {mesh.vertices.getVulkanBuffer()};
++        const std::array<vk::DeviceSize, 1> offset = {0};
++        commandBuffer->bindVertexBuffers(0, vertexBuffers, offset, dispatcher);
++        commandBuffer->bindIndexBuffer(mesh.indices.getVulkanBuffer(), 0, vk::IndexType::eUint16, dispatcher);
++
++        mat4 matrix;
++        matrix::multiply(matrix, rotationMat, util::cast<double>(mask.projection.matrix));
++        const PushConstants constants = {.matrix = util::cast<float>(matrix),
++                                         .tileMercatorCoords = mask.projection.tile_mercator_coords,
++                                         .clippingPlane = mask.projection.clipping_plane};
++        commandBuffer->pushConstants(
++            getPushConstantPipelineLayout().get(),
++            vk::ShaderStageFlags() | vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
++            0,
++            sizeof(constants),
++            &constants,
++            dispatcher);
++        commandBuffer->drawIndexed(mesh.indexCount, 1, 0, 0, 0, dispatcher);
++    }
++
++    stats.numDrawCalls++;
++    stats.totalDrawCalls++;
++    return true;
++}
++
+ const std::unique_ptr<BufferResource>& Context::getDummyBuffer() {
+     if (!dummyBuffer) {
+         const uint32_t usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+@@ -784,7 +902,7 @@ const vk::UniquePipelineLayout& Context::getPushConstantPipelineLayout() {
+     if (pushConstantPipelineLayout) return pushConstantPipelineLayout;
+ 
+     const auto stages = vk::ShaderStageFlags() | vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+-    const auto pushConstant = vk::PushConstantRange().setSize(sizeof(matf4)).setStageFlags(stages);
++    const auto pushConstant = vk::PushConstantRange().setSize(sizeof(matf4) + 2 * sizeof(std::array<float, 4>)).setStageFlags(stages);
+ 
+     auto layoutInfo = vk::PipelineLayoutCreateInfo().setPushConstantRanges(pushConstant);
+ 
