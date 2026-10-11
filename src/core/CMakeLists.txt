@@ -9,21 +9,26 @@ set(MLN_CORE_PATH "${PROJECT_SOURCE_DIR}/vendor/maplibre-native" CACHE STRING "M
 
 # Apply downstream patches to the vendored MapLibre Native sources. These add
 # support for newer style-spec properties (icon-overlap/text-overlap,
-# data-driven line-dasharray, color-relief resampling) that upstream does not
-# implement yet. Patches are applied idempotently: a clean checkout gets them
-# applied, an already-patched tree is left untouched.
+# data-driven line-dasharray, color-relief resampling) and the globe projection.
+#
+# Patches are applied idempotently, one at a time: a patch applies when it can be
+# applied cleanly (a pristine checkout, or new work stacked on already-applied
+# patches) and is skipped when it cannot (already applied). A per-patch
+# `--reverse --check` test is not usable here because the globe patches stack on
+# top of each other and modify overlapping files, so a lower patch can no longer
+# be reversed once a higher one is applied.
 find_package(Git QUIET)
 file(GLOB MLN_CORE_PATCHES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/patches/maplibre-native-*.patch")
 if(GIT_FOUND AND MLN_CORE_PATCHES)
     list(SORT MLN_CORE_PATCHES)
     foreach(mln_core_patch IN LISTS MLN_CORE_PATCHES)
         execute_process(
-            COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${mln_core_patch}"
+            COMMAND "${GIT_EXECUTABLE}" apply --check "${mln_core_patch}"
             WORKING_DIRECTORY "${MLN_CORE_PATH}"
-            RESULT_VARIABLE mln_core_patch_applied
+            RESULT_VARIABLE mln_core_patch_applicable
             OUTPUT_QUIET ERROR_QUIET
         )
-        if(NOT mln_core_patch_applied EQUAL 0)
+        if(mln_core_patch_applicable EQUAL 0)
             message(STATUS "Applying MapLibre Native patch: ${mln_core_patch}")
             execute_process(
                 COMMAND "${GIT_EXECUTABLE}" apply --whitespace=nowarn "${mln_core_patch}"

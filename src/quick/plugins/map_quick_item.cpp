@@ -458,6 +458,9 @@ void MapQuickItem::onMapChanged(Map::MapChange change) {
             d->m_styleLoaded = true;
             emit styleLoadedChanged();
         }
+        // Loading a style resets the projection to the style's root property, so
+        // re-apply the projection selected through this item.
+        d->m_map->setProjectionType(projectionFromMapQuickItem(d->m_projectionType));
     } else if (change == Map::MapChangeWillStartLoadingMap) {
         if (d->m_styleLoaded) {
             d->m_styleLoaded = false;
