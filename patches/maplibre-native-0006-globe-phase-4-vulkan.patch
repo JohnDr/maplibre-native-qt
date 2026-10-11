@@ -1,0 +1,1340 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f97c16fff818..2afdfa707c38 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -239,6 +239,7 @@ list(APPEND INCLUDE_FILES
+     ${PROJECT_SOURCE_DIR}/include/mln/gfx/renderbuffer.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/gfx/renderer_backend.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/gfx/rendering_stats.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/gfx/projection_variant.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/gfx/shader_group.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/gfx/shader_registry.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/gfx/shader.hpp
+@@ -547,6 +548,8 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/map/mercator_projection.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/mercator_projection.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/projection_base.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/map/vertical_perspective_projection.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/map/vertical_perspective_projection.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/transform.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/transform.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/map/transform_state.cpp
+diff --git a/bazel/core.bzl b/bazel/core.bzl
+index 7921b119bf6a..1e57ac3162f3 100644
+--- a/bazel/core.bzl
++++ b/bazel/core.bzl
+@@ -197,6 +197,8 @@ MLN_CORE_SOURCE = [
+     "src/mln/map/mercator_projection.cpp",
+     "src/mln/map/mercator_projection.hpp",
+     "src/mln/map/projection_base.hpp",
++    "src/mln/map/vertical_perspective_projection.cpp",
++    "src/mln/map/vertical_perspective_projection.hpp",
+     "src/mln/map/transform.cpp",
+     "src/mln/map/transform.hpp",
+     "src/mln/map/transform_state.cpp",
+@@ -668,6 +670,7 @@ MLN_CORE_HEADERS = [
+     "include/mln/gfx/gfx_types.hpp",
+     "include/mln/gfx/polyline_generator.hpp",
+     "include/mln/gfx/renderbuffer.hpp",
++    "include/mln/gfx/projection_variant.hpp",
+     "include/mln/gfx/renderable.hpp",
+     "include/mln/gfx/renderer_backend.hpp",
+     "include/mln/gfx/rendering_stats.hpp",
+diff --git a/include/mln/gfx/context.hpp b/include/mln/gfx/context.hpp
+index 81e71d931d40..de0d6a8f1e57 100644
+--- a/include/mln/gfx/context.hpp
++++ b/include/mln/gfx/context.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/actor/scheduler.hpp>
++#include <mln/gfx/projection_variant.hpp>
+ #include <mln/gfx/backend.hpp>
+ #include <mln/gfx/command_encoder.hpp>
+ #include <mln/gfx/context_observer.hpp>
+@@ -133,7 +134,9 @@ public:
+     virtual UniqueUniformBufferArray createLayerUniformBufferArray() = 0;
+ 
+     /// Get the generic shader with the specified name
+-    virtual gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&, const std::string& name) = 0;
++    virtual gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&,
++                                                       const std::string& name,
++                                                       ProjectionVariant = ProjectionVariant::Mercator) = 0;
+ 
+     /// Create a tile layer group implementation
+     virtual TileLayerGroupPtr createTileLayerGroup(int32_t layerIndex,
+diff --git a/include/mln/gfx/projection_variant.hpp b/include/mln/gfx/projection_variant.hpp
+new file mode 100644
+index 000000000000..3761d51a490f
+--- /dev/null
++++ b/include/mln/gfx/projection_variant.hpp
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <cstdint>
++
++namespace mln {
++namespace gfx {
++
++/// Which projection prelude a shader is compiled against.
++enum class ProjectionVariant : uint8_t {
++    Mercator,
++    Globe,
++};
++
++} // namespace gfx
++} // namespace mln
+diff --git a/include/mln/gfx/shader_group.hpp b/include/mln/gfx/shader_group.hpp
+index dadc5190a263..dde68d69bbf3 100644
+--- a/include/mln/gfx/shader_group.hpp
++++ b/include/mln/gfx/shader_group.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <mln/gfx/projection_variant.hpp>
+ #include <mln/gfx/shader.hpp>
+ #include <mln/util/containers.hpp>
+ #include <mln/util/hash.hpp>
+@@ -157,7 +158,8 @@ public:
+     /// @return A `gfx::ShaderPtr`
+     virtual gfx::ShaderPtr getOrCreateShader(gfx::Context&,
+                                              [[maybe_unused]] const StringIDSetsPair& propertiesAsUniforms,
+-                                             [[maybe_unused]] std::string_view firstAttribName = "a_pos") {
++                                             [[maybe_unused]] std::string_view firstAttribName = "a_pos",
++                                             [[maybe_unused]] ProjectionVariant variant = ProjectionVariant::Mercator) {
+         return {};
+     }
+ 
+@@ -168,6 +170,8 @@ protected:
+         return (std::ostringstream() << name << '#' << std::hex << key).str();
+     }
+ 
++    static constexpr auto globeDefine = "PROJECTION_GLOBE";
++
+     /// Generate a map key for the specified combination of properties
+     PropertyHashType propertyHash(const StringIDSetsPair& propertiesAsUniforms) {
+         const auto beg = propertiesAsUniforms.second.cbegin();
+diff --git a/include/mln/mtl/context.hpp b/include/mln/mtl/context.hpp
+index 4eb9b3065d35..e0d9c5cf6546 100644
+--- a/include/mln/mtl/context.hpp
++++ b/include/mln/mtl/context.hpp
+@@ -90,7 +90,9 @@ public:
+ 
+     UniqueUniformBufferArray createLayerUniformBufferArray() override;
+ 
+-    gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&, const std::string& name) override;
++    gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&,
++                                               const std::string& name,
++                                               gfx::ProjectionVariant) override;
+ 
+     TileLayerGroupPtr createTileLayerGroup(int32_t layerIndex, std::size_t initialCapacity, std::string name) override;
+ 
+diff --git a/include/mln/shaders/gl/shader_group_gl.hpp b/include/mln/shaders/gl/shader_group_gl.hpp
+index dfeb14fbd423..ccde0d904b7a 100644
+--- a/include/mln/shaders/gl/shader_group_gl.hpp
++++ b/include/mln/shaders/gl/shader_group_gl.hpp
+@@ -19,7 +19,8 @@ public:
+ 
+     gfx::ShaderPtr getOrCreateShader(gfx::Context& context,
+                                      const StringIDSetsPair& propertiesAsUniforms,
+-                                     std::string_view firstAttribName) override {
++                                     std::string_view firstAttribName,
++                                     gfx::ProjectionVariant variant) override {
+         constexpr auto& name = shaders::ShaderSource<ShaderID, gfx::Backend::Type::OpenGL>::name;
+         constexpr auto& vert = shaders::ShaderSource<ShaderID, gfx::Backend::Type::OpenGL>::vertex;
+         constexpr auto& frag = shaders::ShaderSource<ShaderID, gfx::Backend::Type::OpenGL>::fragment;
+@@ -29,6 +30,7 @@ public:
+         std::size_t seed = 0;
+         mln::util::hash_combine(seed, propertyHash(propertiesAsUniforms));
+         mln::util::hash_combine(seed, programParameters.getDefinesHash());
++        mln::util::hash_combine(seed, static_cast<uint8_t>(variant));
+         const std::string shaderName = getShaderName(name, seed);
+ 
+         auto shader = get<gl::ShaderProgramGL>(shaderName);
+@@ -50,6 +52,11 @@ public:
+             additionalDefines += prefix;
+             additionalDefines += "\n";
+         }
++        if (variant == gfx::ProjectionVariant::Globe) {
++            additionalDefines += "#define ";
++            additionalDefines += globeDefine;
++            additionalDefines += "\n";
++        }
+ 
+         auto& glContext = static_cast<gl::Context&>(context);
+         shader = ShaderProgramGL::create(glContext,
+diff --git a/include/mln/shaders/layer_ubo.hpp b/include/mln/shaders/layer_ubo.hpp
+index 15a58cfbb90d..42b364e70ed1 100644
+--- a/include/mln/shaders/layer_ubo.hpp
++++ b/include/mln/shaders/layer_ubo.hpp
+@@ -59,9 +59,9 @@ struct alignas(16) ProjectionUBO {
+     /* 128 */ std::array<float, 4> tile_mercator_coords;
+     /* 144 */ std::array<float, 4> clipping_plane;
+     /* 160 */ float projection_transition;
+-    /* 164 */ float pad1;
+-    /* 168 */ float pad2;
+-    /* 172 */ float pad3;
++    /* 164 */ float depth_offset;
++    /* 168 */ float pad1;
++    /* 172 */ float pad2;
+     /* 176 */
+ };
+ static_assert(sizeof(ProjectionUBO) == 11 * 16);
+diff --git a/include/mln/shaders/mtl/background.hpp b/include/mln/shaders/mtl/background.hpp
+index 3df37961d991..f79a7fe8fddf 100644
+--- a/include/mln/shaders/mtl/background.hpp
++++ b/include/mln/shaders/mtl/background.hpp
+@@ -96,12 +96,13 @@ struct FragmentStage {
+ 
+ FragmentStage vertex vertexMain(VertexStage in [[stage_in]],
+                                 device const uint32_t& uboIndex [[buffer(idGlobalUBOIndex)]],
+-                                device const BackgroundDrawableUnionUBO* drawableVector [[buffer(idBackgroundDrawableUBO)]]) {
++                                device const BackgroundDrawableUnionUBO* drawableVector [[buffer(idBackgroundDrawableUBO)]],
++                                device const ProjectionUBO* projectionVector [[buffer(idProjectionUBO)]]) {
+ 
+     device const BackgroundDrawableUBO& drawable = drawableVector[uboIndex].backgroundDrawableUBO;
+ 
+     return {
+-        .position = drawable.matrix * float4(float2(in.position.xy), 0, 1)
++        .position = projectTile(float2(in.position.xy), projectionVector[uboIndex])
+     };
+ }
+ 
+@@ -142,6 +143,7 @@ struct FragmentStage {
+ FragmentStage vertex vertexMain(VertexStage in [[stage_in]],
+                                 device const uint32_t& uboIndex [[buffer(idGlobalUBOIndex)]],
+                                 device const BackgroundDrawableUnionUBO* drawableVector [[buffer(idBackgroundDrawableUBO)]],
++                                device const ProjectionUBO* projectionVector [[buffer(idProjectionUBO)]],
+                                 device const BackgroundPatternPropsUBO& props [[buffer(idBackgroundPropsUBO)]]) {
+ 
+     device const BackgroundPatternDrawableUBO& drawable = drawableVector[uboIndex].backgroundPatternDrawableUBO;
+@@ -158,7 +160,7 @@ FragmentStage vertex vertexMain(VertexStage in [[stage_in]],
+                                          drawable.tile_units_to_pixels,
+                                          pos);
+     return {
+-        .position = drawable.matrix * float4(float2(in.position.xy), 0, 1),
++        .position = projectTile(float2(in.position.xy), projectionVector[uboIndex]),
+         .pos_a = pos_a,
+         .pos_b = pos_b,
+     };
+diff --git a/include/mln/shaders/mtl/common.hpp b/include/mln/shaders/mtl/common.hpp
+index a5da3759b532..b08ab0b5add1 100644
+--- a/include/mln/shaders/mtl/common.hpp
++++ b/include/mln/shaders/mtl/common.hpp
+@@ -231,17 +231,78 @@ struct alignas(16) ProjectionUBO {
+     /* 128 */ float4 tile_mercator_coords;
+     /* 144 */ float4 clipping_plane;
+     /* 160 */ float projection_transition;
+-    /* 164 */ float pad1;
+-    /* 168 */ float pad2;
+-    /* 172 */ float pad3;
++    /* 164 */ float depth_offset;
++    /* 168 */ float pad1;
++    /* 172 */ float pad2;
+     /* 176 */
+ };
+ static_assert(sizeof(ProjectionUBO) == 11 * 16, "wrong size");
+ 
++#ifdef PROJECTION_GLOBE
++
++#define GLOBE_RADIUS 6371008.8
++
++// Tile position (0..EXTENT) to a point on the unit sphere; the pole sentinels in rawPos map to the poles.
++inline float3 projectToSphere(float2 translatedPos, float2 rawPos, device const ProjectionUBO& projection) {
++    const float2 mercator_pos = projection.tile_mercator_coords.xy + projection.tile_mercator_coords.zw * translatedPos;
++    const float spherical_x = mercator_pos.x * M_PI_F * 2.0 + M_PI_F;
++    // sin/cos of the latitude from the Mercator Y via the tangent half-angle identities: no atan, and float32 precision survives near the equator.
++    const float t = exp(M_PI_F - (mercator_pos.y * M_PI_F * 2.0));
++    const float t2 = t * t;
++    const float denom = t2 + 1.0;
++    const float sin_sy = (t2 - 1.0) / denom;
++    const float cos_sy = (2.0 * t) / denom;
++    float3 pos = float3(sin(spherical_x) * cos_sy, sin_sy, cos(spherical_x) * cos_sy);
++    if (rawPos.y < -32767.5) {
++        pos = float3(0.0, 1.0, 0.0);
++    }
++    if (rawPos.y > 32766.5) {
++        pos = float3(0.0, -1.0, 0.0);
++    }
++    return pos;
++}
++
++inline float globeComputeClippingZ(float3 spherePos, device const ProjectionUBO& projection) {
++    return 1.0 - (dot(spherePos, projection.clipping_plane.xyz) + projection.clipping_plane.w);
++}
++
++inline float4 interpolateProjection(float2 posInTile, float3 spherePos, float elevation, device const ProjectionUBO& projection) {
++    const float3 elevatedPos = spherePos * (1.0 + elevation / GLOBE_RADIUS);
++    float4 globePosition = projection.matrix * float4(elevatedPos, 1.0);
++    // Clip the far side of the globe through Z; the layer's depth shift keeps layer order.
++    // The layer offset is subtracted in clip space on purpose: the separation it buys grows as the camera nears the
++    // sphere, where the hemisphere's Z gradient is steepest; a constant NDC offset z-fights fill against outline.
++    globePosition.z = globeComputeClippingZ(elevatedPos, projection) * globePosition.w - projection.depth_offset;
++
++    if (projection.projection_transition > 0.999) {
++        return globePosition;
++    }
++
++    const float4 flatPosition = projection.fallback_matrix * float4(posInTile, elevation, 1.0);
++    const float z_globeness_threshold = 0.2;
++    float4 result = globePosition;
++    result.z = mix(0.0, globePosition.z, clamp((projection.projection_transition - z_globeness_threshold) / (1.0 - z_globeness_threshold), 0.0, 1.0));
++    result.xyw = mix(flatPosition.xyw, globePosition.xyw, projection.projection_transition);
++    if ((posInTile.y < -32767.5) || (posInTile.y > 32766.5)) {
++        result = globePosition;
++        const float poles_hidden_anim_percentage = 0.02;
++        result.z = mix(globePosition.z, 100.0, pow(max((1.0 - projection.projection_transition) / poles_hidden_anim_percentage, 0.0), 8.0));
++    }
++    return result;
++}
++
++inline float4 projectTile(float2 pos, device const ProjectionUBO& projection) {
++    return interpolateProjection(pos, projectToSphere(pos, float2(0.0, 0.0), projection), 0.0, projection);
++}
++
++#else
++
+ inline float4 projectTile(float2 pos, device const ProjectionUBO& projection) {
+     return projection.matrix * float4(pos, 0.0, 1.0);
+ }
+ 
++#endif
++
+ enum {
+     idGlobalPaintParamsUBO,
+     idGlobalUBOIndex,
+diff --git a/include/mln/shaders/mtl/shader_group.hpp b/include/mln/shaders/mtl/shader_group.hpp
+index f52a3275e70a..9dcc445bce68 100644
+--- a/include/mln/shaders/mtl/shader_group.hpp
++++ b/include/mln/shaders/mtl/shader_group.hpp
+@@ -45,7 +45,8 @@ public:
+ 
+     gfx::ShaderPtr getOrCreateShader(gfx::Context& gfxContext,
+                                      const StringIDSetsPair& propertiesAsUniforms,
+-                                     std::string_view /*firstAttribName*/) override {
++                                     std::string_view /*firstAttribName*/,
++                                     gfx::ProjectionVariant variant) override {
+         using ShaderSource = shaders::ShaderSource<ShaderID, gfx::Backend::Type::Metal>;
+         constexpr auto& name = ShaderSource::name;
+         constexpr auto& prelude = ShaderSource::prelude;
+@@ -56,12 +57,16 @@ public:
+         std::size_t seed = 0;
+         mln::util::hash_combine(seed, propertyHash(propertiesAsUniforms));
+         mln::util::hash_combine(seed, programParameters.getDefinesHash());
++        mln::util::hash_combine(seed, static_cast<uint8_t>(variant));
+         const std::string shaderName = getShaderName(name, seed);
+ 
+         auto shader = get<mtl::ShaderProgram>(shaderName);
+         if (!shader) {
+             DefinesMap additionalDefines;
+             addAdditionalDefines(propertiesAsUniforms, additionalDefines);
++            if (variant == gfx::ProjectionVariant::Globe) {
++                additionalDefines.emplace(globeDefine, std::string());
++            }
+ 
+             auto& context = static_cast<Context&>(gfxContext);
+             const auto shaderSource = std::string(shaders::prelude) + prelude + source;
+diff --git a/include/mln/shaders/vulkan/background.hpp b/include/mln/shaders/vulkan/background.hpp
+index 8dee2e39de7c..366e6506283b 100644
+--- a/include/mln/shaders/vulkan/background.hpp
++++ b/include/mln/shaders/vulkan/background.hpp
+@@ -40,10 +40,14 @@ layout(std140, set = LAYER_SET_INDEX, binding = idBackgroundDrawableUBO) readonl
+     BackgroundDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ void main() {
+     const BackgroundDrawableUBO drawable = drawableVector.drawable_ubo[constant.ubo_index];
+ 
+-    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
++    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ }
+ )";
+@@ -101,6 +105,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idBackgroundDrawableUBO) readonl
+     BackgroundPatternDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ layout(set = LAYER_SET_INDEX, binding = idBackgroundPropsUBO) uniform BackgroundPatternPropsUBO {
+     vec2 pattern_tl_a;
+     vec2 pattern_br_a;
+@@ -131,7 +139,7 @@ void main() {
+                                  drawable.tile_units_to_pixels,
+                                  in_position);
+ 
+-    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
++    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ }
+ )";
+diff --git a/include/mln/shaders/vulkan/common.hpp b/include/mln/shaders/vulkan/common.hpp
+index a57798cb8d88..61a1f9adefb0 100644
+--- a/include/mln/shaders/vulkan/common.hpp
++++ b/include/mln/shaders/vulkan/common.hpp
+@@ -128,15 +128,76 @@ struct ProjectionUBO {
+     vec4 tile_mercator_coords;
+     vec4 clipping_plane;
+     float projection_transition;
++    float depth_offset;
+     float pad1;
+     float pad2;
+-    float pad3;
+ };
+ 
++#ifdef PROJECTION_GLOBE
++
++#define GLOBE_RADIUS 6371008.8
++#define GLOBE_POLE_NORTH_Y -32767.5
++#define GLOBE_POLE_SOUTH_Y 32766.5
++
++// Tile position (0..EXTENT) to a point on the unit sphere; the pole sentinels in rawPos map to the poles.
++vec3 projectToSphere(vec2 translatedPos, vec2 rawPos, ProjectionUBO projection) {
++    const vec2 mercator_pos = projection.tile_mercator_coords.xy + projection.tile_mercator_coords.zw * translatedPos;
++    const float spherical_x = mercator_pos.x * M_PI * 2.0 + M_PI;
++    // sin/cos of the latitude from the Mercator Y via tangent half-angle identities: no atan, and float32 precision survives near the equator.
++    const float t = exp(M_PI - (mercator_pos.y * M_PI * 2.0));
++    const float t2 = t * t;
++    const float denom = t2 + 1.0;
++    const float sin_sy = (t2 - 1.0) / denom;
++    const float cos_sy = (2.0 * t) / denom;
++    vec3 pos = vec3(sin(spherical_x) * cos_sy, sin_sy, cos(spherical_x) * cos_sy);
++    if (rawPos.y < GLOBE_POLE_NORTH_Y) {
++        pos = vec3(0.0, 1.0, 0.0);
++    }
++    if (rawPos.y > GLOBE_POLE_SOUTH_Y) {
++        pos = vec3(0.0, -1.0, 0.0);
++    }
++    return pos;
++}
++
++float globeComputeClippingZ(vec3 spherePos, ProjectionUBO projection) {
++    return 1.0 - (dot(spherePos, projection.clipping_plane.xyz) + projection.clipping_plane.w);
++}
++
++vec4 interpolateProjection(vec2 posInTile, vec3 spherePos, float elevation, ProjectionUBO projection) {
++    const vec3 elevatedPos = spherePos * (1.0 + elevation / GLOBE_RADIUS);
++    vec4 globePosition = projection.matrix * vec4(elevatedPos, 1.0);
++    // Clip the far side of the globe through Z; the layer's depth shift keeps layer order.
++    globePosition.z = globeComputeClippingZ(elevatedPos, projection) * globePosition.w - projection.depth_offset;
++
++    if (projection.projection_transition > 0.999) {
++        return globePosition;
++    }
++
++    const vec4 flatPosition = projection.fallback_matrix * vec4(posInTile, elevation, 1.0);
++    const float z_globeness_threshold = 0.2;
++    vec4 result = globePosition;
++    result.z = mix(0.0, globePosition.z, clamp((projection.projection_transition - z_globeness_threshold) / (1.0 - z_globeness_threshold), 0.0, 1.0));
++    result.xyw = mix(flatPosition.xyw, globePosition.xyw, projection.projection_transition);
++    if ((posInTile.y < GLOBE_POLE_NORTH_Y) || (posInTile.y > GLOBE_POLE_SOUTH_Y)) {
++        result = globePosition;
++        const float poles_hidden_anim_percentage = 0.02;
++        result.z = mix(globePosition.z, 100.0, pow(max((1.0 - projection.projection_transition) / poles_hidden_anim_percentage, 0.0), 8.0));
++    }
++    return result;
++}
++
++vec4 projectTile(vec2 pos, ProjectionUBO projection) {
++    return interpolateProjection(pos, projectToSphere(pos, vec2(0.0, 0.0), projection), 0.0, projection);
++}
++
++#else
++
+ vec4 projectTile(vec2 pos, ProjectionUBO projection) {
+     return projection.matrix * vec4(pos, 0.0, 1.0);
+ }
+ 
++#endif
++
+ void applySurfaceTransform() {
+ #ifdef USE_SURFACE_TRANSFORM
+     const mat2 rotation = {
+diff --git a/include/mln/shaders/vulkan/shader_group.hpp b/include/mln/shaders/vulkan/shader_group.hpp
+index e9b48006d103..9ce8792d83f8 100644
+--- a/include/mln/shaders/vulkan/shader_group.hpp
++++ b/include/mln/shaders/vulkan/shader_group.hpp
+@@ -44,7 +44,8 @@ public:
+ 
+     gfx::ShaderPtr getOrCreateShader(gfx::Context& gfxContext,
+                                      const StringIDSetsPair& propertiesAsUniforms,
+-                                     std::string_view /*firstAttribName*/) override {
++                                     std::string_view /*firstAttribName*/,
++                                     gfx::ProjectionVariant variant) override {
+         using ShaderSource = shaders::ShaderSource<ShaderID, gfx::Backend::Type::Vulkan>;
+         constexpr auto& name = ShaderSource::name;
+         constexpr auto& prelude = ShaderSource::prelude;
+@@ -54,12 +55,16 @@ public:
+         std::size_t seed = 0;
+         mln::util::hash_combine(seed, propertyHash(propertiesAsUniforms));
+         mln::util::hash_combine(seed, programParameters.getDefinesHash());
++        mln::util::hash_combine(seed, static_cast<uint8_t>(variant));
+         const std::string shaderName = getShaderName(name, seed);
+ 
+         auto shader = get<vulkan::ShaderProgram>(shaderName);
+         if (!shader) {
+             DefinesMap additionalDefines;
+             addAdditionalDefines(propertiesAsUniforms, additionalDefines);
++            if (variant == gfx::ProjectionVariant::Globe) {
++                additionalDefines.emplace(globeDefine, std::string());
++            }
+ 
+             const std::string preludeSource(prelude);
+             const std::string vertexSource = preludeSource + vert;
+diff --git a/include/mln/shaders/webgpu/shader_group.hpp b/include/mln/shaders/webgpu/shader_group.hpp
+index 0199a1f69ac0..88cf252fee80 100644
+--- a/include/mln/shaders/webgpu/shader_group.hpp
++++ b/include/mln/shaders/webgpu/shader_group.hpp
+@@ -47,7 +47,8 @@ public:
+ 
+     gfx::ShaderPtr getOrCreateShader(gfx::Context& gfxContext,
+                                      const StringIDSetsPair& propertiesAsUniforms,
+-                                     std::string_view /*firstAttribName*/) override {
++                                     std::string_view /*firstAttribName*/,
++                                     gfx::ProjectionVariant variant) override {
+         using ShaderSource = shaders::ShaderSource<ShaderID, gfx::Backend::Type::WebGPU>;
+         constexpr auto& name = ShaderSource::name;
+         constexpr auto& vert = ShaderSource::vertex;
+@@ -56,12 +57,16 @@ public:
+         std::size_t seed = 0;
+         mln::util::hash_combine(seed, propertyHash(propertiesAsUniforms));
+         mln::util::hash_combine(seed, programParameters.getDefinesHash());
++        mln::util::hash_combine(seed, static_cast<uint8_t>(variant));
+         const std::string shaderName = getShaderName(name, seed);
+ 
+         auto shader = get<webgpu::ShaderProgram>(shaderName);
+         if (!shader) {
+             DefinesMap additionalDefines;
+             addAdditionalDefines(propertiesAsUniforms, additionalDefines);
++            if (variant == gfx::ProjectionVariant::Globe) {
++                additionalDefines.emplace(globeDefine, std::string());
++            }
+ 
+             std::string vertexSource;
+             std::string fragmentSource;
+diff --git a/include/mln/vulkan/context.hpp b/include/mln/vulkan/context.hpp
+index 3bfe73632d0a..c3c01ea73db2 100644
+--- a/include/mln/vulkan/context.hpp
++++ b/include/mln/vulkan/context.hpp
+@@ -85,7 +85,9 @@ public:
+ 
+     UniqueUniformBufferArray createLayerUniformBufferArray() override;
+ 
+-    gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&, const std::string& name) override;
++    gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&,
++                                               const std::string& name,
++                                               gfx::ProjectionVariant) override;
+ 
+     TileLayerGroupPtr createTileLayerGroup(int32_t layerIndex, std::size_t initialCapacity, std::string name) override;
+ 
+diff --git a/include/mln/webgpu/context.hpp b/include/mln/webgpu/context.hpp
+index bf66c6e672f7..04c8c3c94560 100644
+--- a/include/mln/webgpu/context.hpp
++++ b/include/mln/webgpu/context.hpp
+@@ -53,7 +53,9 @@ public:
+                                               bool persistent = false,
+                                               bool ssbo = false) override;
+     gfx::UniqueUniformBufferArray createLayerUniformBufferArray() override;
+-    gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&, const std::string& name) override;
++    gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&,
++                                               const std::string& name,
++                                               gfx::ProjectionVariant) override;
+     TileLayerGroupPtr createTileLayerGroup(int32_t layerIndex, std::size_t initialCapacity, std::string name) override;
+     LayerGroupPtr createLayerGroup(int32_t layerIndex, std::size_t initialCapacity, std::string name) override;
+     gfx::Texture2DPtr createTexture2D() override;
+diff --git a/src/mln/gl/context.cpp b/src/mln/gl/context.cpp
+index 02efd92640c7..489fab2a4717 100644
+--- a/src/mln/gl/context.cpp
++++ b/src/mln/gl/context.cpp
+@@ -553,14 +553,17 @@ gfx::UniqueUniformBufferArray Context::createLayerUniformBufferArray() {
+     return std::make_unique<UniformBufferArrayGL>();
+ }
+ 
+-gfx::ShaderProgramBasePtr Context::getGenericShader(gfx::ShaderRegistry& shaders, const std::string& name) {
++gfx::ShaderProgramBasePtr Context::getGenericShader(gfx::ShaderRegistry& shaders,
++                                                    const std::string& name,
++                                                    gfx::ProjectionVariant variant) {
+     MLN_TRACE_FUNC();
+ 
+     auto shaderGroup = shaders.getShaderGroup(name);
+     if (!shaderGroup) {
+         return nullptr;
+     }
+-    return std::static_pointer_cast<gfx::ShaderProgramBase>(shaderGroup->getOrCreateShader(*this, {}));
++    return std::static_pointer_cast<gfx::ShaderProgramBase>(
++        shaderGroup->getOrCreateShader(*this, {}, "a_pos", variant));
+ }
+ 
+ TileLayerGroupPtr Context::createTileLayerGroup(int32_t layerIndex, std::size_t initialCapacity, std::string name) {
+diff --git a/src/mln/gl/context.hpp b/src/mln/gl/context.hpp
+index 23b93b120525..90d3e6fdda36 100644
+--- a/src/mln/gl/context.hpp
++++ b/src/mln/gl/context.hpp
+@@ -121,7 +121,9 @@ public:
+ 
+     gfx::UniqueUniformBufferArray createLayerUniformBufferArray() override;
+ 
+-    gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&, const std::string& name) override;
++    gfx::ShaderProgramBasePtr getGenericShader(gfx::ShaderRegistry&,
++                                               const std::string& name,
++                                               gfx::ProjectionVariant) override;
+ 
+     TileLayerGroupPtr createTileLayerGroup(int32_t layerIndex, std::size_t initialCapacity, std::string name) override;
+ 
+diff --git a/src/mln/map/map.cpp b/src/mln/map/map.cpp
+index d65f57ed3344..46715df1e326 100644
+--- a/src/mln/map/map.cpp
++++ b/src/mln/map/map.cpp
+@@ -5,6 +5,9 @@
+ #include <mln/map/map_impl.hpp>
+ #include <mln/map/transform.hpp>
+ #include <mln/math/angles.hpp>
++#include <mln/style/projection.hpp>
++#include <mln/style/projection_definition.hpp>
++#include <mln/style/style_impl.hpp>
+ #include <mln/math/log2.hpp>
+ #include <mln/renderer/renderer_frontend.hpp>
+ #include <mln/renderer/renderer_observer.hpp>
+@@ -426,6 +429,11 @@ ProjectionMode Map::getProjectionMode() const {
+ 
+ void Map::setProjectionType(ProjectionType type) {
+     impl->transform.setProjectionType(type);
++    if (impl->style) {
++        auto projection = std::make_unique<style::Projection>();
++        projection->setType(ProjectionDefinition{type == ProjectionType::Globe ? "globe" : "mercator"});
++        impl->style->impl->setProjection(std::move(projection));
++    }
+     impl->onUpdate();
+ }
+ 
+diff --git a/src/mln/map/mercator_projection.cpp b/src/mln/map/mercator_projection.cpp
+index 54f5db35fa02..05df66b484aa 100644
+--- a/src/mln/map/mercator_projection.cpp
++++ b/src/mln/map/mercator_projection.cpp
+@@ -26,25 +26,18 @@ void MercatorProjection::tileMatrix(mat4& matrix, const UnwrappedTileID& tileID,
+     matrix::scale(matrix, matrix, s / util::EXTENT, s / util::EXTENT, 1);
+ }
+ 
+-ProjectionData MercatorProjection::getProjectionData(const UnwrappedTileID& tileID,
+-                                                     double scale,
+-                                                     const mat4& projMatrix) const {
+-    mat4 mainMatrix;
+-    tileMatrix(mainMatrix, tileID, scale);
+-    matrix::multiply(mainMatrix, projMatrix, mainMatrix);
+-    return getProjectionData(tileID, mainMatrix);
+-}
+-
+-ProjectionData MercatorProjection::getProjectionData(const UnwrappedTileID& tileID, const mat4& mainMatrix) const {
++ProjectionData MercatorProjection::getProjectionData(const TransformState&,
++                                                     const UnwrappedTileID& tileID,
++                                                     const mat4& mercatorMatrix) const {
+     const double tileScale = static_cast<double>(1ull << tileID.canonical.z);
+-    return {.mainMatrix = mainMatrix,
++    return {.mainMatrix = mercatorMatrix,
+             .tileMercatorCoords = {{tileID.canonical.x / tileScale,
+                                     tileID.canonical.y / tileScale,
+                                     1.0 / tileScale / util::EXTENT,
+                                     1.0 / tileScale / util::EXTENT}},
+             .clippingPlane = {{0, 0, 0, 0}},
+             .projectionTransition = 0,
+-            .fallbackMatrix = mainMatrix,
++            .fallbackMatrix = mercatorMatrix,
+             .clipAntimeridian = false};
+ }
+ 
+diff --git a/src/mln/map/mercator_projection.hpp b/src/mln/map/mercator_projection.hpp
+index 660f3ac37b2f..310b84da82d9 100644
+--- a/src/mln/map/mercator_projection.hpp
++++ b/src/mln/map/mercator_projection.hpp
+@@ -11,8 +11,9 @@ public:
+ 
+     void tileMatrix(mat4&, const UnwrappedTileID&, double scale) const override;
+ 
+-    ProjectionData getProjectionData(const UnwrappedTileID&, double scale, const mat4& projMatrix) const override;
+-    ProjectionData getProjectionData(const UnwrappedTileID&, const mat4& mainMatrix) const override;
++    ProjectionData getProjectionData(const TransformState&,
++                                     const UnwrappedTileID&,
++                                     const mat4& mercatorMatrix) const override;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/map/projection_base.hpp b/src/mln/map/projection_base.hpp
+index bcc7861845c7..5232e7da3be4 100644
+--- a/src/mln/map/projection_base.hpp
++++ b/src/mln/map/projection_base.hpp
+@@ -6,6 +6,7 @@
+ 
+ namespace mln {
+ 
++class TransformState;
+ class UnwrappedTileID;
+ 
+ struct ProjectionData {
+@@ -15,6 +16,8 @@ struct ProjectionData {
+     double projectionTransition = 0;
+     mat4 fallbackMatrix{};
+     bool clipAntimeridian = false;
++    /// Clip-space Z shift for this drawable's layer, the same one the Mercator matrix carries.
++    double depthOffset = 0;
+ };
+ 
+ class ProjectionBase {
+@@ -26,8 +29,10 @@ public:
+ 
+     virtual void tileMatrix(mat4&, const UnwrappedTileID&, double scale) const = 0;
+ 
+-    virtual ProjectionData getProjectionData(const UnwrappedTileID&, double scale, const mat4& projMatrix) const = 0;
+-    virtual ProjectionData getProjectionData(const UnwrappedTileID&, const mat4& mainMatrix) const = 0;
++    /// The per-tile projection contract, given the Mercator tile-to-clip matrix the renderer already computed.
++    virtual ProjectionData getProjectionData(const TransformState&,
++                                             const UnwrappedTileID&,
++                                             const mat4& mercatorMatrix) const = 0;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
+index 643c1792904d..2d9d34aec028 100644
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -1,5 +1,6 @@
+ #include <mln/map/transform_state.hpp>
+ #include <mln/map/mercator_projection.hpp>
++#include <mln/map/vertical_perspective_projection.hpp>
+ #include <mln/math/angles.hpp>
+ #include <mln/math/clamp.hpp>
+ #include <mln/math/log2.hpp>
+@@ -117,8 +118,38 @@ void TransformState::setProperties(const TransformStateProperties& properties) {
+ 
+ // MARK: - Projection
+ 
++namespace {
++
++// GL JS `GlobeProjection.transitionState`
++double transitionStateFor(const ProjectionDefinition& definition) {
++    if (definition.from == definition.to) {
++        return definition.from == "mercator" ? 0 : 1;
++    }
++    if (definition.from == "vertical-perspective" && definition.to == "mercator") {
++        return 1 - definition.transition;
++    }
++    if (definition.from == "mercator" && definition.to == "vertical-perspective") {
++        return definition.transition;
++    }
++    return 1;
++}
++
++} // namespace
++
+ void TransformState::setProjectionDefinition(const ProjectionDefinition& definition) {
+     projectionDefinition = definition;
++    const double transition = transitionStateFor(definition);
++    if (transition == projectionTransition) {
++        return;
++    }
++    if ((transition > 0) != (projectionTransition > 0)) {
++        if (transition > 0) {
++            projection = std::make_shared<VerticalPerspectiveProjection>();
++        } else {
++            projection = std::make_shared<MercatorProjection>();
++        }
++    }
++    projectionTransition = transition;
+ }
+ 
+ // MARK: - Matrix
+@@ -128,15 +159,19 @@ void TransformState::matrixFor(mat4& matrix, const UnwrappedTileID& tileID) cons
+ }
+ 
+ ProjectionData TransformState::getProjectionData(const UnwrappedTileID& tileID, const mat4& projMatrix) const {
+-    return projection->getProjectionData(tileID, scale, projMatrix);
++    mat4 mercatorMatrix;
++    projection->tileMatrix(mercatorMatrix, tileID, scale);
++    matrix::multiply(mercatorMatrix, projMatrix, mercatorMatrix);
++    return projection->getProjectionData(*this, tileID, mercatorMatrix);
+ }
+ 
+ ProjectionData TransformState::getProjectionData(const UnwrappedTileID& tileID) const {
+     return getProjectionData(tileID, getProjectionMatrix());
+ }
+ 
+-ProjectionData TransformState::getProjectionDataForMatrix(const UnwrappedTileID& tileID, const mat4& mainMatrix) const {
+-    return projection->getProjectionData(tileID, mainMatrix);
++ProjectionData TransformState::getProjectionDataForMatrix(const UnwrappedTileID& tileID,
++                                                          const mat4& mercatorMatrix) const {
++    return projection->getProjectionData(*this, tileID, mercatorMatrix);
+ }
+ 
+ void TransformState::getProjMatrix(mat4& projMatrix, uint16_t nearZ, bool aligned) const {
+diff --git a/src/mln/map/transform_state.hpp b/src/mln/map/transform_state.hpp
+index b2a8462c134d..52c4d9d803e7 100644
+--- a/src/mln/map/transform_state.hpp
++++ b/src/mln/map/transform_state.hpp
+@@ -142,13 +142,17 @@ public:
+     // Projection
+     const ProjectionDefinition& getProjectionDefinition() const { return projectionDefinition; }
+     void setProjectionDefinition(const ProjectionDefinition&);
++    /// 0 is Mercator, 1 is the globe, in between is the transition.
++    double getProjectionTransition() const { return projectionTransition; }
++    bool isGlobeRendering() const { return projectionTransition > 0; }
+ 
+     // Matrix
+     void matrixFor(mat4&, const UnwrappedTileID&) const;
+     void getProjMatrix(mat4& matrix, uint16_t nearZ = 1, bool aligned = false) const;
+     ProjectionData getProjectionData(const UnwrappedTileID&, const mat4& projMatrix) const;
+     ProjectionData getProjectionData(const UnwrappedTileID&) const;
+-    ProjectionData getProjectionDataForMatrix(const UnwrappedTileID&, const mat4& mainMatrix) const;
++    ProjectionData getProjectionDataForMatrix(const UnwrappedTileID&, const mat4& mercatorMatrix) const;
++    ScreenCoordinate getCenterOffset() const;
+ 
+     // Dimensions
+     Size getSize() const;
+@@ -282,7 +286,6 @@ private:
+ 
+     // Viewport center offset, from [size.width / 2, size.height / 2], defined
+     // by |edgeInsets| in screen coordinates, with top left origin.
+-    ScreenCoordinate getCenterOffset() const;
+ 
+     LatLngBounds bounds;
+ 
+@@ -321,6 +324,7 @@ private:
+ private:
+     std::shared_ptr<const ProjectionBase> projection;
+     ProjectionDefinition projectionDefinition;
++    double projectionTransition = 0;
+ 
+     ConstrainMode constrainMode;
+     ViewportMode viewportMode;
+diff --git a/src/mln/map/vertical_perspective_projection.cpp b/src/mln/map/vertical_perspective_projection.cpp
+new file mode 100644
+index 000000000000..d4a70b528a82
+--- /dev/null
++++ b/src/mln/map/vertical_perspective_projection.cpp
+@@ -0,0 +1,140 @@
++#include <mln/map/vertical_perspective_projection.hpp>
++#include <mln/map/transform_state.hpp>
++#include <mln/math/angles.hpp>
++#include <mln/tile/tile_id.hpp>
++#include <mln/util/constants.hpp>
++#include <mln/util/projection.hpp>
++
++#include <cmath>
++#include <numbers>
++
++namespace mln {
++
++namespace {
++
++vec3 rotateX(const vec3& v, double rad) {
++    const double c = std::cos(rad);
++    const double s = std::sin(rad);
++    return {{v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c}};
++}
++
++vec3 rotateY(const vec3& v, double rad) {
++    const double c = std::cos(rad);
++    const double s = std::sin(rad);
++    return {{v[2] * s + v[0] * c, v[1], v[2] * c - v[0] * s}};
++}
++
++vec3 rotateZ(const vec3& v, double rad) {
++    const double c = std::cos(rad);
++    const double s = std::sin(rad);
++    return {{v[0] * c - v[1] * s, v[0] * s + v[1] * c, v[2]}};
++}
++
++} // namespace
++
++Point<double> VerticalPerspectiveProjection::project(const LatLng& latLng, double scale) const {
++    return Projection::project(latLng, scale);
++}
++
++LatLng VerticalPerspectiveProjection::unproject(const Point<double>& point,
++                                                double scale,
++                                                LatLng::WrapMode wrapMode) const {
++    return Projection::unproject(point, scale, wrapMode);
++}
++
++void VerticalPerspectiveProjection::tileMatrix(mat4& matrix, const UnwrappedTileID& tileID, double scale) const {
++    const uint64_t tileScale = 1ull << tileID.canonical.z;
++    const double s = Projection::worldSize(scale) / tileScale;
++
++    matrix::identity(matrix);
++    matrix::translate(matrix,
++                      matrix,
++                      static_cast<int64_t>(tileID.canonical.x + tileID.wrap * static_cast<int64_t>(tileScale)) * s,
++                      static_cast<int64_t>(tileID.canonical.y) * s,
++                      0);
++    matrix::scale(matrix, matrix, s / util::EXTENT, s / util::EXTENT, 1);
++}
++
++double VerticalPerspectiveProjection::globeRadiusPixels(double worldSize, double centerLatitude) {
++    return worldSize / (2.0 * std::numbers::pi) / std::cos(util::deg2rad(centerLatitude));
++}
++
++vec3 VerticalPerspectiveProjection::tileCoordinatesToSphere(const Point<double>& tilePoint,
++                                                            const UnwrappedTileID& tileID) {
++    const double scale = 1.0 / static_cast<double>(1ull << tileID.canonical.z);
++    const double mercatorX = tilePoint.x / util::EXTENT * scale + tileID.canonical.x * scale;
++    const double mercatorY = tilePoint.y / util::EXTENT * scale + tileID.canonical.y * scale;
++    const double sphericalX = std::fmod(mercatorX * std::numbers::pi * 2.0 + std::numbers::pi, std::numbers::pi * 2.0);
++    const double sphericalY = 2.0 * std::atan(std::exp(std::numbers::pi - (mercatorY * std::numbers::pi * 2.0))) -
++                              std::numbers::pi * 0.5;
++    const double len = std::cos(sphericalY);
++    return {{std::sin(sphericalX) * len, std::sin(sphericalY), std::cos(sphericalX) * len}};
++}
++
++mat4 VerticalPerspectiveProjection::globeViewProjectionMatrix(const TransformState& state, double radius) {
++    const Size size = state.getSize();
++    const double cameraToCenterDistance = state.getCameraToCenterDistance();
++    const LatLng center = state.getLatLng();
++
++    mat4 matrix;
++    matrix::perspective(matrix,
++                        state.getFieldOfView(),
++                        static_cast<double>(size.width) / size.height,
++                        0.5,
++                        cameraToCenterDistance + radius * 2.0);
++
++    const ScreenCoordinate offset = state.getCenterOffset();
++    matrix[8] = -offset.x * 2.0 / size.width;
++    matrix[9] = offset.y * 2.0 / size.height;
++
++    if (state.getNorthOrientation() != NorthOrientation::Upwards) {
++        matrix::rotate_z(matrix, matrix, -state.getNorthOrientationAngle());
++    }
++
++    matrix::translate(matrix, matrix, 0, 0, -cameraToCenterDistance);
++    matrix::rotate_z(matrix, matrix, state.getRoll());
++    matrix::rotate_x(matrix, matrix, -state.getPitch());
++    matrix::rotate_z(matrix, matrix, -state.getBearing());
++    matrix::translate(matrix, matrix, 0, 0, -radius);
++    matrix::rotate_x(matrix, matrix, util::deg2rad(center.latitude()));
++    matrix::rotate_y(matrix, matrix, -util::deg2rad(center.longitude()));
++    matrix::scale(matrix, matrix, radius, radius, radius);
++    return matrix;
++}
++
++vec4 VerticalPerspectiveProjection::clippingPlane(const TransformState& state, double radius) {
++    const double pitch = state.getPitch();
++    const double distanceCameraToB = state.getCameraToCenterDistance() / radius;
++    const double distanceCameraToA = std::sin(pitch) * distanceCameraToB;
++    const double distanceAtoC = std::cos(pitch) * distanceCameraToB + 1.0;
++    const double distanceCameraToC = std::sqrt(distanceCameraToA * distanceCameraToA + distanceAtoC * distanceAtoC);
++    const double tangentPlaneDistanceToC = 1.0 / distanceCameraToC;
++
++    vec3 plane = {{0.0, -distanceCameraToA / distanceCameraToC, distanceAtoC / distanceCameraToC}};
++
++    const LatLng center = state.getLatLng();
++    plane = rotateZ(plane, state.getBearing());
++    plane = rotateX(plane, -util::deg2rad(center.latitude()));
++    plane = rotateY(plane, util::deg2rad(center.longitude()));
++
++    const double scale = 1.0 / std::sqrt(plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]);
++    return {{plane[0] * scale, plane[1] * scale, plane[2] * scale, -tangentPlaneDistanceToC * scale}};
++}
++
++ProjectionData VerticalPerspectiveProjection::getProjectionData(const TransformState& state,
++                                                                const UnwrappedTileID& tileID,
++                                                                const mat4& mercatorMatrix) const {
++    const double radius = globeRadiusPixels(Projection::worldSize(state.getScale()), state.getLatLng().latitude());
++    const double tileScale = static_cast<double>(1ull << tileID.canonical.z);
++    return {.mainMatrix = globeViewProjectionMatrix(state, radius),
++            .tileMercatorCoords = {{tileID.canonical.x / tileScale,
++                                    tileID.canonical.y / tileScale,
++                                    1.0 / tileScale / util::EXTENT,
++                                    1.0 / tileScale / util::EXTENT}},
++            .clippingPlane = clippingPlane(state, radius),
++            .projectionTransition = state.getProjectionTransition(),
++            .fallbackMatrix = mercatorMatrix,
++            .clipAntimeridian = tileID.canonical.z == 0};
++}
++
++} // namespace mln
+diff --git a/src/mln/map/vertical_perspective_projection.hpp b/src/mln/map/vertical_perspective_projection.hpp
+new file mode 100644
+index 000000000000..d0ab0958c921
+--- /dev/null
++++ b/src/mln/map/vertical_perspective_projection.hpp
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <mln/map/projection_base.hpp>
++
++namespace mln {
++
++/// The globe: tile geometry projected onto a unit sphere, viewed with a vertical perspective camera.
++/// Port of MapLibre GL JS `vertical_perspective_transform.ts`.
++class VerticalPerspectiveProjection final : public ProjectionBase {
++public:
++    Point<double> project(const LatLng&, double scale) const override;
++    LatLng unproject(const Point<double>&, double scale, LatLng::WrapMode) const override;
++
++    void tileMatrix(mat4&, const UnwrappedTileID&, double scale) const override;
++
++    ProjectionData getProjectionData(const TransformState&,
++                                     const UnwrappedTileID&,
++                                     const mat4& mercatorMatrix) const override;
++
++    /// Globe radius in pixels at the given world size and center latitude, so zoom means the same on both projections.
++    static double globeRadiusPixels(double worldSize, double centerLatitude);
++
++    /// The unit-sphere position of a point in tile units.
++    static vec3 tileCoordinatesToSphere(const Point<double>& tilePoint, const UnwrappedTileID&);
++
++    /// The view-projection matrix that takes unit-sphere positions to clip space.
++    static mat4 globeViewProjectionMatrix(const TransformState&, double globeRadiusPixels);
++
++    /// The plane (as ax + by + cz + d) that separates the visible hemisphere from the back of the globe.
++    static vec4 clippingPlane(const TransformState&, double globeRadiusPixels);
++};
++
++} // namespace mln
+diff --git a/src/mln/mtl/context.cpp b/src/mln/mtl/context.cpp
+index 71f084d6fefc..1fb341e036ba 100644
+--- a/src/mln/mtl/context.cpp
++++ b/src/mln/mtl/context.cpp
+@@ -212,9 +212,12 @@ UniqueUniformBufferArray Context::createLayerUniformBufferArray() {
+     return std::make_unique<UniformBufferArray>();
+ }
+ 
+-gfx::ShaderProgramBasePtr Context::getGenericShader(gfx::ShaderRegistry& shaders, const std::string& name) {
++gfx::ShaderProgramBasePtr Context::getGenericShader(gfx::ShaderRegistry& shaders,
++                                                    const std::string& name,
++                                                    gfx::ProjectionVariant variant) {
+     const auto shaderGroup = shaders.getShaderGroup(name);
+-    auto shader = shaderGroup ? shaderGroup->getOrCreateShader(*this, {}) : gfx::ShaderProgramBasePtr{};
++    auto shader = shaderGroup ? shaderGroup->getOrCreateShader(*this, {}, "a_pos", variant)
++                              : gfx::ShaderProgramBasePtr{};
+     return std::static_pointer_cast<gfx::ShaderProgramBase>(std::move(shader));
+ }
+ 
+diff --git a/src/mln/renderer/layer_tweaker.cpp b/src/mln/renderer/layer_tweaker.cpp
+index 01866fc6b530..a77d3448ccaa 100644
+--- a/src/mln/renderer/layer_tweaker.cpp
++++ b/src/mln/renderer/layer_tweaker.cpp
+@@ -56,9 +56,18 @@ ProjectionData LayerTweaker::getProjectionData(const UnwrappedTileID& tileID,
+                                                bool inViewportPixelUnits,
+                                                const gfx::Drawable& drawable,
+                                                bool aligned) {
+-    return parameters.state.getProjectionDataForMatrix(
++    auto data = parameters.state.getProjectionDataForMatrix(
+         tileID,
+         getTileMatrix(tileID, parameters, translation, anchor, nearClipped, inViewportPixelUnits, drawable, aligned));
++#if MLN_GLOBE_DEPTH_OFFSET_IN_SHADER
++    // The same per-layer shift `multiplyWithProjectionMatrix` bakes into the Mercator matrix.
++    if (!drawable.getIs3D() && drawable.getEnableDepth()) {
++        data.depthOffset = ((1 + parameters.currentLayer) * PaintParameters::numSublayers -
++                            drawable.getSubLayerIndex()) *
++                           PaintParameters::depthEpsilon;
++    }
++#endif
++    return data;
+ }
+ 
+ shaders::ProjectionUBO LayerTweaker::toProjectionUBO(const ProjectionData& data) {
+@@ -67,9 +76,9 @@ shaders::ProjectionUBO LayerTweaker::toProjectionUBO(const ProjectionData& data)
+             .tile_mercator_coords = util::cast<float>(data.tileMercatorCoords),
+             .clipping_plane = util::cast<float>(data.clippingPlane),
+             .projection_transition = static_cast<float>(data.projectionTransition),
++            .depth_offset = static_cast<float>(data.depthOffset),
+             .pad1 = 0,
+-            .pad2 = 0,
+-            .pad3 = 0};
++            .pad2 = 0};
+ }
+ 
+ #if MLN_UBO_CONSOLIDATION
+diff --git a/src/mln/renderer/layers/background_layer_tweaker.cpp b/src/mln/renderer/layers/background_layer_tweaker.cpp
+index 8b9ac132e73b..a1f9af183157 100644
+--- a/src/mln/renderer/layers/background_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/background_layer_tweaker.cpp
+@@ -15,10 +15,6 @@ namespace mln {
+ using namespace style;
+ using namespace shaders;
+ 
+-#ifndef NDEBUG
+-constexpr auto BackgroundPatternShaderName = "BackgroundPatternShader";
+-#endif
+-
+ void BackgroundLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters& parameters) {
+     if (layerGroup.empty()) {
+         return;
+@@ -85,10 +81,6 @@ void BackgroundLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPara
+             return;
+         }
+ 
+-        // We assume that drawables don't change between pattern and non-pattern.
+-        assert(hasPattern == (drawable.getShader() ==
+-                              context.getGenericShader(parameters.shaders, std::string(BackgroundPatternShaderName))));
+-
+         const UnwrappedTileID tileID = drawable.getTileID()->toUnwrapped();
+         const auto projection = getProjectionData(
+             tileID, parameters, {0.f, 0.f}, TranslateAnchorType::Viewport, false, false, drawable);
+diff --git a/src/mln/renderer/layers/render_background_layer.cpp b/src/mln/renderer/layers/render_background_layer.cpp
+index b8f7fc16aace..c95ebde4365a 100644
+--- a/src/mln/renderer/layers/render_background_layer.cpp
++++ b/src/mln/renderer/layers/render_background_layer.cpp
+@@ -168,11 +168,19 @@ void RenderBackgroundLayer::update(gfx::ShaderRegistry& shaders,
+         layerGroup->addLayerTweaker(layerTweaker);
+     }
+ 
++    const auto variant = state.isGlobeRendering() ? gfx::ProjectionVariant::Globe : gfx::ProjectionVariant::Mercator;
++    if (variant != projectionVariant) {
++        projectionVariant = variant;
++        plainShader.reset();
++        patternShader.reset();
++        removeAllDrawables();
++    }
++
+     if (!hasPattern && !plainShader) {
+-        plainShader = context.getGenericShader(shaders, std::string(BackgroundPlainShaderName));
++        plainShader = context.getGenericShader(shaders, std::string(BackgroundPlainShaderName), projectionVariant);
+     }
+     if (hasPattern && !patternShader) {
+-        patternShader = context.getGenericShader(shaders, std::string(BackgroundPatternShaderName));
++        patternShader = context.getGenericShader(shaders, std::string(BackgroundPatternShaderName), projectionVariant);
+     }
+ 
+     const auto& curShader = hasPattern ? patternShader : plainShader;
+diff --git a/src/mln/renderer/layers/render_background_layer.hpp b/src/mln/renderer/layers/render_background_layer.hpp
+index 1a0e95554c9b..1ea8890df0e6 100644
+--- a/src/mln/renderer/layers/render_background_layer.hpp
++++ b/src/mln/renderer/layers/render_background_layer.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <mln/shaders/segment.hpp>
+ #include <mln/renderer/render_layer.hpp>
++#include <mln/gfx/shader_group.hpp>
+ #include <mln/style/layers/background_layer_impl.hpp>
+ #include <mln/style/layers/background_layer_properties.hpp>
+ 
+@@ -46,6 +47,7 @@ private:
+     SegmentVector segments;
+ 
+     // Drawable shaders
++    gfx::ProjectionVariant projectionVariant = gfx::ProjectionVariant::Mercator;
+     gfx::ShaderProgramBasePtr plainShader;
+     gfx::ShaderProgramBasePtr patternShader;
+ };
+diff --git a/src/mln/renderer/layers/render_fill_layer.cpp b/src/mln/renderer/layers/render_fill_layer.cpp
+index 74d873157405..29377beddc89 100644
+--- a/src/mln/renderer/layers/render_fill_layer.cpp
++++ b/src/mln/renderer/layers/render_fill_layer.cpp
+@@ -119,7 +119,7 @@ bool RenderFillLayer::queryIntersectsFeature(const GeometryCoordinates& queryGeo
+ 
+ void RenderFillLayer::update(gfx::ShaderRegistry& shaders,
+                              gfx::Context& context,
+-                             const TransformState&,
++                             const TransformState& state,
+                              const std::shared_ptr<UpdateParameters>&,
+                              [[maybe_unused]] const PaintParameters& paintParameters,
+                              const RenderTree&,
+@@ -150,6 +150,12 @@ void RenderFillLayer::update(gfx::ShaderRegistry& shaders,
+         layerGroup->addLayerTweaker(layerTweaker);
+     }
+ 
++    const auto variant = state.isGlobeRendering() ? gfx::ProjectionVariant::Globe : gfx::ProjectionVariant::Mercator;
++    if (variant != projectionVariant) {
++        projectionVariant = variant;
++        removeAllDrawables();
++    }
++
+     if (!fillShaderGroup) {
+         fillShaderGroup = shaders.getShaderGroup(std::string(FillShaderName));
+     }
+@@ -350,7 +356,7 @@ void RenderFillLayer::update(gfx::ShaderRegistry& shaders,
+                 continue;
+             }
+             const auto fillShader = std::static_pointer_cast<gfx::ShaderProgramBase>(
+-                fillShaderGroup->getOrCreateShader(context, propertiesAsUniforms));
++                fillShaderGroup->getOrCreateShader(context, propertiesAsUniforms, "a_pos", projectionVariant));
+ 
+ #if MLN_TRIANGULATE_FILL_OUTLINES
+             const auto outlineTriangulatedShader = doOutline && !dataDrivenOutline ? [&]() -> auto {
+@@ -358,7 +364,8 @@ void RenderFillLayer::update(gfx::ShaderRegistry& shaders,
+                     {"a_color", "a_opacity", "a_width"},
+                     {idLineColorVertexAttribute, idLineOpacityVertexAttribute, idLineWidthVertexAttribute}};
+                 return std::static_pointer_cast<gfx::ShaderProgramBase>(
+-                    outlineTriangulatedShaderGroup->getOrCreateShader(context, outlinePropertiesAsUniforms));
++                    outlineTriangulatedShaderGroup->getOrCreateShader(
++                        context, outlinePropertiesAsUniforms, "a_pos", projectionVariant));
+             }()
+                 : nullptr;
+ 
+@@ -375,10 +382,10 @@ void RenderFillLayer::update(gfx::ShaderRegistry& shaders,
+                 }
+             };
+ #endif
+-            const auto outlineShader = doOutline
+-                                           ? std::static_pointer_cast<gfx::ShaderProgramBase>(
+-                                                 outlineShaderGroup->getOrCreateShader(context, propertiesAsUniforms))
+-                                           : nullptr;
++            const auto outlineShader = doOutline ? std::static_pointer_cast<gfx::ShaderProgramBase>(
++                                                       outlineShaderGroup->getOrCreateShader(
++                                                           context, propertiesAsUniforms, "a_pos", projectionVariant))
++                                                 : nullptr;
+ 
+             if (!fillBuilder && fillShader) {
+                 if (auto builder = context.createDrawableBuilder(layerPrefix + "fill")) {
+@@ -466,10 +473,10 @@ void RenderFillLayer::update(gfx::ShaderRegistry& shaders,
+             }
+ 
+             const auto fillShader = std::static_pointer_cast<gfx::ShaderProgramBase>(
+-                patternShaderGroup->getOrCreateShader(context, propertiesAsUniforms));
++                patternShaderGroup->getOrCreateShader(context, propertiesAsUniforms, "a_pos", projectionVariant));
+             const auto outlineShader = doOutline ? std::static_pointer_cast<gfx::ShaderProgramBase>(
+                                                        outlinePatternShaderGroup->getOrCreateShader(
+-                                                           context, propertiesAsUniforms))
++                                                           context, propertiesAsUniforms, "a_pos", projectionVariant))
+                                                  : nullptr;
+ 
+             if (!patternBuilder) {
+diff --git a/src/mln/renderer/layers/render_fill_layer.hpp b/src/mln/renderer/layers/render_fill_layer.hpp
+index 84ffd60b4345..7f7972a14040 100644
+--- a/src/mln/renderer/layers/render_fill_layer.hpp
++++ b/src/mln/renderer/layers/render_fill_layer.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/renderer/render_layer.hpp>
++#include <mln/gfx/shader_group.hpp>
+ #include <mln/style/layers/fill_layer_impl.hpp>
+ #include <mln/style/layers/fill_layer_properties.hpp>
+ #include <mln/layout/pattern_layout.hpp>
+@@ -54,6 +55,7 @@ private:
+     // Paint properties
+     style::FillPaintProperties::Unevaluated unevaluated;
+ 
++    gfx::ProjectionVariant projectionVariant = gfx::ProjectionVariant::Mercator;
+     gfx::ShaderGroupPtr fillShaderGroup;
+     gfx::ShaderGroupPtr outlineShaderGroup;
+     gfx::ShaderGroupPtr patternShaderGroup;
+diff --git a/src/mln/renderer/paint_parameters.cpp b/src/mln/renderer/paint_parameters.cpp
+index a55243c508b2..c6e216c5d11f 100644
+--- a/src/mln/renderer/paint_parameters.cpp
++++ b/src/mln/renderer/paint_parameters.cpp
+@@ -186,6 +186,11 @@ void PaintParameters::clearStencil() {
+ }
+ 
+ bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
++    // The clip masks are Mercator tile quads; on the globe they arrive with the tile meshes.
++    if (state.isGlobeRendering()) {
++        return true;
++    }
++
+     // We can avoid updating the mask if it already contains the same set of tiles.
+     if (!renderTiles || tileIDsCovered(renderTiles, tileClippingMaskIDs)) {
+         return true;
+@@ -366,6 +371,9 @@ bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
+ }
+ 
+ gfx::StencilMode PaintParameters::stencilModeForClipping(const UnwrappedTileID& tileID) const {
++    if (state.isGlobeRendering()) {
++        return gfx::StencilMode::disabled();
++    }
+     auto it = tileClippingMaskIDs.find(tileID);
+     assert(it != tileClippingMaskIDs.end());
+     const int32_t id = it != tileClippingMaskIDs.end() ? it->second : 0b00000000;
+diff --git a/src/mln/vulkan/context.cpp b/src/mln/vulkan/context.cpp
+index 174a1686f80e..86ceb0005a86 100644
+--- a/src/mln/vulkan/context.cpp
++++ b/src/mln/vulkan/context.cpp
+@@ -446,9 +446,12 @@ UniqueUniformBufferArray Context::createLayerUniformBufferArray() {
+         DescriptorSetType::Layer, shaders::globalUBOCount, shaders::maxSSBOCountPerLayer, shaders::maxUBOCountPerLayer);
+ }
+ 
+-gfx::ShaderProgramBasePtr Context::getGenericShader(gfx::ShaderRegistry& shaders, const std::string& name) {
++gfx::ShaderProgramBasePtr Context::getGenericShader(gfx::ShaderRegistry& shaders,
++                                                    const std::string& name,
++                                                    gfx::ProjectionVariant variant) {
+     const auto shaderGroup = shaders.getShaderGroup(name);
+-    auto shader = shaderGroup ? shaderGroup->getOrCreateShader(*this, {}) : gfx::ShaderProgramBasePtr{};
++    auto shader = shaderGroup ? shaderGroup->getOrCreateShader(*this, {}, "a_pos", variant)
++                              : gfx::ShaderProgramBasePtr{};
+     return std::static_pointer_cast<gfx::ShaderProgramBase>(std::move(shader));
+ }
+ 
+diff --git a/src/mln/webgpu/context.cpp b/src/mln/webgpu/context.cpp
+index 44f1498156ec..5d2b32ed9567 100644
+--- a/src/mln/webgpu/context.cpp
++++ b/src/mln/webgpu/context.cpp
+@@ -107,10 +107,13 @@ gfx::UniqueUniformBufferArray Context::createLayerUniformBufferArray() {
+     return std::make_unique<UniformBufferArray>();
+ }
+ 
+-gfx::ShaderProgramBasePtr Context::getGenericShader(gfx::ShaderRegistry& registry, const std::string& name) {
++gfx::ShaderProgramBasePtr Context::getGenericShader(gfx::ShaderRegistry& registry,
++                                                    const std::string& name,
++                                                    gfx::ProjectionVariant variant) {
+     // Align with Metal - just get shader from registry without caching
+     const auto shaderGroup = registry.getShaderGroup(name);
+-    auto shader = shaderGroup ? shaderGroup->getOrCreateShader(*this, {}) : gfx::ShaderProgramBasePtr{};
++    auto shader = shaderGroup ? shaderGroup->getOrCreateShader(*this, {}, "a_pos", variant)
++                              : gfx::ShaderProgramBasePtr{};
+     return std::static_pointer_cast<gfx::ShaderProgramBase>(std::move(shader));
+ }
+ 
+diff --git a/test/map/transform.test.cpp b/test/map/transform.test.cpp
+index ec205d599dfe..825e726f8aa0 100644
+--- a/test/map/transform.test.cpp
++++ b/test/map/transform.test.cpp
+@@ -3,6 +3,7 @@
+ #include <gmock/gmock.h>
+ #include <cmath>
+ #include <mln/map/mercator_projection.hpp>
++#include <mln/map/vertical_perspective_projection.hpp>
+ #include <mln/map/transform.hpp>
+ #include <mln/math/angles.hpp>
+ #include <mln/util/geo.hpp>
+@@ -1362,3 +1363,45 @@ TEST(Transform, ProjectionDefinition) {
+     ASSERT_EQ(ProjectionDefinition("vertical-perspective", "mercator", 0.5),
+               transform.getState().getProjectionDefinition());
+ }
++
++TEST(VerticalPerspectiveProjection, TileCoordinatesToSphere) {
++    const auto near = [](const vec3& a, const vec3& b) {
++        return std::abs(a[0] - b[0]) < 1e-9 && std::abs(a[1] - b[1]) < 1e-9 && std::abs(a[2] - b[2]) < 1e-9;
++    };
++    const UnwrappedTileID world{0, 0, 0};
++    const double half = util::EXTENT / 2.0;
++    // (0┬░, 0┬░) is the +Z axis; the equator runs through ┬▒X; latitude is Y.
++    EXPECT_TRUE(near({{0, 0, 1}}, VerticalPerspectiveProjection::tileCoordinatesToSphere({half, half}, world)));
++    EXPECT_TRUE(near({{1, 0, 0}}, VerticalPerspectiveProjection::tileCoordinatesToSphere({half * 1.5, half}, world)));
++    EXPECT_TRUE(near({{-1, 0, 0}}, VerticalPerspectiveProjection::tileCoordinatesToSphere({half * 0.5, half}, world)));
++    const vec3 north = VerticalPerspectiveProjection::tileCoordinatesToSphere({half, 0}, world);
++    EXPECT_GT(north[1], 0.99);
++    const vec3 south = VerticalPerspectiveProjection::tileCoordinatesToSphere({half, util::EXTENT}, world);
++    EXPECT_LT(south[1], -0.99);
++}
++
++TEST(VerticalPerspectiveProjection, CenterProjectsToScreenCenter) {
++    Transform transform;
++    transform.resize({512, 512});
++    transform.jumpTo(CameraOptions().withCenter(LatLng{37.0, -122.0}).withZoom(3.0).withBearing(20.0).withPitch(30.0));
++    transform.setProjectionDefinition(ProjectionDefinition("vertical-perspective"));
++    const TransformState& state = transform.getState();
++    ASSERT_TRUE(state.isGlobeRendering());
++
++    const double radius = VerticalPerspectiveProjection::globeRadiusPixels(Projection::worldSize(state.getScale()),
++                                                                           state.getLatLng().latitude());
++    const mat4 matrix = VerticalPerspectiveProjection::globeViewProjectionMatrix(state, radius);
++    const LatLng center = state.getLatLng();
++    const double lat = util::deg2rad(center.latitude());
++    const double lng = util::deg2rad(center.longitude());
++    const vec4 surface = {{std::sin(lng) * std::cos(lat), std::sin(lat), std::cos(lng) * std::cos(lat), 1}};
++    vec4 clip;
++    matrix::transformMat4(clip, surface, matrix);
++    EXPECT_NEAR(0.0, clip[0] / clip[3], 1e-6);
++    EXPECT_NEAR(0.0, clip[1] / clip[3], 1e-6);
++
++    const vec4 plane = VerticalPerspectiveProjection::clippingPlane(state, radius);
++    EXPECT_GT(plane[0] * surface[0] + plane[1] * surface[1] + plane[2] * surface[2] + plane[3], 0.0);
++    const vec4 antipode = {{-surface[0], -surface[1], -surface[2], 1}};
++    EXPECT_LT(plane[0] * antipode[0] + plane[1] * antipode[1] + plane[2] * antipode[2] + plane[3], 0.0);
++}
