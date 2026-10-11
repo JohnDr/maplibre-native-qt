@@ -1,0 +1,776 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6150e5caf0cf..8fd8a139a1c3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -633,6 +633,8 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_source_observer.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_static_data.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_static_data.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/globe_depth_pass.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/globe_depth_pass.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_tile.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_tile.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_tree.hpp
+diff --git a/bazel/core.bzl b/bazel/core.bzl
+index c470dae72dad..8e62d4db02b9 100644
+--- a/bazel/core.bzl
++++ b/bazel/core.bzl
+@@ -231,6 +231,8 @@ MLN_CORE_SOURCE = [
+     "src/mln/renderer/cross_faded_property_evaluator.cpp",
+     "src/mln/renderer/cross_faded_property_evaluator.hpp",
+     "src/mln/renderer/data_driven_property_evaluator.hpp",
++    "src/mln/renderer/globe_depth_pass.cpp",
++    "src/mln/renderer/globe_depth_pass.hpp",
+     "src/mln/renderer/globe_tile_mesh.hpp",
+     "src/mln/renderer/group_by_layout.cpp",
+     "src/mln/renderer/group_by_layout.hpp",
+diff --git a/cmake/vulkan.cmake b/cmake/vulkan.cmake
+index 3048f0a320b7..ec7601ffcd79 100644
+--- a/cmake/vulkan.cmake
++++ b/cmake/vulkan.cmake
+@@ -45,6 +45,7 @@ list(APPEND
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/custom_symbol_icon.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/fill.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/fill_extrusion.hpp
++        ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/globe_depth.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/heatmap.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/heatmap_texture.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/hillshade.hpp
+@@ -91,6 +92,7 @@ list(APPEND
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/debug.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/fill.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/fill_extrusion.cpp
++        ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/globe_depth.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/heatmap.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/heatmap_texture.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/hillshade.cpp
+diff --git a/include/mln/shaders/shader_defines.hpp b/include/mln/shaders/shader_defines.hpp
+index 1f85d1bdf265..b89283bb8454 100644
+--- a/include/mln/shaders/shader_defines.hpp
++++ b/include/mln/shaders/shader_defines.hpp
+@@ -480,6 +480,11 @@ enum {
+     fillExtrusionVertexAttributeCount
+ };
+ 
++enum {
++    idGlobeDepthPosVertexAttribute,
++    globeDepthVertexAttributeCount
++};
++
+ enum {
+     idHeatmapPosVertexAttribute,
+ 
+@@ -590,6 +595,7 @@ static constexpr uint32_t maxAttributeCountPerShader = std::max({
+     static_cast<uint32_t>(debugVertexAttributeCount),
+     static_cast<uint32_t>(fillVertexAttributeCount),
+     static_cast<uint32_t>(fillExtrusionVertexAttributeCount),
++    static_cast<uint32_t>(globeDepthVertexAttributeCount),
+     static_cast<uint32_t>(heatmapVertexAttributeCount),
+     static_cast<uint32_t>(hillshadeVertexAttributeCount),
+     static_cast<uint32_t>(colorReliefVertexAttributeCount),
+diff --git a/include/mln/shaders/shader_source.hpp b/include/mln/shaders/shader_source.hpp
+index d9282c568810..026a1fcfda26 100644
+--- a/include/mln/shaders/shader_source.hpp
++++ b/include/mln/shaders/shader_source.hpp
+@@ -28,6 +28,7 @@ enum class BuiltIn {
+     FillExtrusionInstancedShader,
+     FillExtrusionPatternShader,
+     FillExtrusionPatternInstancedShader,
++    GlobeDepthShader,
+     HeatmapShader,
+     HeatmapTextureShader,
+     HillshadePrepareShader,
+diff --git a/include/mln/shaders/vulkan/common.hpp b/include/mln/shaders/vulkan/common.hpp
+index ac940f285077..8186f28f3cf0 100644
+--- a/include/mln/shaders/vulkan/common.hpp
++++ b/include/mln/shaders/vulkan/common.hpp
+@@ -207,6 +207,21 @@ vec4 projectTile(vec2 pos, vec2 rawPos, ProjectionUBO projection) {
+     return interpolateProjection(pos, projectToSphere(pos, rawPos, projection), 0.0, projection);
+ }
+ 
++// Keeps the matrix Z, for geometry that needs the depth buffer (3D layers).
++vec4 interpolateProjectionFor3D(vec2 posInTile, vec3 spherePos, float elevation, ProjectionUBO projection) {
++    const vec3 elevatedPos = spherePos * (1.0 + elevation / GLOBE_RADIUS);
++    const vec4 globePosition = projection.matrix * vec4(elevatedPos, 1.0);
++    if (projection.projection_transition > 0.999) {
++        return globePosition;
++    }
++    const vec4 fallbackPosition = projection.fallback_matrix * vec4(posInTile, elevation, 1.0);
++    return mix(fallbackPosition, globePosition, projection.projection_transition);
++}
++
++vec4 projectTileFor3D(vec2 pos, float elevation, ProjectionUBO projection) {
++    return interpolateProjectionFor3D(pos, projectToSphere(pos, pos, projection), elevation, projection);
++}
++
+ #else
+ 
+ vec4 projectTile(vec2 pos, ProjectionUBO projection) {
+@@ -222,6 +237,10 @@ vec4 projectTile(vec2 pos, vec2 rawPos, ProjectionUBO projection) {
+     return result;
+ }
+ 
++vec4 projectTileFor3D(vec2 pos, float elevation, ProjectionUBO projection) {
++    return projection.matrix * vec4(pos, elevation, 1.0);
++}
++
+ #endif
+ 
+ void applySurfaceTransform() {
+diff --git a/include/mln/shaders/vulkan/fill_extrusion.hpp b/include/mln/shaders/vulkan/fill_extrusion.hpp
+index f556b6638e40..52e445475a95 100644
+--- a/include/mln/shaders/vulkan/fill_extrusion.hpp
++++ b/include/mln/shaders/vulkan/fill_extrusion.hpp
+@@ -64,6 +64,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillExtrusionDrawableUBO) read
+     FillExtrusionDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ layout(set = LAYER_SET_INDEX, binding = idFillExtrusionPropsUBO) uniform FillExtrusionPropsUBO {
+     vec4 color;
+     vec4 light_color_pad;
+@@ -106,7 +110,7 @@ void main() {
+     const float z = t > 0.0 ? height : base;
+     const vec2 decimals = unpack_float(floor(in_decimals_ed.x / 2)) / 128.0;
+ 
+-    gl_Position = drawable.matrix * vec4(in_position + decimals, z, 1.0);
++    gl_Position = projectTileFor3D(in_position + decimals, z, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+ #if defined(OVERDRAW_INSPECTOR)
+@@ -212,6 +216,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillExtrusionDrawableUBO) read
+     FillExtrusionDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ layout(set = LAYER_SET_INDEX, binding = idFillExtrusionPropsUBO) uniform FillExtrusionPropsUBO {
+     vec4 color;
+     vec4 light_color_pad;
+@@ -279,7 +287,7 @@ void main() {
+     const float t = float(in_position.y);
+     const float z = t > 0.0 ? height : base;
+ 
+-    gl_Position = drawable.matrix * vec4(in_position.x == 0.0 ? p1 : p2, z, 1.0);
++    gl_Position = projectTileFor3D(in_position.x == 0.0 ? p1 : p2, z, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+ #if defined(OVERDRAW_INSPECTOR)
+@@ -390,6 +398,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillExtrusionDrawableUBO) read
+     FillExtrusionDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ struct FillExtrusionTilePropsUBO {
+     vec4 pattern_from;
+     vec4 pattern_to;
+@@ -449,7 +461,7 @@ void main() {
+     const float z = t > 0.0 ? height : base;
+     const vec2 decimals = unpack_float(floor(in_decimals_ed.x / 2)) / 128.0;
+ 
+-    gl_Position = drawable.matrix * vec4(in_position + decimals, z, 1.0);
++    gl_Position = projectTileFor3D(in_position + decimals, z, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+ #if defined(OVERDRAW_INSPECTOR)
+@@ -658,6 +670,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idFillExtrusionDrawableUBO) read
+     FillExtrusionDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ struct OutlineInstance {
+     int pos;
+     uint decimals_ed;
+@@ -741,7 +757,7 @@ void main() {
+     const float t = float(in_position.y);
+     const float z = t > 0.0 ? height : base;
+ 
+-    gl_Position = drawable.matrix * vec4(in_position.x == 0.0 ? p1 : p2, z, 1.0);
++    gl_Position = projectTileFor3D(in_position.x == 0.0 ? p1 : p2, z, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+ #if defined(OVERDRAW_INSPECTOR)
+diff --git a/include/mln/shaders/vulkan/globe_depth.hpp b/include/mln/shaders/vulkan/globe_depth.hpp
+new file mode 100644
+index 000000000000..fde5163ec697
+--- /dev/null
++++ b/include/mln/shaders/vulkan/globe_depth.hpp
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <mln/shaders/shader_source.hpp>
++#include <mln/shaders/vulkan/shader_program.hpp>
++
++namespace mln {
++namespace shaders {
++
++constexpr auto globeDepthShaderPrelude = R"(
++
++)";
++
++/// Writes the planet surface into the depth buffer so 3D geometry behind the horizon is hidden.
++template <>
++struct ShaderSource<BuiltIn::GlobeDepthShader, gfx::Backend::Type::Vulkan> {
++    static constexpr const char* name = "GlobeDepthShader";
++
++    static const std::array<AttributeInfo, 1> attributes;
++    static constexpr std::array<AttributeInfo, 0> instanceAttributes{};
++    static const std::array<TextureInfo, 0> textures;
++
++    static constexpr auto prelude = globeDepthShaderPrelude;
++    static constexpr auto vertex = R"(
++
++layout(location = 0) in ivec2 in_position;
++
++layout(push_constant) uniform Constants {
++    int ubo_index;
++} constant;
++
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
++void main() {
++    gl_Position = projectTileFor3D(vec2(in_position), 0.0, projectionVector.projection_ubo[constant.ubo_index]);
++    applySurfaceTransform();
++}
++)";
++
++    static constexpr auto fragment = R"(
++
++void main() {
++}
++)";
++};
++
++} // namespace shaders
++} // namespace mln
+diff --git a/src/mln/renderer/buckets/fill_extrusion_bucket.cpp b/src/mln/renderer/buckets/fill_extrusion_bucket.cpp
+index c49e53b8b41a..d8baa5dd0257 100644
+--- a/src/mln/renderer/buckets/fill_extrusion_bucket.cpp
++++ b/src/mln/renderer/buckets/fill_extrusion_bucket.cpp
+@@ -6,7 +6,9 @@
+ #include <mln/map/transform_state.hpp>
+ #include <mln/util/math.hpp>
+ #include <mln/util/constants.hpp>
++#include <mln/util/subdivision.hpp>
+ 
++#include <optional>
+ #include <variant>
+ 
+ #ifdef _MSC_VER
+@@ -86,7 +88,20 @@ void FillExtrusionBucket::addFeature(const GeometryTileFeature& feature,
+             polyVariant = roundPolygonCorners(polygon, roundedCornerDistance);
+         }
+ 
+-        std::size_t totalVertices = 0;
++        // On the globe the walls follow subdivided rings and the roof is a subdivided mesh of its own.
++        const uint32_t granularity = subdivisionGranularity.fill.getGranularityForZoomLevel(canonical.z);
++        std::optional<util::SubdivisionResult> roof;
++        if (granularity >= 2 && roundedCornerDistance <= 0) {
++            GeometryCollection subdividedRings;
++            for (const auto& ring : polygon) {
++                subdividedRings.push_back(util::subdivideVertexLine(ring, granularity, /*isRing=*/true));
++            }
++            polyVariant = std::move(subdividedRings);
++            roof = util::subdividePolygonWithinLimit(
++                polygon, canonical, granularity, /*generateOutlineLines=*/false, maxSegmentVertices);
++        }
++
++        std::size_t totalVertices = roof ? roof->vertices.size() / 2 : 0;
+ 
+         std::visit(
+             [&totalVertices](const auto& poly) {
+@@ -167,7 +182,7 @@ void FillExtrusionBucket::addFeature(const GeometryTileFeature& feature,
+ 
+         std::vector<uint32_t> indices;
+         std::visit(
+-            [&indices, processRingPoints](const auto& poly) {
++            [&indices, &roof, processRingPoints](const auto& poly) {
+                 for (const auto& ring : poly) {
+                     std::size_t nVertices = ring.size();
+ 
+@@ -186,18 +201,41 @@ void FillExtrusionBucket::addFeature(const GeometryTileFeature& feature,
+                     }
+                 }
+ 
+-                indices = mapbox::earcut(poly);
++                if (!roof) {
++                    indices = mapbox::earcut(poly);
++                }
+             },
+             polyVariant);
+ 
+         std::size_t nIndices = indices.size();
+         assert(nIndices % 3 == 0);
+ 
+-        for (std::size_t i = 0; i < nIndices; i += 3) {
+-            // Counter-Clockwise winding order.
+-            triangles.emplace_back(static_cast<uint16_t>(flatIndices[indices[i]]),
+-                                   static_cast<uint16_t>(flatIndices[indices[i + 2]]),
+-                                   static_cast<uint16_t>(flatIndices[indices[i + 1]]));
++        if (roof) {
++            const auto base = triangleIndex;
++            for (std::size_t i = 0; i + 1 < roof->vertices.size(); i += 2) {
++                const Point<double> p{static_cast<double>(roof->vertices[i]),
++                                      static_cast<double>(roof->vertices[i + 1])};
++#if MLN_USE_FILL_EXTRUSION_INSTANCING
++                vertices.emplace_back(layoutVertex(p, 0, true));
++#else
++                vertices.emplace_back(FillExtrusionBucket::layoutVertex(p, 0, 0, 1, 0));
++#endif
++                triangleIndex++;
++            }
++            nIndices = roof->triangleIndices.size();
++            assert(nIndices % 3 == 0);
++            for (std::size_t i = 0; i + 2 < nIndices; i += 3) {
++                triangles.emplace_back(static_cast<uint16_t>(base + roof->triangleIndices[i]),
++                                       static_cast<uint16_t>(base + roof->triangleIndices[i + 1]),
++                                       static_cast<uint16_t>(base + roof->triangleIndices[i + 2]));
++            }
++        } else {
++            for (std::size_t i = 0; i < nIndices; i += 3) {
++                // Counter-Clockwise winding order.
++                triangles.emplace_back(static_cast<uint16_t>(flatIndices[indices[i]]),
++                                       static_cast<uint16_t>(flatIndices[indices[i + 2]]),
++                                       static_cast<uint16_t>(flatIndices[indices[i + 1]]));
++            }
+         }
+ 
+         triangleSegment.vertexLength += totalVertices;
+diff --git a/src/mln/renderer/buckets/fill_extrusion_bucket.hpp b/src/mln/renderer/buckets/fill_extrusion_bucket.hpp
+index 5bd25e6eca46..255abfc10890 100644
+--- a/src/mln/renderer/buckets/fill_extrusion_bucket.hpp
++++ b/src/mln/renderer/buckets/fill_extrusion_bucket.hpp
+@@ -4,6 +4,7 @@
+ #include <mln/renderer/paint_property_binder.hpp>
+ #include <mln/renderer/render_light.hpp>
+ #include <mln/tile/geometry_tile_data.hpp>
++#include <mln/util/subdivision_granularity.hpp>
+ #include <mln/gfx/vertex_buffer.hpp>
+ #include <mln/gfx/index_buffer.hpp>
+ #include <mln/shaders/segment.hpp>
+@@ -25,6 +26,8 @@ using FillExtrusionLayoutVertex = gfx::Vertex<TypeList<attributes::pos, attribut
+ 
+ class FillExtrusionBucket final : public Bucket {
+ public:
++    void setSubdivisionGranularity(const SubdivisionGranularitySetting& value) { subdivisionGranularity = value; }
++
+     ~FillExtrusionBucket() override;
+     using PossiblyEvaluatedPaintProperties = style::FillExtrusionPaintProperties::PossiblyEvaluated;
+     using PossiblyEvaluatedLayoutProperties = style::FillExtrusionLayoutProperties::PossiblyEvaluated;
+@@ -97,6 +100,7 @@ public:
+     TriangleIndexVector& triangles = *sharedTriangles;
+ 
+     SegmentVector triangleSegments;
++    SubdivisionGranularitySetting subdivisionGranularity;
+     SegmentVector instanceSegments;
+ 
+     std::unordered_map<std::string, FillExtrusionBinders> paintPropertyBinders;
+diff --git a/src/mln/renderer/globe_depth_pass.cpp b/src/mln/renderer/globe_depth_pass.cpp
+new file mode 100644
+index 000000000000..5401b1cacb52
+--- /dev/null
++++ b/src/mln/renderer/globe_depth_pass.cpp
+@@ -0,0 +1,118 @@
++#include <mln/renderer/globe_depth_pass.hpp>
++
++#include <mln/gfx/context.hpp>
++#include <mln/gfx/cull_face_mode.hpp>
++#include <mln/gfx/drawable.hpp>
++#include <mln/gfx/drawable_builder.hpp>
++#include <mln/gfx/drawable_tweaker.hpp>
++#include <mln/gfx/projection_variant.hpp>
++#include <mln/gfx/shader_registry.hpp>
++#include <mln/gfx/uniform_buffer.hpp>
++#include <mln/map/transform_state.hpp>
++#include <mln/renderer/globe_tile_mesh.hpp>
++#include <mln/renderer/layer_tweaker.hpp>
++#include <mln/renderer/paint_parameters.hpp>
++#include <mln/renderer/render_pass.hpp>
++#include <mln/renderer/update_parameters.hpp>
++#include <mln/shaders/shader_defines.hpp>
++#include <mln/util/tile_cover.hpp>
++
++#include <algorithm>
++#include <unordered_set>
++
++namespace mln {
++
++namespace {
++
++constexpr std::string_view GlobeDepthShaderName = "GlobeDepthShader";
++
++class GlobeDepthTweaker : public gfx::DrawableTweaker {
++public:
++    void init(gfx::Drawable&) override {}
++
++    void execute(gfx::Drawable& drawable, PaintParameters& parameters) override {
++        if (!drawable.getTileID()) {
++            return;
++        }
++        const auto ubo = LayerTweaker::toProjectionUBO(
++            parameters.projectionDataForTile(drawable.getTileID()->toUnwrapped()));
++        drawable.mutableUniformBuffers().createOrUpdate(shaders::idProjectionUBO, &ubo, parameters.context);
++    }
++};
++
++} // namespace
++
++void GlobeDepthPass::update(gfx::ShaderRegistry& shaders,
++                            gfx::Context& context,
++                            const TransformState& state,
++                            const UpdateParameters& updateParameters,
++                            bool needed) {
++    if (!state.isGlobeRendering() || !needed) {
++        if (layerGroup) {
++            layerGroup->clearDrawables();
++        }
++        return;
++    }
++
++    if (!shader) {
++        shader = context.getGenericShader(shaders, std::string(GlobeDepthShaderName), gfx::ProjectionVariant::Globe);
++    }
++    if (!shader) {
++        return;
++    }
++    if (!layerGroup) {
++        constexpr std::size_t initialCapacity = 64;
++        layerGroup = context.createTileLayerGroup(0, initialCapacity, "globe-depth");
++    }
++
++    const auto zoom = state.getIntegerZoom();
++    const auto tileCover = util::tileCover({.transformState = state,
++                                            .tileLodMinRadius = updateParameters.tileLodMinRadius,
++                                            .tileLodScale = updateParameters.tileLodScale,
++                                            .tileLodPitchThreshold = updateParameters.tileLodPitchThreshold,
++                                            .tileLodMode = updateParameters.tileLodMode},
++                                           zoom,
++                                           Range<uint8_t>(0, zoom));
++
++    const std::unordered_set<OverscaledTileID> covered(tileCover.begin(), tileCover.end());
++    layerGroup->removeDrawablesIf(
++        [&](gfx::Drawable& drawable) { return drawable.getTileID() && !covered.contains(*drawable.getTileID()); });
++
++    std::unique_ptr<gfx::DrawableBuilder> builder;
++    for (const auto& tileID : tileCover) {
++        if (layerGroup->getDrawableCount(RenderPass::Translucent, tileID) > 0) {
++            continue;
++        }
++        if (!builder) {
++            builder = context.createDrawableBuilder("globe-depth");
++            builder->setShader(shader);
++            builder->setRenderPass(RenderPass::Translucent);
++            builder->setIs3D(true);
++            builder->setEnableColor(false);
++            builder->setEnableDepth(true);
++            builder->setDepthType(gfx::DepthMaskType::ReadWrite);
++            builder->setCullFaceMode(gfx::CullFaceMode::backCCW());
++            builder->setVertexAttrId(shaders::idGlobeDepthPosVertexAttribute);
++            builder->addTweaker(std::make_shared<GlobeDepthTweaker>());
++        }
++
++        // The grid depends only on the zoom and whether the tile touches a pole.
++        const auto& canonical = tileID.canonical;
++        const auto key = std::make_tuple(canonical.z, canonical.y == 0, canonical.y == (1u << canonical.z) - 1);
++        auto meshIt = meshes.find(key);
++        if (meshIt == meshes.end()) {
++            meshIt = meshes.emplace(key, rawGlobeTileMesh(canonical, true)).first;
++        }
++        const auto& mesh = meshIt->second;
++        builder->setRawVertices(std::vector(mesh.vertices), mesh.vertexCount, gfx::AttributeDataType::Short2);
++        builder->setSegments(gfx::Triangles(), mesh.indices, mesh.segments.data(), mesh.segments.size());
++        builder->flush(context);
++
++        for (auto& drawable : builder->clearDrawables()) {
++            drawable->setTileID(tileID);
++            layerGroup->addDrawable(RenderPass::Translucent, tileID, std::move(drawable));
++        }
++    }
++}
++
++} // namespace mln
+diff --git a/src/mln/renderer/globe_depth_pass.hpp b/src/mln/renderer/globe_depth_pass.hpp
+new file mode 100644
+index 000000000000..31e0813bae7d
+--- /dev/null
++++ b/src/mln/renderer/globe_depth_pass.hpp
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <mln/renderer/globe_tile_mesh.hpp>
++#include <map>
++#include <tuple>
++
++#include <mln/renderer/layer_group.hpp>
++#include <mln/shaders/shader_program_base.hpp>
++
++namespace mln {
++
++namespace gfx {
++class Context;
++class ShaderRegistry;
++} // namespace gfx
++
++class TransformState;
++class UpdateParameters;
++
++/// Writes the planet into the depth buffer ahead of the translucent pass, so that 3D geometry
++/// behind the horizon is hidden by the globe the way the 2D layers are by their clip Z.
++class GlobeDepthPass {
++public:
++    /// `needed` is whether any layer draws 3D geometry this frame; without one the planet's depth is never read.
++    void update(gfx::ShaderRegistry&, gfx::Context&, const TransformState&, const UpdateParameters&, bool needed);
++
++    LayerGroupBase* getLayerGroup() const { return layerGroup.get(); }
++
++private:
++    TileLayerGroupPtr layerGroup;
++    gfx::ShaderProgramBasePtr shader;
++    std::map<std::tuple<uint8_t, bool, bool>, RawGlobeTileMesh> meshes;
++};
++
++} // namespace mln
+diff --git a/src/mln/renderer/layers/render_fill_extrusion_layer.cpp b/src/mln/renderer/layers/render_fill_extrusion_layer.cpp
+index a105a8137889..bee27d9b5260 100644
+--- a/src/mln/renderer/layers/render_fill_extrusion_layer.cpp
++++ b/src/mln/renderer/layers/render_fill_extrusion_layer.cpp
+@@ -103,7 +103,7 @@ bool RenderFillExtrusionLayer::queryIntersectsFeature(const GeometryCoordinates&
+ 
+ void RenderFillExtrusionLayer::update(gfx::ShaderRegistry& shaders,
+                                       gfx::Context& context,
+-                                      const TransformState&,
++                                      const TransformState& state,
+                                       const std::shared_ptr<UpdateParameters>&,
+                                       [[maybe_unused]] const PaintParameters& paintParameters,
+                                       const RenderTree&,
+@@ -127,6 +127,8 @@ void RenderFillExtrusionLayer::update(gfx::ShaderRegistry& shaders,
+         layerGroup->addLayerTweaker(layerTweaker);
+     }
+ 
++    updateProjectionVariant(state);
++
+     if (!fillExtrusionGroup) {
+         fillExtrusionGroup = shaders.getShaderGroup("FillExtrusionShader");
+     }
+@@ -245,7 +247,7 @@ void RenderFillExtrusionLayer::update(gfx::ShaderRegistry& shaders,
+             binders, evaluated, propertiesAsUniforms, idFillExtrusionBaseVertexAttribute);
+ 
+         const auto shader = std::static_pointer_cast<gfx::ShaderProgramBase>(
+-            shaderGroup->getOrCreateShader(context, propertiesAsUniforms));
++            shaderGroup->getOrCreateShader(context, propertiesAsUniforms, "a_pos", projectionVariant));
+         if (!shader) {
+             continue;
+         }
+@@ -269,7 +271,7 @@ void RenderFillExtrusionLayer::update(gfx::ShaderRegistry& shaders,
+             binders, evaluated, instancePropertiesAsUniforms, idFillExtrusionBaseVertexAttribute);
+ 
+         const auto instancedShader = std::static_pointer_cast<gfx::ShaderProgramBase>(
+-            instancedShaderGroup->getOrCreateShader(context, instancePropertiesAsUniforms));
++            instancedShaderGroup->getOrCreateShader(context, instancePropertiesAsUniforms, "a_pos", projectionVariant));
+         if (!instancedShader) {
+             continue;
+         }
+diff --git a/src/mln/renderer/render_layer.cpp b/src/mln/renderer/render_layer.cpp
+index 7febd43b430c..de89dc428f39 100644
+--- a/src/mln/renderer/render_layer.cpp
++++ b/src/mln/renderer/render_layer.cpp
+@@ -1,6 +1,7 @@
+ #include <mln/renderer/render_layer.hpp>
+ 
+ #include <mln/gfx/context.hpp>
++#include <mln/map/transform_state.hpp>
+ #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/renderer/render_source.hpp>
+ #include <mln/renderer/render_tile.hpp>
+@@ -156,6 +157,16 @@ std::size_t RenderLayer::removeAllDrawables() {
+     return 0;
+ }
+ 
++bool RenderLayer::updateProjectionVariant(const TransformState& state) {
++    const auto variant = state.isGlobeRendering() ? gfx::ProjectionVariant::Globe : gfx::ProjectionVariant::Mercator;
++    if (variant == projectionVariant) {
++        return false;
++    }
++    projectionVariant = variant;
++    removeAllDrawables();
++    return true;
++}
++
+ void RenderLayer::updateRenderTileIDs() {
+     if (!renderTiles || renderTiles->empty()) {
+         renderTileIDs.clear();
+diff --git a/src/mln/renderer/render_layer.hpp b/src/mln/renderer/render_layer.hpp
+index 7dc4524a48af..bbea0deb24b1 100644
+--- a/src/mln/renderer/render_layer.hpp
++++ b/src/mln/renderer/render_layer.hpp
+@@ -7,6 +7,7 @@
+ #include <mln/util/mat4.hpp>
+ 
+ #include <mln/gfx/drawable.hpp>
++#include <mln/gfx/projection_variant.hpp>
+ #include <mln/renderer/layer_group.hpp>
+ #include <mln/renderer/change_request.hpp>
+ #include <mln/util/tiny_unordered_map.hpp>
+@@ -189,6 +190,9 @@ public:
+     /// Remove all the drawables for tiles
+     virtual std::size_t removeAllDrawables();
+ 
++    /// Switch to the projection the transform renders with; drops drawables and returns true if it changed.
++    bool updateProjectionVariant(const TransformState&);
++
+     using Dependency = style::expression::Dependency;
+     Dependency getStyleDependencies() const { return styleDependencies; }
+ 
+@@ -318,6 +322,8 @@ protected:
+     // Current renderable status as specified by the markLayerRenderable event
+     bool isRenderable{false};
+ 
++    gfx::ProjectionVariant projectionVariant = gfx::ProjectionVariant::Mercator;
++
+     struct Stats {
+         size_t propertyEvaluations = 0;
+         size_t drawablesAdded = 0;
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index f724664f17b4..986c018055ea 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -972,8 +972,10 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+     std::vector<std::unique_ptr<ChangeRequest>> changes;
+     changes.reserve(items.size() * 3);
+ 
++    bool has3D = false;
+     for (const auto& item : items) {
+         auto& renderLayer = item.layer.get();
++        has3D = has3D || renderLayer.is3D();
+ #if MLN_RENDER_BACKEND_OPENGL
+         // Android Emulator: Goldfish is *very* broken. This will prevent a crash
+         // inside the GL translation layer at the cost of emulator performance.
+@@ -988,6 +990,8 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+         }
+     }
+     addChanges(changes);
++
++    globeDepthPass.update(shaders, context, state, *updateParameters, has3D);
+ }
+ 
+ void RenderOrchestrator::processChanges() {
+diff --git a/src/mln/renderer/render_orchestrator.hpp b/src/mln/renderer/render_orchestrator.hpp
+index 15f1f6665aeb..903e7db59374 100644
+--- a/src/mln/renderer/render_orchestrator.hpp
++++ b/src/mln/renderer/render_orchestrator.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <mln/renderer/globe_depth_pass.hpp>
+ #include <mln/renderer/layer_group.hpp>
+ #include <mln/actor/scheduler.hpp>
+ #include <mln/renderer/renderer.hpp>
+@@ -108,6 +109,8 @@ public:
+     size_t numLayerGroups() const noexcept;
+     void updateLayerIndex(LayerGroupBasePtr, int32_t newIndex);
+ 
++    LayerGroupBase* getGlobeDepthLayerGroup() const { return globeDepthPass.getLayerGroup(); }
++
+     template <typename Func /* void(LayerGroupBase&) */>
+     void visitLayerGroups(Func f) {
+         for (auto& pair : layerGroupsByLayerIndex) {
+@@ -246,6 +249,7 @@ private:
+ 
+     std::vector<RenderTargetPtr> renderTargets;
+     RenderItem::DebugLayerGroupMap debugLayerGroups;
++    GlobeDepthPass globeDepthPass;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+index b6c6aee30587..b6446f39ded4 100644
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -290,6 +290,9 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+ 
+         // Give the layers a chance to upload
+         orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) { layerGroup.upload(*uploadPass); });
++        if (auto* globeDepth = orchestrator.getGlobeDepthLayerGroup()) {
++            globeDepth->upload(*uploadPass);
++        }
+ 
+         // Give the render targets a chance to upload
+         orchestrator.visitRenderTargets([&](RenderTarget& renderTarget) { renderTarget.upload(*uploadPass); });
+@@ -414,6 +417,11 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+         parameters.depthRangeSize = 1 - (orchestrator.numLayerGroups() + 2) * PaintParameters::numSublayers *
+                                             PaintParameters::depthEpsilon;
+ 
++        // The planet goes into the depth buffer first, so 3D geometry behind the horizon stays hidden.
++        if (auto* globeDepth = orchestrator.getGlobeDepthLayerGroup()) {
++            globeDepth->render(orchestrator, parameters);
++        }
++
+         // draw layer groups, translucent pass
+         parameters.currentLayer = static_cast<uint32_t>(orchestrator.numLayerGroups()) - 1;
+         orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) {
+diff --git a/src/mln/shaders/shader_source.cpp b/src/mln/shaders/shader_source.cpp
+index ea7517875539..65361abfc131 100644
+--- a/src/mln/shaders/shader_source.cpp
++++ b/src/mln/shaders/shader_source.cpp
+@@ -27,6 +27,7 @@ MBGL_DEFINE_ENUM(BuiltIn,
+                   {BuiltIn::FillExtrusionInstancedShader, "FillExtrusionInstancedShader"},
+                   {BuiltIn::FillExtrusionPatternShader, "FillExtrusionPatternShader"},
+                   {BuiltIn::FillExtrusionPatternInstancedShader, "FillExtrusionPatternInstancedShader"},
++                  {BuiltIn::GlobeDepthShader, "GlobeDepthShader"},
+                   {BuiltIn::HeatmapShader, "HeatmapShader"},
+                   {BuiltIn::HeatmapTextureShader, "HeatmapTextureShader"},
+                   {BuiltIn::HillshadePrepareShader, "HillshadePrepareShader"},
+diff --git a/src/mln/shaders/vulkan/globe_depth.cpp b/src/mln/shaders/vulkan/globe_depth.cpp
+new file mode 100644
+index 000000000000..9018f08a63dd
+--- /dev/null
++++ b/src/mln/shaders/vulkan/globe_depth.cpp
+@@ -0,0 +1,15 @@
++#include <mln/shaders/vulkan/globe_depth.hpp>
++#include <mln/shaders/shader_defines.hpp>
++
++namespace mln {
++namespace shaders {
++
++using GlobeDepthShaderSource = ShaderSource<BuiltIn::GlobeDepthShader, gfx::Backend::Type::Vulkan>;
++
++const std::array<AttributeInfo, 1> GlobeDepthShaderSource::attributes = {
++    AttributeInfo{0, gfx::AttributeDataType::Short2, idGlobeDepthPosVertexAttribute},
++};
++const std::array<TextureInfo, 0> GlobeDepthShaderSource::textures = {};
++
++} // namespace shaders
++} // namespace mln
+diff --git a/src/mln/vulkan/renderer_backend.cpp b/src/mln/vulkan/renderer_backend.cpp
+index 51286c73423a..63c8d79001e6 100644
+--- a/src/mln/vulkan/renderer_backend.cpp
++++ b/src/mln/vulkan/renderer_backend.cpp
+@@ -18,6 +18,7 @@
+ #include <mln/shaders/vulkan/debug.hpp>
+ #include <mln/shaders/vulkan/fill.hpp>
+ #include <mln/shaders/vulkan/fill_extrusion.hpp>
++#include <mln/shaders/vulkan/globe_depth.hpp>
+ #include <mln/shaders/vulkan/heatmap.hpp>
+ #include <mln/shaders/vulkan/heatmap_texture.hpp>
+ #include <mln/shaders/vulkan/hillshade.hpp>
+@@ -711,6 +712,7 @@ void RendererBackend::initShaders(gfx::ShaderRegistry& shaders, const ProgramPar
+                   shaders::BuiltIn::FillExtrusionInstancedShader,
+                   shaders::BuiltIn::FillExtrusionPatternShader,
+                   shaders::BuiltIn::FillExtrusionPatternInstancedShader,
++                  shaders::BuiltIn::GlobeDepthShader,
+                   shaders::BuiltIn::HeatmapShader,
+                   shaders::BuiltIn::HeatmapTextureShader,
+                   shaders::BuiltIn::HillshadeShader,
