@@ -1,0 +1,1305 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 48766e0c33df..f97c16fff818 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -306,6 +306,7 @@ list(APPEND INCLUDE_FILES
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/get_json_type.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/layer.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/light.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/projection.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/position.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/property_value.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/rotation.hpp
+@@ -372,6 +373,8 @@ list(APPEND INCLUDE_FILES
+     ${PROJECT_SOURCE_DIR}/include/mln/style/layers/raster_layer.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/layers/symbol_layer.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/light.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/style/projection.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/style/projection_definition.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/position.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/property_expression.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/property_value.hpp
+@@ -695,6 +698,7 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/json.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/layer.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/light.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/projection.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/position.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/property_value.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/hillshade_conversions.cpp
+@@ -811,7 +815,11 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/style/light.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/light_impl.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/light_impl.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/projection_definition.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/light_observer.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/projection.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/projection_impl.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/projection_observer.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/observer.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/paint_property.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/parser.cpp
+diff --git a/bazel/core.bzl b/bazel/core.bzl
+index 93d6b63c70e3..7921b119bf6a 100644
+--- a/bazel/core.bzl
++++ b/bazel/core.bzl
+@@ -350,6 +350,7 @@ MLN_CORE_SOURCE = [
+     "src/mln/style/conversion/layer.cpp",
+     "src/mln/style/conversion/light.cpp",
+     "src/mln/style/conversion/position.cpp",
++    "src/mln/style/conversion/projection.cpp",
+     "src/mln/style/conversion/property_value.cpp",
+     "src/mln/style/conversion/hillshade_conversions.cpp",
+     "src/mln/style/conversion/rotation.cpp",
+@@ -447,6 +448,10 @@ MLN_CORE_SOURCE = [
+     "src/mln/style/paint_property.hpp",
+     "src/mln/style/parser.cpp",
+     "src/mln/style/parser.hpp",
++    "src/mln/style/projection.cpp",
++    "src/mln/style/projection_definition.cpp",
++    "src/mln/style/projection_impl.hpp",
++    "src/mln/style/projection_observer.hpp",
+     "src/mln/style/properties.hpp",
+     "src/mln/style/property_expression.cpp",
+     "src/mln/style/rapidjson_conversion.hpp",
+@@ -736,6 +741,7 @@ MLN_CORE_HEADERS = [
+     "include/mln/style/conversion/layer.hpp",
+     "include/mln/style/conversion/light.hpp",
+     "include/mln/style/conversion/position.hpp",
++    "include/mln/style/conversion/projection.hpp",
+     "include/mln/style/conversion/property_value.hpp",
+     "include/mln/style/conversion/rotation.hpp",
+     "include/mln/style/conversion/source.hpp",
+@@ -791,6 +797,8 @@ MLN_CORE_HEADERS = [
+     "include/mln/style/layers/custom_layer_init_parameters.hpp",
+     "include/mln/style/layers/custom_layer_render_parameters.hpp",
+     "include/mln/style/position.hpp",
++    "include/mln/style/projection.hpp",
++    "include/mln/style/projection_definition.hpp",
+     "include/mln/style/property_expression.hpp",
+     "include/mln/style/property_value.hpp",
+     "include/mln/style/rotation.hpp",
+diff --git a/include/mln/style/conversion/constant.hpp b/include/mln/style/conversion/constant.hpp
+index 80321bdbdbb7..6803eeb05f79 100644
+--- a/include/mln/style/conversion/constant.hpp
++++ b/include/mln/style/conversion/constant.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/style/conversion.hpp>
++#include <mln/style/projection_definition.hpp>
+ #include <mln/style/types.hpp>
+ #include <mln/style/variable_anchor_offset_collection.hpp>
+ #include <mln/util/color.hpp>
+@@ -56,6 +57,11 @@ struct Converter<Padding> {
+     std::optional<Padding> operator()(const Convertible& value, Error& error) const;
+ };
+ 
++template <>
++struct Converter<ProjectionDefinition> {
++    std::optional<ProjectionDefinition> operator()(const Convertible& value, Error& error) const;
++};
++
+ template <>
+ struct Converter<VariableAnchorOffsetCollection> {
+     std::optional<VariableAnchorOffsetCollection> operator()(const Convertible& value, Error& error) const;
+diff --git a/include/mln/style/conversion/projection.hpp b/include/mln/style/conversion/projection.hpp
+new file mode 100644
+index 000000000000..9bf174670735
+--- /dev/null
++++ b/include/mln/style/conversion/projection.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <mln/style/conversion.hpp>
++#include <mln/style/projection.hpp>
++
++#include <optional>
++
++namespace mln {
++namespace style {
++namespace conversion {
++
++template <>
++struct Converter<Projection> {
++public:
++    std::optional<Projection> operator()(const Convertible& value, Error& error) const;
++};
++
++} // namespace conversion
++} // namespace style
++} // namespace mln
+diff --git a/include/mln/style/conversion_impl.hpp b/include/mln/style/conversion_impl.hpp
+index e77071cad0b6..b58e84792167 100644
+--- a/include/mln/style/conversion_impl.hpp
++++ b/include/mln/style/conversion_impl.hpp
+@@ -320,6 +320,11 @@ struct ValueFactory<Padding> {
+     static Value make(const Padding& padding) { return padding.serialize(); }
+ };
+ 
++template <>
++struct ValueFactory<ProjectionDefinition> {
++    static Value make(const ProjectionDefinition& projection) { return projection.serialize(); }
++};
++
+ template <>
+ struct ValueFactory<VariableAnchorOffsetCollection> {
+     static Value make(const VariableAnchorOffsetCollection& variableAnchorOffset) {
+diff --git a/include/mln/style/expression/dsl.hpp b/include/mln/style/expression/dsl.hpp
+index a2762683d86b..441e95393284 100644
+--- a/include/mln/style/expression/dsl.hpp
++++ b/include/mln/style/expression/dsl.hpp
+@@ -43,6 +43,8 @@ std::unique_ptr<Expression> boolean(std::unique_ptr<Expression>, std::unique_ptr
+ 
+ std::unique_ptr<Expression> toColor(std::unique_ptr<Expression>, std::unique_ptr<Expression> def = nullptr);
+ std::unique_ptr<Expression> toPadding(std::unique_ptr<Expression> value, std::unique_ptr<Expression> def = nullptr);
++std::unique_ptr<Expression> toProjectionDefinition(std::unique_ptr<Expression> value,
++                                                   std::unique_ptr<Expression> def = nullptr);
+ std::unique_ptr<Expression> toVariableAnchorOffset(std::unique_ptr<Expression>,
+                                                    std::unique_ptr<Expression> def = nullptr);
+ std::unique_ptr<Expression> toString(std::unique_ptr<Expression>, std::unique_ptr<Expression> def = nullptr);
+diff --git a/include/mln/style/expression/type.hpp b/include/mln/style/expression/type.hpp
+index 2954d0ad385a..6fedb027a963 100644
+--- a/include/mln/style/expression/type.hpp
++++ b/include/mln/style/expression/type.hpp
+@@ -50,6 +50,12 @@ struct PaddingType {
+     bool operator==(const PaddingType&) const { return true; }
+ };
+ 
++struct ProjectionDefinitionType {
++    constexpr ProjectionDefinitionType() = default;
++    std::string getName() const { return "projectionDefinition"; }
++    bool operator==(const ProjectionDefinitionType&) const { return true; }
++};
++
+ struct VariableAnchorOffsetCollectionType {
+     constexpr VariableAnchorOffsetCollectionType() = default;
+     std::string getName() const { return "variableAnchorOffsetCollection"; }
+@@ -98,6 +104,7 @@ constexpr StringType String;
+ constexpr BooleanType Boolean;
+ constexpr ColorType Color;
+ constexpr PaddingType Padding;
++constexpr ProjectionDefinitionType ProjectionDefinition;
+ constexpr VariableAnchorOffsetCollectionType VariableAnchorOffsetCollection;
+ constexpr ValueType Value;
+ constexpr ObjectType Object;
+@@ -114,6 +121,7 @@ using Type = variant<NullType,
+                      StringType,
+                      ColorType,
+                      PaddingType,
++                     ProjectionDefinitionType,
+                      VariableAnchorOffsetCollectionType,
+                      ObjectType,
+                      ValueType,
+diff --git a/include/mln/style/expression/value.hpp b/include/mln/style/expression/value.hpp
+index 25455ffcb819..c4328c7153aa 100644
+--- a/include/mln/style/expression/value.hpp
++++ b/include/mln/style/expression/value.hpp
+@@ -5,6 +5,7 @@
+ #include <mln/style/expression/image.hpp>
+ #include <mln/style/expression/type.hpp>
+ #include <mln/style/position.hpp>
++#include <mln/style/projection_definition.hpp>
+ #include <mln/style/rotation.hpp>
+ #include <mln/style/types.hpp>
+ #include <mln/style/variable_anchor_offset_collection.hpp>
+@@ -34,6 +35,7 @@ using ValueBase = variant<NullValue,
+                           Formatted,
+                           Image,
+                           Padding,
++                          ProjectionDefinition,
+                           mapbox::util::recursive_wrapper<std::vector<Value>>,
+                           mapbox::util::recursive_wrapper<std::unordered_map<std::string, Value>>>;
+ struct Value : ValueBase {
+diff --git a/include/mln/style/projection.hpp b/include/mln/style/projection.hpp
+new file mode 100644
+index 000000000000..b0f9a22191d6
+--- /dev/null
++++ b/include/mln/style/projection.hpp
+@@ -0,0 +1,40 @@
++#pragma once
++
++#include <mln/style/conversion.hpp>
++#include <mln/style/projection_definition.hpp>
++#include <mln/style/property_value.hpp>
++#include <mln/style/style_property.hpp>
++#include <mln/util/immutable.hpp>
++
++#include <optional>
++#include <string>
++
++namespace mln {
++namespace style {
++
++class ProjectionObserver;
++
++/// The style's root `projection` object.
++class Projection {
++public:
++    Projection();
++    ~Projection();
++
++    std::optional<conversion::Error> setProperty(const std::string& name, const conversion::Convertible& value);
++    StyleProperty getProperty(const std::string&) const;
++
++    static ProjectionDefinition getDefaultType();
++    PropertyValue<ProjectionDefinition> getType() const;
++    void setType(PropertyValue<ProjectionDefinition>);
++
++    class Impl;
++    Immutable<Impl> impl;
++    explicit Projection(Immutable<Impl>);
++    Mutable<Impl> mutableImpl() const;
++
++    ProjectionObserver* observer = nullptr;
++    void setObserver(ProjectionObserver*);
++};
++
++} // namespace style
++} // namespace mln
+diff --git a/include/mln/style/projection_definition.hpp b/include/mln/style/projection_definition.hpp
+new file mode 100644
+index 000000000000..d35783a49a74
+--- /dev/null
++++ b/include/mln/style/projection_definition.hpp
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <mln/util/feature.hpp>
++
++#include <string>
++
++namespace mln {
++
++/// The value of the style's `projection.type`: a single projection, or a transition between two.
++struct ProjectionDefinition {
++    ProjectionDefinition() = default;
++    explicit ProjectionDefinition(std::string type);
++    ProjectionDefinition(std::string from_, std::string to_, double transition_);
++
++    std::string from = "mercator";
++    std::string to = "mercator";
++    double transition = 1;
++
++    bool operator==(const ProjectionDefinition&) const = default;
++
++    mln::Value serialize() const;
++};
++
++} // namespace mln
+diff --git a/include/mln/style/style.hpp b/include/mln/style/style.hpp
+index f656d626f290..c104e3aa6ce6 100644
+--- a/include/mln/style/style.hpp
++++ b/include/mln/style/style.hpp
+@@ -18,6 +18,7 @@ class FileSource;
+ namespace style {
+ 
+ class Light;
++class Projection;
+ class Source;
+ class Layer;
+ 
+@@ -46,6 +47,12 @@ public:
+ 
+     void setLight(std::unique_ptr<Light>);
+ 
++    // Projection
++    Projection* getProjection();
++    const Projection* getProjection() const;
++
++    void setProjection(std::unique_ptr<Projection>);
++
+     // Images
+     std::optional<Image> getImage(const std::string&) const;
+     void addImage(std::unique_ptr<Image>);
+diff --git a/include/mln/util/interpolate.hpp b/include/mln/util/interpolate.hpp
+index bb23817b3831..2641543f1644 100644
+--- a/include/mln/util/interpolate.hpp
++++ b/include/mln/util/interpolate.hpp
+@@ -129,6 +129,16 @@ public:
+     }
+ };
+ 
++template <>
++struct Interpolator<ProjectionDefinition> {
++public:
++    ProjectionDefinition operator()(const ProjectionDefinition& a,
++                                    const ProjectionDefinition& b,
++                                    const double t) const {
++        return {a.from, b.to, t};
++    }
++};
++
+ template <>
+ struct Interpolator<Padding> {
+ public:
+diff --git a/platform/node/src/node_expression.cpp b/platform/node/src/node_expression.cpp
+index eeb36fd4219b..58dea94a287d 100644
+--- a/platform/node/src/node_expression.cpp
++++ b/platform/node/src/node_expression.cpp
+@@ -2,6 +2,7 @@
+ #include "node_expression.hpp"
+ #include "node_feature.hpp"
+ 
++#include <mln/style/projection_definition.hpp>
+ #include <mln/style/expression/parsing_context.hpp>
+ #include <mln/style/expression/is_constant.hpp>
+ #include <mln/style/conversion/function.hpp>
+@@ -52,6 +53,7 @@ type::Type parseType(v8::Local<v8::Object> type) {
+         {"number-format", type::String},
+         {"resolvedImage", type::Image},
+         {"variableAnchorOffsetCollection", type::VariableAnchorOffsetCollection},
++        {"projectionDefinition", type::ProjectionDefinition},
+         {"numberArray", type::Array(type::Number)},
+         {"colorArray", type::Array(type::Color)}};
+ 
+@@ -239,6 +241,9 @@ struct ToValue {
+     }
+ 
+     v8::Local<v8::Value> operator()(const Image& image) { return toJS(image.toValue()); }
++    v8::Local<v8::Value> operator()(const mln::ProjectionDefinition& projection) {
++        return toJS(projection.serialize());
++    }
+ 
+     v8::Local<v8::Value> operator()(const mln::VariableAnchorOffsetCollection& variableAnchorOffsets) {
+         std::vector<Value> components;
+diff --git a/src/mln/map/map_impl.cpp b/src/mln/map/map_impl.cpp
+index 5cd858e8bff7..31906dab0b96 100644
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -3,6 +3,7 @@
+ #include <mln/renderer/update_parameters.hpp>
+ #include <mln/storage/file_source.hpp>
+ #include <mln/style/style_impl.hpp>
++#include <mln/style/projection_impl.hpp>
+ #include <mln/util/exception.hpp>
+ #include <mln/util/logging.hpp>
+ #include <mln/util/traits.hpp>
+@@ -114,6 +115,8 @@ void Map::Impl::onUpdate() {
+     TimePoint timePoint = mode == MapMode::Continuous ? Clock::now() : Clock::time_point::max();
+ 
+     transform.updateTransitions(timePoint);
++    transform.setProjectionDefinition(
++        style->impl->getProjection()->impl->evaluate(static_cast<float>(transform.getZoom())));
+ 
+     UpdateParameters params = {.styleLoaded = style->impl->isLoaded(),
+                                .mode = mode,
+diff --git a/src/mln/map/transform.cpp b/src/mln/map/transform.cpp
+index 26e5d2a8a942..35d316d24c48 100644
+--- a/src/mln/map/transform.cpp
++++ b/src/mln/map/transform.cpp
+@@ -526,6 +526,10 @@ double Transform::getFieldOfView() const {
+ 
+ // MARK: - North Orientation
+ 
++void Transform::setProjectionDefinition(const ProjectionDefinition& definition) {
++    state.setProjectionDefinition(definition);
++}
++
+ void Transform::setNorthOrientation(NorthOrientation orientation) {
+     state.setNorthOrientation(orientation);
+     double scale{state.getScale()};
+diff --git a/src/mln/map/transform.hpp b/src/mln/map/transform.hpp
+index ecb43fa65e1a..6466c79b39d4 100644
+--- a/src/mln/map/transform.hpp
++++ b/src/mln/map/transform.hpp
+@@ -96,6 +96,7 @@ public:
+     double getFieldOfView() const;
+ 
+     // North Orientation
++    void setProjectionDefinition(const ProjectionDefinition&);
+     void setNorthOrientation(NorthOrientation);
+     NorthOrientation getNorthOrientation() const;
+ 
+diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
+index a0375d189cb4..643c1792904d 100644
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -115,6 +115,12 @@ void TransformState::setProperties(const TransformStateProperties& properties) {
+     }
+ }
+ 
++// MARK: - Projection
++
++void TransformState::setProjectionDefinition(const ProjectionDefinition& definition) {
++    projectionDefinition = definition;
++}
++
+ // MARK: - Matrix
+ 
+ void TransformState::matrixFor(mat4& matrix, const UnwrappedTileID& tileID) const {
+diff --git a/src/mln/map/transform_state.hpp b/src/mln/map/transform_state.hpp
+index 67b395d0e126..b2a8462c134d 100644
+--- a/src/mln/map/transform_state.hpp
++++ b/src/mln/map/transform_state.hpp
+@@ -4,6 +4,7 @@
+ #include <mln/map/mode.hpp>
+ #include <mln/map/projection_base.hpp>
+ #include <mln/map/projection_type.hpp>
++#include <mln/style/projection_definition.hpp>
+ #include <mln/util/camera.hpp>
+ #include <mln/util/constants.hpp>
+ #include <mln/util/geo.hpp>
+@@ -138,6 +139,10 @@ public:
+ 
+     void setProperties(const TransformStateProperties& properties);
+ 
++    // Projection
++    const ProjectionDefinition& getProjectionDefinition() const { return projectionDefinition; }
++    void setProjectionDefinition(const ProjectionDefinition&);
++
+     // Matrix
+     void matrixFor(mat4&, const UnwrappedTileID&) const;
+     void getProjMatrix(mat4& matrix, uint16_t nearZ = 1, bool aligned = false) const;
+@@ -315,6 +320,7 @@ private:
+ 
+ private:
+     std::shared_ptr<const ProjectionBase> projection;
++    ProjectionDefinition projectionDefinition;
+ 
+     ConstrainMode constrainMode;
+     ViewportMode viewportMode;
+diff --git a/src/mln/style/conversion/constant.cpp b/src/mln/style/conversion/constant.cpp
+index 880b0d15c376..a0953fa77587 100644
+--- a/src/mln/style/conversion/constant.cpp
++++ b/src/mln/style/conversion/constant.cpp
+@@ -138,6 +138,34 @@ std::optional<std::vector<Color>> Converter<std::vector<Color>>::operator()(cons
+     return result;
+ }
+ 
++std::optional<ProjectionDefinition> Converter<ProjectionDefinition>::operator()(const Convertible& value,
++                                                                                Error& error) const {
++    const auto isProjectionName = [](const std::string& name) {
++        return name == "mercator" || name == "vertical-perspective" || name == "globe";
++    };
++    if (const std::optional<std::string> type = toString(value)) {
++        if (isProjectionName(*type)) {
++            return ProjectionDefinition(*type);
++        }
++        error.message = "projection type must be mercator, vertical-perspective or globe";
++        return std::nullopt;
++    }
++    if (isArray(value) && arrayLength(value) == 3) {
++        const std::optional<std::string> from = toString(arrayMember(value, 0));
++        const std::optional<std::string> to = toString(arrayMember(value, 1));
++        const std::optional<double> transition = toDouble(arrayMember(value, 2));
++        if (from && to && transition) {
++            if (isProjectionName(*from) && isProjectionName(*to)) {
++                return ProjectionDefinition(*from, *to, *transition);
++            }
++            error.message = "projection type must be mercator, vertical-perspective or globe";
++            return std::nullopt;
++        }
++    }
++    error.message = "value must be a string or an array of [from, to, transition]";
++    return std::nullopt;
++}
++
+ std::optional<Padding> Converter<Padding>::operator()(const Convertible& value, Error& error) const {
+     std::optional<Padding> result;
+     if (isArray(value)) {
+diff --git a/src/mln/style/conversion/function.cpp b/src/mln/style/conversion/function.cpp
+index faaf2f928ca8..04b657f51dbd 100644
+--- a/src/mln/style/conversion/function.cpp
++++ b/src/mln/style/conversion/function.cpp
+@@ -135,6 +135,8 @@ template std::optional<PropertyExpression<Color>> convertFunctionToExpression<Co
+ template std::optional<PropertyExpression<Padding>> convertFunctionToExpression<Padding>(const Convertible&,
+                                                                                          Error&,
+                                                                                          bool);
++template std::optional<PropertyExpression<ProjectionDefinition>> convertFunctionToExpression<ProjectionDefinition>(
++    const Convertible&, Error&, bool);
+ template std::optional<PropertyExpression<VariableAnchorOffsetCollection>>
+ convertFunctionToExpression<VariableAnchorOffsetCollection>(const Convertible&, Error&, bool);
+ template std::optional<PropertyExpression<Position>> convertFunctionToExpression<Position>(const Convertible&,
+@@ -220,6 +222,7 @@ bool interpolatable(type::Type type) noexcept {
+     return type.match([&](const type::NumberType&) { return true; },
+                       [&](const type::ColorType&) { return true; },
+                       [&](const type::PaddingType&) { return true; },
++                      [&](const type::ProjectionDefinitionType&) { return true; },
+                       [&](const type::VariableAnchorOffsetCollectionType&) { return true; },
+                       [&](const type::Array& array) {
+                           // Arrays are interpolatable if they have a fixed size and item type is Number,
+@@ -277,6 +280,13 @@ std::optional<std::unique_ptr<Expression>> convertLiteral(type::Type type,
+             }
+             return literal(*result);
+         },
++        [&](const type::ProjectionDefinitionType&) -> std::optional<std::unique_ptr<Expression>> {
++            auto result = convert<ProjectionDefinition>(value, error);
++            if (!result) {
++                return std::nullopt;
++            }
++            return literal(*result);
++        },
+         [&](const type::VariableAnchorOffsetCollectionType&) -> std::optional<std::unique_ptr<Expression>> {
+             auto result = convert<VariableAnchorOffsetCollection>(value, error);
+             if (!result) {
+@@ -873,6 +883,9 @@ std::optional<std::unique_ptr<Expression>> convertFunctionToExpression(type::Typ
+             [&](const type::PaddingType&) -> std::optional<std::unique_ptr<Expression>> {
+                 return toPadding(get(literal(*property)), defaultExpr());
+             },
++            [&](const type::ProjectionDefinitionType&) -> std::optional<std::unique_ptr<Expression>> {
++                return toProjectionDefinition(get(literal(*property)), defaultExpr());
++            },
+             [&](const type::VariableAnchorOffsetCollectionType&) -> std::optional<std::unique_ptr<Expression>> {
+                 return toVariableAnchorOffset(get(literal(*property)), defaultExpr());
+             },
+diff --git a/src/mln/style/conversion/projection.cpp b/src/mln/style/conversion/projection.cpp
+new file mode 100644
+index 000000000000..a0122d90919e
+--- /dev/null
++++ b/src/mln/style/conversion/projection.cpp
+@@ -0,0 +1,30 @@
++#include <mln/style/conversion/projection.hpp>
++#include <mln/style/conversion/property_value.hpp>
++#include <mln/style/conversion_impl.hpp>
++
++namespace mln {
++namespace style {
++namespace conversion {
++
++std::optional<Projection> Converter<Projection>::operator()(const Convertible& value, Error& error) const {
++    if (!isObject(value)) {
++        error.message = "projection must be an object";
++        return std::nullopt;
++    }
++
++    Projection projection;
++
++    if (const auto type = objectMember(value, "type")) {
++        const auto converted = convert<PropertyValue<ProjectionDefinition>>(*type, error, false, false);
++        if (!converted) {
++            return std::nullopt;
++        }
++        projection.setType(*converted);
++    }
++
++    return projection;
++}
++
++} // namespace conversion
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/conversion/property_value.cpp b/src/mln/style/conversion/property_value.cpp
+index b145e360813d..68cca0d0fbdf 100644
+--- a/src/mln/style/conversion/property_value.cpp
++++ b/src/mln/style/conversion/property_value.cpp
+@@ -81,6 +81,8 @@ template std::optional<PropertyValue<Color>> Converter<PropertyValue<Color>>::op
+                                                                                          bool) const;
+ template std::optional<PropertyValue<Padding>> Converter<PropertyValue<Padding>>::operator()(
+     conversion::Convertible const&, conversion::Error&, bool, bool) const;
++template std::optional<PropertyValue<ProjectionDefinition>> Converter<PropertyValue<ProjectionDefinition>>::operator()(
++    conversion::Convertible const&, conversion::Error&, bool, bool) const;
+ template std::optional<PropertyValue<VariableAnchorOffsetCollection>>
+ Converter<PropertyValue<VariableAnchorOffsetCollection>>::operator()(conversion::Convertible const&,
+                                                                      conversion::Error&,
+diff --git a/src/mln/style/conversion/stringify.hpp b/src/mln/style/conversion/stringify.hpp
+index 8fa14807f8f3..52ff85795471 100644
+--- a/src/mln/style/conversion/stringify.hpp
++++ b/src/mln/style/conversion/stringify.hpp
+@@ -133,6 +133,11 @@ void stringify(Writer& writer, const Value& v) {
+     Value::visit(v, [&](const auto& v_) { stringify(writer, v_); });
+ }
+ 
++template <class Writer>
++void stringify(Writer& writer, const ProjectionDefinition& v) {
++    stringify(writer, v.serialize());
++}
++
+ template <class Writer>
+ void stringify(Writer& writer, FeatureType type) {
+     switch (type) {
+diff --git a/src/mln/style/expression/check_subtype.cpp b/src/mln/style/expression/check_subtype.cpp
+index 3c30cec47c1f..93f33399afa0 100644
+--- a/src/mln/style/expression/check_subtype.cpp
++++ b/src/mln/style/expression/check_subtype.cpp
+@@ -33,8 +33,17 @@ std::optional<std::string> checkSubtype(const Type& expected, const Type& t) {
+         [&](const ValueType&) -> std::optional<std::string> {
+             if (t.is<ValueType>()) return {};
+ 
+-            const Type members[] = {
+-                Null, Boolean, Number, String, Object, Color, Padding, Formatted, Image, Array(Value)};
++            const Type members[] = {Null,
++                                    Boolean,
++                                    Number,
++                                    String,
++                                    Object,
++                                    Color,
++                                    Padding,
++                                    ProjectionDefinition,
++                                    Formatted,
++                                    Image,
++                                    Array(Value)};
+ 
+             for (const auto& member : members) {
+                 const auto err = checkSubtype(member, t);
+diff --git a/src/mln/style/expression/coercion.cpp b/src/mln/style/expression/coercion.cpp
+index 9527ebf12d07..b1f116f36814 100644
+--- a/src/mln/style/expression/coercion.cpp
++++ b/src/mln/style/expression/coercion.cpp
+@@ -73,6 +73,23 @@ EvaluationResult toColor(const Value& colorValue) {
+         });
+ }
+ 
++EvaluationResult toProjectionDefinition(const Value& value) {
++    return value.match(
++        [](const ProjectionDefinition& projection) -> EvaluationResult { return projection; },
++        [](const std::string& type) -> EvaluationResult { return ProjectionDefinition(type); },
++        [&](const std::vector<Value>& components) -> EvaluationResult {
++            if (components.size() == 3 && components[0].is<std::string>() && components[1].is<std::string>() &&
++                components[2].is<double>()) {
++                return ProjectionDefinition(
++                    components[0].get<std::string>(), components[1].get<std::string>(), components[2].get<double>());
++            }
++            return EvaluationError{"Could not parse projectionDefinition from value '" + stringify(value) + "'"};
++        },
++        [&](const auto&) -> EvaluationResult {
++            return EvaluationError{"Could not parse projectionDefinition from value '" + stringify(value) + "'"};
++        });
++}
++
+ EvaluationResult toPadding(const Value& paddingValue) {
+     return paddingValue.match(
+         [](const Padding& padding) -> EvaluationResult { return padding; },
+@@ -159,6 +176,8 @@ CoerceFunction getCoerceFunction(const type::Type& t) {
+         return toColor;
+     } else if (t.is<type::PaddingType>()) {
+         return toPadding;
++    } else if (t.is<type::ProjectionDefinitionType>()) {
++        return toProjectionDefinition;
+     } else if (t.is<type::VariableAnchorOffsetCollectionType>()) {
+         return toVariableAnchorOffset;
+     } else if (t.is<type::NumberType>()) {
+@@ -209,6 +228,7 @@ std::string Coercion::getOperator() const {
+         [](const type::BooleanType&) -> std::string_view { return "to-boolean"; },
+         [](const type::ColorType&) -> std::string_view { return "to-color"; },
+         [](const type::PaddingType&) -> std::string_view { return "to-padding"; },
++        [](const type::ProjectionDefinitionType&) -> std::string_view { return "to-projection-definition"; },
+         [](const type::NumberType&) -> std::string_view { return "to-number"; },
+         [](const type::StringType&) -> std::string_view { return "to-string"; },
+         [](const type::VariableAnchorOffsetCollectionType&) -> std::string_view { return "to-variableanchoroffset"; },
+@@ -225,6 +245,7 @@ ParseResult Coercion::parse(const Convertible& value, ParsingContext& ctx) {
+         {"to-boolean", type::Boolean},
+         {"to-color", type::Color},
+         {"to-padding", type::Padding},
++        {"to-projection-definition", type::ProjectionDefinition},
+         {"to-number", type::Number},
+         {"to-string", type::String},
+         {"to-variableanchoroffset", type::VariableAnchorOffsetCollection}};
+diff --git a/src/mln/style/expression/dsl.cpp b/src/mln/style/expression/dsl.cpp
+index 00f92c501c62..ce69d8ae88f0 100644
+--- a/src/mln/style/expression/dsl.cpp
++++ b/src/mln/style/expression/dsl.cpp
+@@ -121,6 +121,10 @@ std::unique_ptr<Expression> toPadding(std::unique_ptr<Expression> value, std::un
+     return coercion(type::Padding, std::move(value), std::move(def));
+ }
+ 
++std::unique_ptr<Expression> toProjectionDefinition(std::unique_ptr<Expression> value, std::unique_ptr<Expression> def) {
++    return coercion(type::ProjectionDefinition, std::move(value), std::move(def));
++}
++
+ std::unique_ptr<Expression> toVariableAnchorOffset(std::unique_ptr<Expression> value, std::unique_ptr<Expression> def) {
+     return coercion(type::VariableAnchorOffsetCollection, std::move(value), std::move(def));
+ }
+diff --git a/src/mln/style/expression/interpolate.cpp b/src/mln/style/expression/interpolate.cpp
+index 975cc7a6f5ec..aa598de2b069 100644
+--- a/src/mln/style/expression/interpolate.cpp
++++ b/src/mln/style/expression/interpolate.cpp
+@@ -236,6 +236,10 @@ ParseResult createInterpolate(type::Type type,
+             return ParseResult(
+                 std::make_unique<InterpolateImpl<Padding>>(type, interpolator, std::move(input), std::move(stops)));
+         },
++        [&](const type::ProjectionDefinitionType&) -> ParseResult {
++            return ParseResult(std::make_unique<InterpolateImpl<ProjectionDefinition>>(
++                type, interpolator, std::move(input), std::move(stops)));
++        },
+         [&](const type::VariableAnchorOffsetCollectionType&) -> ParseResult {
+             return ParseResult(std::make_unique<InterpolateImpl<VariableAnchorOffsetCollection>>(
+                 type, interpolator, std::move(input), std::move(stops)));
+diff --git a/src/mln/style/expression/parsing_context.cpp b/src/mln/style/expression/parsing_context.cpp
+index 8f315fbe8c26..bfdc6df546ec 100644
+--- a/src/mln/style/expression/parsing_context.cpp
++++ b/src/mln/style/expression/parsing_context.cpp
+@@ -214,6 +214,10 @@ ParseResult ParsingContext::parse(const Convertible& value,
+                    (actual == type::Value || actual == type::Number || actual.is<type::Array>())) {
+             parsed = {annotate(
+                 std::move(*parsed), std::move(*expected), typeAnnotationOption.value_or(TypeAnnotationOption::coerce))};
++        } else if (*expected == type::ProjectionDefinition &&
++                   (actual == type::Value || actual == type::String || actual.is<type::Array>())) {
++            parsed = {annotate(
++                std::move(*parsed), std::move(*expected), typeAnnotationOption.value_or(TypeAnnotationOption::coerce))};
+         } else if (*expected == type::VariableAnchorOffsetCollection &&
+                    (actual == type::Value || actual.is<type::Array>())) {
+             parsed = {annotate(
+diff --git a/src/mln/style/expression/value.cpp b/src/mln/style/expression/value.cpp
+index 644235ae1788..8dea2d9dbc84 100644
+--- a/src/mln/style/expression/value.cpp
++++ b/src/mln/style/expression/value.cpp
+@@ -14,6 +14,7 @@ type::Type typeOf(const Value& value) {
+         [&](const std::string&) -> type::Type { return type::String; },
+         [&](const Color&) -> type::Type { return type::Color; },
+         [&](const Padding&) -> type::Type { return type::Padding; },
++        [&](const ProjectionDefinition&) -> type::Type { return type::ProjectionDefinition; },
+         [&](const VariableAnchorOffsetCollection&) -> type::Type { return type::VariableAnchorOffsetCollection; },
+         [&](const Collator&) -> type::Type { return type::Collator; },
+         [&](const Formatted&) -> type::Type { return type::Formatted; },
+@@ -58,6 +59,7 @@ void writeJSON(rapidjson::Writer<rapidjson::StringBuffer>& writer, const Value&
+                 [&](const std::string& s) { writer.String(s); },
+                 [&](const Color& c) { writer.String(c.stringify()); },
+                 [&](const Padding& p) { mln::style::conversion::stringify(writer, p); },
++                [&](const ProjectionDefinition& p) { mln::style::conversion::stringify(writer, p); },
+                 [&](const VariableAnchorOffsetCollection& v) { mln::style::conversion::stringify(writer, v); },
+                 [&](const Collator&) {
+                     // Collators are excluded from constant folding and there's no Literal parser
+@@ -130,6 +132,7 @@ mln::Value ValueConverter<mln::Value>::fromExpressionValue(const Value& value) {
+     return value.match(
+         [&](const Color& color) -> mln::Value { return color.serialize(); },
+         [&](const Padding& padding) -> mln::Value { return padding.serialize(); },
++        [&](const ProjectionDefinition& projection) -> mln::Value { return projection.serialize(); },
+         [&](const VariableAnchorOffsetCollection& anchorOffset) -> mln::Value { return anchorOffset.serialize(); },
+         [&](const Collator&) -> mln::Value {
+             // fromExpressionValue can't be used for Collator values,
+@@ -321,6 +324,10 @@ type::Type valueTypeToExpressionType<Padding>() {
+     return type::Padding;
+ }
+ template <>
++type::Type valueTypeToExpressionType<ProjectionDefinition>() {
++    return type::ProjectionDefinition;
++}
++template <>
+ type::Type valueTypeToExpressionType<VariableAnchorOffsetCollection>() {
+     return type::VariableAnchorOffsetCollection;
+ }
+diff --git a/src/mln/style/parser.cpp b/src/mln/style/parser.cpp
+index b4c9891e6bc3..70fedf0a281d 100644
+--- a/src/mln/style/parser.cpp
++++ b/src/mln/style/parser.cpp
+@@ -5,6 +5,7 @@
+ #include <mln/style/conversion/source.hpp>
+ #include <mln/style/conversion/layer.hpp>
+ #include <mln/style/conversion/light.hpp>
++#include <mln/style/conversion/projection.hpp>
+ #include <mln/style/conversion/sprite.hpp>
+ #include <mln/style/conversion/transition_options.hpp>
+ #include <mln/style/conversion_impl.hpp>
+@@ -112,6 +113,10 @@ StyleParseResult Parser::parse(const std::string& json) {
+         parseLight(document["light"]);
+     }
+ 
++    if (document.HasMember("projection")) {
++        parseProjection(document["projection"]);
++    }
++
+     if (document.HasMember("sources")) {
+         parseSources(document["sources"]);
+     }
+@@ -236,6 +241,16 @@ void Parser::parseLight(const JSValue& value) {
+     light = *converted;
+ }
+ 
++void Parser::parseProjection(const JSValue& value) {
++    conversion::Error error;
++    std::optional<Projection> converted = conversion::convert<Projection>(value, error);
++    if (!converted) {
++        Log::Warning(Event::ParseStyle, error.message);
++        return;
++    }
++    projection = *converted;
++}
++
+ void Parser::parseSources(const JSValue& value) {
+     if (!value.IsObject()) {
+         Log::Warning(Event::ParseStyle, "sources must be an object");
+diff --git a/src/mln/style/parser.hpp b/src/mln/style/parser.hpp
+index bae2a43f4a93..84d3f983dc96 100644
+--- a/src/mln/style/parser.hpp
++++ b/src/mln/style/parser.hpp
+@@ -4,6 +4,7 @@
+ #include <mln/style/sprite.hpp>
+ #include <mln/style/source.hpp>
+ #include <mln/style/light.hpp>
++#include <mln/style/projection.hpp>
+ 
+ #include <mln/text/glyph.hpp>
+ 
+@@ -39,6 +40,7 @@ public:
+ 
+     TransitionOptions transition{{util::DEFAULT_TRANSITION_DURATION}};
+     Light light;
++    Projection projection;
+ 
+     std::string name;
+     LatLng latLng;
+@@ -54,6 +56,7 @@ public:
+ private:
+     void parseTransition(const JSValue&);
+     void parseLight(const JSValue&);
++    void parseProjection(const JSValue&);
+     void parseSources(const JSValue&);
+     void parseSprites(const JSValue&);
+     void parseLayers(const JSValue&);
+diff --git a/src/mln/style/projection.cpp b/src/mln/style/projection.cpp
+new file mode 100644
+index 000000000000..c906330e4679
+--- /dev/null
++++ b/src/mln/style/projection.cpp
+@@ -0,0 +1,74 @@
++#include <mln/style/projection.hpp>
++#include <mln/style/projection_impl.hpp>
++#include <mln/style/projection_observer.hpp>
++#include <mln/style/conversion/property_value.hpp>
++#include <mln/style/conversion_impl.hpp>
++#include <mln/renderer/property_evaluator.hpp>
++
++namespace mln {
++namespace style {
++
++namespace {
++ProjectionObserver nullObserver;
++} // namespace
++
++Projection::Projection(Immutable<Projection::Impl> impl_)
++    : impl(std::move(impl_)),
++      observer(&nullObserver) {}
++
++Projection::Projection()
++    : Projection(makeMutable<Impl>()) {}
++
++Projection::~Projection() = default;
++
++void Projection::setObserver(ProjectionObserver* observer_) {
++    observer = observer_ ? observer_ : &nullObserver;
++}
++
++Mutable<Projection::Impl> Projection::mutableImpl() const {
++    return makeMutable<Impl>(*impl);
++}
++
++ProjectionDefinition Projection::getDefaultType() {
++    return ProjectionDefinition();
++}
++
++PropertyValue<ProjectionDefinition> Projection::getType() const {
++    return impl->type;
++}
++
++void Projection::setType(PropertyValue<ProjectionDefinition> type) {
++    auto mutableImpl_ = mutableImpl();
++    mutableImpl_->type = std::move(type);
++    impl = std::move(mutableImpl_);
++    observer->onProjectionChanged(*this);
++}
++
++std::optional<conversion::Error> Projection::setProperty(const std::string& name,
++                                                         const conversion::Convertible& value) {
++    if (name != "type") {
++        return conversion::Error{"projection doesn't support this property"};
++    }
++    conversion::Error error;
++    const auto type = conversion::convert<PropertyValue<ProjectionDefinition>>(value, error, false, false);
++    if (!type) {
++        return error;
++    }
++    setType(*type);
++    return std::nullopt;
++}
++
++StyleProperty Projection::getProperty(const std::string& name) const {
++    if (name == "type") {
++        return conversion::makeStyleProperty(getType());
++    }
++    return {};
++}
++
++ProjectionDefinition Projection::Impl::evaluate(float zoom) const {
++    const PropertyEvaluationParameters parameters(zoom);
++    return type.evaluate(PropertyEvaluator<ProjectionDefinition>(parameters, Projection::getDefaultType()));
++}
++
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/projection_definition.cpp b/src/mln/style/projection_definition.cpp
+new file mode 100644
+index 000000000000..f5cc5ae9efac
+--- /dev/null
++++ b/src/mln/style/projection_definition.cpp
+@@ -0,0 +1,21 @@
++#include <mln/style/projection_definition.hpp>
++
++namespace mln {
++
++ProjectionDefinition::ProjectionDefinition(std::string type)
++    : from(type),
++      to(std::move(type)) {}
++
++ProjectionDefinition::ProjectionDefinition(std::string from_, std::string to_, double transition_)
++    : from(std::move(from_)),
++      to(std::move(to_)),
++      transition(transition_) {}
++
++mln::Value ProjectionDefinition::serialize() const {
++    if (from == to && transition == 1) {
++        return from;
++    }
++    return std::vector<mln::Value>{from, to, transition};
++}
++
++} // namespace mln
+diff --git a/src/mln/style/projection_impl.hpp b/src/mln/style/projection_impl.hpp
+new file mode 100644
+index 000000000000..6561d6f0c6ae
+--- /dev/null
++++ b/src/mln/style/projection_impl.hpp
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <mln/style/projection.hpp>
++
++namespace mln {
++namespace style {
++
++class Projection::Impl {
++public:
++    PropertyValue<ProjectionDefinition> type;
++
++    /// The definition at a zoom level; `mercator` when the style does not set one.
++    ProjectionDefinition evaluate(float zoom) const;
++};
++
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/projection_observer.hpp b/src/mln/style/projection_observer.hpp
+new file mode 100644
+index 000000000000..3ac51592b7bf
+--- /dev/null
++++ b/src/mln/style/projection_observer.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++
++namespace mln {
++namespace style {
++
++class Projection;
++
++class ProjectionObserver {
++public:
++    virtual ~ProjectionObserver() = default;
++
++    virtual void onProjectionChanged(const Projection&) {}
++};
++
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/style.cpp b/src/mln/style/style.cpp
+index d6c2060a61b3..03a271a209cd 100644
+--- a/src/mln/style/style.cpp
++++ b/src/mln/style/style.cpp
+@@ -2,6 +2,7 @@
+ #include <mln/style/image_impl.hpp>
+ #include <mln/style/layer.hpp>
+ #include <mln/style/light.hpp>
++#include <mln/style/projection.hpp>
+ #include <mln/style/source.hpp>
+ #include <mln/style/style.hpp>
+ #include <mln/style/style_impl.hpp>
+@@ -75,6 +76,18 @@ const Light* Style::getLight() const {
+     return impl->getLight();
+ }
+ 
++void Style::setProjection(std::unique_ptr<Projection> projection) {
++    impl->setProjection(std::move(projection));
++}
++
++Projection* Style::getProjection() {
++    return impl->getProjection();
++}
++
++const Projection* Style::getProjection() const {
++    return impl->getProjection();
++}
++
+ std::optional<Image> Style::getImage(const std::string& name) const {
+     MLN_TRACE_FUNC();
+ 
+diff --git a/src/mln/style/style_impl.cpp b/src/mln/style/style_impl.cpp
+index e5deefdaacfe..cc080bd7be32 100644
+--- a/src/mln/style/style_impl.cpp
++++ b/src/mln/style/style_impl.cpp
+@@ -4,6 +4,7 @@
+ #include <mln/storage/resource.hpp>
+ #include <mln/storage/response.hpp>
+ #include <mln/style/image_impl.hpp>
++#include <mln/style/projection.hpp>
+ #include <mln/style/layer_impl.hpp>
+ #include <mln/style/layers/background_layer.hpp>
+ #include <mln/style/layers/circle_layer.hpp>
+@@ -32,9 +33,11 @@ Style::Impl::Impl(std::shared_ptr<FileSource> fileSource_, float pixelRatio, con
+     : fileSource(std::move(fileSource_)),
+       spriteLoader(std::make_unique<SpriteLoader>(pixelRatio, threadPool_)),
+       light(std::make_unique<Light>()),
++      projection(std::make_unique<Projection>()),
+       observer(&nullObserver) {
+     spriteLoader->setObserver(this);
+     light->setObserver(this);
++    projection->setObserver(this);
+ }
+ 
+ Style::Impl::~Impl() = default;
+@@ -122,6 +125,7 @@ void Style::Impl::parse(const std::string& json_) {
+     defaultCamera.roll = parser.roll;
+ 
+     setLight(std::make_unique<Light>(parser.light));
++    setProjection(std::make_unique<Projection>(parser.projection));
+ 
+     if (fileSource) {
+         if (parser.sprites.empty()) {
+@@ -250,6 +254,16 @@ Light* Style::Impl::getLight() const {
+     return light.get();
+ }
+ 
++void Style::Impl::setProjection(std::unique_ptr<Projection> projection_) {
++    projection = std::move(projection_);
++    projection->setObserver(this);
++    onProjectionChanged(*projection);
++}
++
++Projection* Style::Impl::getProjection() const {
++    return projection.get();
++}
++
+ std::string Style::Impl::getName() const {
+     return name;
+ }
+@@ -423,6 +437,10 @@ void Style::Impl::onLightChanged(const Light&) {
+     observer->onUpdate();
+ }
+ 
++void Style::Impl::onProjectionChanged(const Projection&) {
++    observer->onUpdate();
++}
++
+ void Style::Impl::dumpDebugLogs() const {
+     Log::Info(Event::General, "styleURL: " + url);
+     for (const auto& source : sources) {
+diff --git a/src/mln/style/style_impl.hpp b/src/mln/style/style_impl.hpp
+index a69926379cef..0514a3b2bab6 100644
+--- a/src/mln/style/style_impl.hpp
++++ b/src/mln/style/style_impl.hpp
+@@ -7,6 +7,7 @@
+ #include <mln/style/source_observer.hpp>
+ #include <mln/style/layer_observer.hpp>
+ #include <mln/style/light_observer.hpp>
++#include <mln/style/projection_observer.hpp>
+ #include <mln/sprite/sprite_loader_observer.hpp>
+ #include <mln/style/image.hpp>
+ #include <mln/style/source.hpp>
+@@ -35,9 +36,10 @@ namespace style {
+ 
+ class Style::Impl : public SpriteLoaderObserver,
+                     public SourceObserver,
+-                    public LayerObserver,
+-                    public LightObserver,
+-                    public util::noncopyable {
++                     public LayerObserver,
++                     public LightObserver,
++                     public ProjectionObserver,
++                     public util::noncopyable {
+ public:
+     Impl(std::shared_ptr<FileSource>, float pixelRatio, const TaggedScheduler& threadPool_);
+     ~Impl() override;
+@@ -85,6 +87,9 @@ public:
+     void setLight(std::unique_ptr<Light>);
+     Light* getLight() const;
+ 
++    void setProjection(std::unique_ptr<Projection>);
++    Projection* getProjection() const;
++
+     std::optional<Immutable<style::Image::Impl>> getImage(const std::string&) const;
+     void addImage(std::unique_ptr<style::Image>);
+     void removeImage(const std::string&);
+@@ -121,6 +126,7 @@ private:
+     Collection<Layer> layers;
+     TransitionOptions transitionOptions;
+     std::unique_ptr<Light> light;
++    std::unique_ptr<Projection> projection;
+     std::unordered_map<std::string, bool> spritesLoadingStatus;
+ 
+     // Defaults
+@@ -144,6 +150,9 @@ private:
+     // LightObserver implementation.
+     void onLightChanged(const Light&) override;
+ 
++    // ProjectionObserver implementation.
++    void onProjectionChanged(const Projection&) override;
++
+     Observer nullObserver;
+     Observer* observer = &nullObserver;
+ 
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 188e9eb407d1..3381bd1b88d9 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -52,6 +52,7 @@ add_library(
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/layer.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/light.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/padding.test.cpp
++    ${PROJECT_SOURCE_DIR}/test/style/conversion/projection.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/property_value.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/source_options.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/stringify.test.cpp
+diff --git a/test/fixtures/style_parser/projection-not-object.info.json b/test/fixtures/style_parser/projection-not-object.info.json
+new file mode 100644
+index 000000000000..46fff3301075
+--- /dev/null
++++ b/test/fixtures/style_parser/projection-not-object.info.json
+@@ -0,0 +1,7 @@
++{
++    "default": {
++        "log": [
++            [1, "WARNING", "ParseStyle", "projection must be an object"]
++        ]
++    }
++}
+diff --git a/test/fixtures/style_parser/projection-not-object.style.json b/test/fixtures/style_parser/projection-not-object.style.json
+new file mode 100644
+index 000000000000..43364bb16860
+--- /dev/null
++++ b/test/fixtures/style_parser/projection-not-object.style.json
+@@ -0,0 +1,4 @@
++{
++  "version": 8,
++  "projection": "globe"
++}
+diff --git a/test/map/transform.test.cpp b/test/map/transform.test.cpp
+index c88475d9bb7e..ec205d599dfe 100644
+--- a/test/map/transform.test.cpp
++++ b/test/map/transform.test.cpp
+@@ -1354,3 +1354,11 @@ TEST(TransformState, ProjectionDataMercatorFields) {
+         EXPECT_EQ(0.0, data.projectionTransition);
+     }
+ }
++
++TEST(Transform, ProjectionDefinition) {
++    Transform transform;
++    ASSERT_EQ(ProjectionDefinition("mercator"), transform.getState().getProjectionDefinition());
++    transform.setProjectionDefinition(ProjectionDefinition("vertical-perspective", "mercator", 0.5));
++    ASSERT_EQ(ProjectionDefinition("vertical-perspective", "mercator", 0.5),
++              transform.getState().getProjectionDefinition());
++}
+diff --git a/test/style/conversion/projection.test.cpp b/test/style/conversion/projection.test.cpp
+new file mode 100644
+index 000000000000..34832ceb76af
+--- /dev/null
++++ b/test/style/conversion/projection.test.cpp
+@@ -0,0 +1,74 @@
++#include <mln/test/util.hpp>
++
++#include <mln/style/conversion/json.hpp>
++#include <mln/style/conversion/projection.hpp>
++#include <mln/style/conversion_impl.hpp>
++#include <mln/style/projection_impl.hpp>
++#include <mln/style/rapidjson_conversion.hpp>
++#include <mln/util/rapidjson.hpp>
++
++using namespace mln;
++using namespace mln::style;
++using namespace mln::style::conversion;
++
++TEST(StyleConversion, Projection) {
++    Error error;
++
++    auto parseProjection = [&](const std::string& src) {
++        return convertJSON<Projection>(src, error);
++    };
++
++    {
++        auto projection = parseProjection("{}");
++        ASSERT_TRUE(projection);
++        ASSERT_TRUE(projection->getType().isUndefined());
++        ASSERT_EQ(ProjectionDefinition("mercator"), projection->impl->evaluate(3.f));
++    }
++
++    {
++        auto projection = parseProjection(R"({"type":"globe"})");
++        ASSERT_TRUE(projection);
++        ASSERT_TRUE(projection->getType().isConstant());
++        ASSERT_EQ(ProjectionDefinition("globe"), projection->getType().asConstant());
++        ASSERT_EQ(ProjectionDefinition("globe", "globe", 1), projection->impl->evaluate(3.f));
++    }
++
++    {
++        auto projection = parseProjection(R"({"type":["vertical-perspective","mercator",0.25]})");
++        ASSERT_TRUE(projection);
++        ASSERT_TRUE(projection->getType().isConstant());
++        ASSERT_EQ(ProjectionDefinition("vertical-perspective", "mercator", 0.25), projection->getType().asConstant());
++    }
++
++    {
++        auto projection = parseProjection(
++            R"({"type":["interpolate",["linear"],["zoom"],10,"vertical-perspective",12,"mercator"]})");
++        ASSERT_TRUE(projection);
++        ASSERT_TRUE(projection->getType().isExpression());
++        ASSERT_EQ(ProjectionDefinition("vertical-perspective", "vertical-perspective", 1),
++                  projection->impl->evaluate(9.f));
++        ASSERT_EQ(ProjectionDefinition("vertical-perspective", "mercator", 0.5), projection->impl->evaluate(11.f));
++        ASSERT_EQ(ProjectionDefinition("mercator", "mercator", 1), projection->impl->evaluate(13.f));
++    }
++
++    {
++        auto projection = parseProjection("{}");
++        ASSERT_TRUE(projection);
++        const mln::JSValue typeValue("globe");
++        ASSERT_FALSE(projection->setProperty("type", &typeValue));
++        ASSERT_EQ(ProjectionDefinition("globe"), projection->getType().asConstant());
++        ASSERT_TRUE(projection->setProperty("bogus", &typeValue));
++        ASSERT_EQ(StyleProperty::Kind::Constant, projection->getProperty("type").getKind());
++        ASSERT_EQ(mln::Value("globe"), projection->getProperty("type").getValue());
++    }
++
++    {
++        ASSERT_FALSE(parseProjection("3"));
++        ASSERT_EQ("projection must be an object", error.message);
++    }
++
++    {
++        ASSERT_FALSE(parseProjection(R"({"type":3})"));
++        ASSERT_EQ("value must be a string or an array of [from, to, transition]", error.message);
++    }
++}
+diff --git a/test/style/style.test.cpp b/test/style/style.test.cpp
+index 2682473efe22..61df000b72ed 100644
+--- a/test/style/style.test.cpp
++++ b/test/style/style.test.cpp
+@@ -8,6 +8,7 @@
+ #include <mln/style/sources/vector_source.hpp>
+ #include <mln/style/layer.hpp>
+ #include <mln/style/layers/line_layer.hpp>
++#include <mln/style/projection.hpp>
+ #include <mln/util/io.hpp>
+ #include <mln/util/run_loop.hpp>
+ #include <mln/util/client_options.hpp>
+@@ -212,3 +213,25 @@ TEST(Style, AddRemoveRemoveImage) {
+     EXPECT_FALSE(!!style.getImage("two"));
+     EXPECT_FALSE(!!style.getImage("four"));
+ }
++
++TEST(Style, Projection) {
++    util::RunLoop loop;
++
++    auto fileSource = std::make_shared<StubFileSource>();
++    Style::Impl style{fileSource, 1.0, {Scheduler::GetBackground(), {}}};
++
++    style.loadJSON(R"STYLE({"projection": {"type": "globe"}})STYLE");
++    ASSERT_EQ(ProjectionDefinition("globe"), style.getProjection()->getType().asConstant());
++
++    style.loadJSON(R"STYLE({})STYLE");
++    ASSERT_TRUE(style.getProjection()->getType().isUndefined());
++
++    auto projection = std::make_unique<Projection>();
++    projection->setType(ProjectionDefinition("vertical-perspective"));
++    style.setProjection(std::move(projection));
++    ASSERT_EQ(ProjectionDefinition("vertical-perspective"), style.getProjection()->getType().asConstant());
++
++    // A name that is not a projection keeps the default, with a warning.
++    style.loadJSON(R"STYLE({"projection": {"type": "orthographic"}})STYLE");
++    ASSERT_TRUE(style.getProjection()->getType().isUndefined());
++}
