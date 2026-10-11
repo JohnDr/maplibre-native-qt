@@ -1,0 +1,326 @@
+diff --git a/include/mln/shaders/vulkan/color_relief.hpp b/include/mln/shaders/vulkan/color_relief.hpp
+index 987697348953..6354fee94516 100644
+--- a/include/mln/shaders/vulkan/color_relief.hpp
++++ b/include/mln/shaders/vulkan/color_relief.hpp
+@@ -47,6 +47,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idColorReliefDrawableUBO) readon
+     ColorReliefDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ layout(std140, set = LAYER_SET_INDEX, binding = idColorReliefTilePropsUBO) readonly buffer ColorReliefTilePropsUBOVector {
+     ColorReliefTilePropsUBO tile_props_ubo[];
+ } tilePropsVector;
+@@ -57,7 +61,7 @@ void main() {
+     const ColorReliefDrawableUBO drawable = drawableVector.drawable_ubo[constant.ubo_index];
+     const ColorReliefTilePropsUBO tileProps = tilePropsVector.tile_props_ubo[constant.ubo_index];
+ 
+-    gl_Position = drawable.matrix * vec4(in_position, 0, 1);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+     highp vec2 epsilon = 1.0 / tileProps.dimension;
+diff --git a/include/mln/shaders/vulkan/hillshade.hpp b/include/mln/shaders/vulkan/hillshade.hpp
+index 8ecc6ceaf6e5..34d4fc166da6 100644
+--- a/include/mln/shaders/vulkan/hillshade.hpp
++++ b/include/mln/shaders/vulkan/hillshade.hpp
+@@ -40,12 +40,16 @@ layout(std140, set = LAYER_SET_INDEX, binding = idHillshadeDrawableUBO) readonly
+     HillshadeDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ layout(location = 0) out vec2 frag_position;
+ 
+ void main() {
+     const HillshadeDrawableUBO drawable = drawableVector.drawable_ubo[constant.ubo_index];
+ 
+-    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+     frag_position = vec2(in_texture_position) / 8192.0;
+diff --git a/include/mln/shaders/vulkan/raster.hpp b/include/mln/shaders/vulkan/raster.hpp
+index 1a519efc0831..b7bd71bccb32 100644
+--- a/include/mln/shaders/vulkan/raster.hpp
++++ b/include/mln/shaders/vulkan/raster.hpp
+@@ -39,6 +39,10 @@ layout(std140, set = LAYER_SET_INDEX, binding = idRasterDrawableUBO) readonly bu
+     RasterDrawableUBO drawable_ubo[];
+ } drawableVector;
+ 
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
+ layout(set = LAYER_SET_INDEX, binding = idRasterEvaluatedPropsUBO) uniform RasterEvaluatedPropsUBO {
+     vec4 spin_weights;
+     vec2 tl_parent;
+@@ -60,7 +64,7 @@ layout(location = 1) out vec2 frag_position1;
+ void main() {
+     const RasterDrawableUBO drawable = drawableVector.drawable_ubo[constant.ubo_index];
+ 
+-    gl_Position = drawable.matrix * vec4(in_position, 0, 1);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+     // We are using Int16 for texture position coordinates to give us enough precision for
+diff --git a/src/mln/renderer/layers/render_color_relief_layer.cpp b/src/mln/renderer/layers/render_color_relief_layer.cpp
+index 29bad1684505..98ed81b478b3 100644
+--- a/src/mln/renderer/layers/render_color_relief_layer.cpp
++++ b/src/mln/renderer/layers/render_color_relief_layer.cpp
+@@ -5,6 +5,9 @@
+ #include <mln/renderer/sources/render_raster_dem_source.hpp>
+ #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/renderer/render_static_data.hpp>
++#include <mln/renderer/globe_tile_mesh.hpp>
++
++#include <optional>
+ #include <mln/style/layers/color_relief_layer.hpp>
+ #include <mln/style/layers/color_relief_layer_impl.hpp>
+ #include <mln/gfx/cull_face_mode.hpp>
+@@ -195,7 +198,7 @@ static const std::string ColorReliefShaderGroupName = "ColorReliefShader";
+ 
+ void RenderColorReliefLayer::update(gfx::ShaderRegistry& shaders,
+                                     gfx::Context& context,
+-                                    const TransformState&,
++                                    const TransformState& state,
+                                     const std::shared_ptr<UpdateParameters>&,
+                                     const PaintParameters&,
+                                     const RenderTree&,
+@@ -221,8 +224,11 @@ void RenderColorReliefLayer::update(gfx::ShaderRegistry& shaders,
+         layerGroup->addLayerTweaker(layerTweaker);
+     }
+ 
+-    if (!colorReliefShader) {
+-        colorReliefShader = context.getGenericShader(shaders, ColorReliefShaderGroupName);
++    const gfx::ProjectionVariant variant =
++        state.isGlobeRendering() ? gfx::ProjectionVariant::Globe : gfx::ProjectionVariant::Mercator;
++    if (!colorReliefShader || projectionVariant != variant) {
++        projectionVariant = variant;
++        colorReliefShader = context.getGenericShader(shaders, ColorReliefShaderGroupName, projectionVariant);
+     }
+ 
+     if (!colorReliefShader) {
+@@ -299,7 +305,13 @@ void RenderColorReliefLayer::update(gfx::ShaderRegistry& shaders,
+         std::shared_ptr<gfx::IndexVector<gfx::Triangles>> indices;
+         auto* segments = &staticDataSegments;
+ 
+-        if (!bucket.vertices.empty() && !bucket.indices.empty() && !bucket.segments.empty()) {
++        std::optional<GlobeTileMesh<HillshadeLayoutVertex, decltype(&HillshadeBucket::layoutVertex)>> globeMesh;
++        if (projectionVariant == gfx::ProjectionVariant::Globe) {
++            globeMesh.emplace(tileID.canonical, &HillshadeBucket::layoutVertex);
++            vertices = globeMesh->vertices;
++            indices = globeMesh->indices;
++            segments = &globeMesh->segments;
++        } else if (!bucket.vertices.empty() && !bucket.indices.empty() && !bucket.segments.empty()) {
+             vertices = bucket.sharedVertices;
+             indices = bucket.sharedIndices;
+             segments = &bucket.segments;
+diff --git a/src/mln/renderer/layers/render_color_relief_layer.hpp b/src/mln/renderer/layers/render_color_relief_layer.hpp
+index 3f4371b44e3a..35cebce7623d 100644
+--- a/src/mln/renderer/layers/render_color_relief_layer.hpp
++++ b/src/mln/renderer/layers/render_color_relief_layer.hpp
+@@ -5,6 +5,7 @@
+ #include <mln/style/layers/color_relief_layer_impl.hpp>
+ #include <mln/style/layers/color_relief_layer_properties.hpp>
+ #include <mln/util/image.hpp>
++#include <mln/gfx/projection_variant.hpp>
+ #include <memory>
+ #include <vector> // Added for std::vector<float>
+ 
+@@ -64,6 +65,7 @@ private:
+ 
+     // Shader
+     gfx::ShaderProgramBasePtr colorReliefShader;
++    gfx::ProjectionVariant projectionVariant = gfx::ProjectionVariant::Mercator;
+ 
+     // Vertex data
+     using ColorReliefVertexVector = gfx::VertexVector<HillshadeLayoutVertex>;
+diff --git a/src/mln/renderer/layers/render_hillshade_layer.cpp b/src/mln/renderer/layers/render_hillshade_layer.cpp
+index d74769eefb40..702c3da5799e 100644
+--- a/src/mln/renderer/layers/render_hillshade_layer.cpp
++++ b/src/mln/renderer/layers/render_hillshade_layer.cpp
+@@ -12,6 +12,9 @@
+ #include <mln/math/angles.hpp>
+ #include <mln/util/geo.hpp>
+ 
++#include <optional>
++
++#include <mln/renderer/globe_tile_mesh.hpp>
+ #include <mln/renderer/layers/hillshade_layer_tweaker.hpp>
+ #include <mln/renderer/layers/hillshade_prepare_layer_tweaker.hpp>
+ #include <mln/renderer/layer_group.hpp>
+@@ -183,8 +186,11 @@ void RenderHillshadeLayer::update(gfx::ShaderRegistry& shaders,
+         hillshadePrepareShader = context.getGenericShader(shaders, HillshadePrepareShaderGroupName);
+     }
+ 
+-    if (!hillshadeShader) {
+-        hillshadeShader = context.getGenericShader(shaders, HillshadeShaderGroupName);
++    const gfx::ProjectionVariant variant =
++        state.isGlobeRendering() ? gfx::ProjectionVariant::Globe : gfx::ProjectionVariant::Mercator;
++    if (!hillshadeShader || projectionVariant != variant) {
++        projectionVariant = variant;
++        hillshadeShader = context.getGenericShader(shaders, HillshadeShaderGroupName, projectionVariant);
+     }
+ 
+     if (!hillshadePrepareShader || !hillshadeShader) {
+@@ -310,7 +316,13 @@ void RenderHillshadeLayer::update(gfx::ShaderRegistry& shaders,
+         std::shared_ptr<gfx::IndexVector<gfx::Triangles>> indices;
+         auto* segments = &staticDataSegments;
+ 
+-        if (!bucket.vertices.empty() && !bucket.indices.empty() && !bucket.segments.empty()) {
++        std::optional<GlobeTileMesh<HillshadeLayoutVertex, decltype(&HillshadeBucket::layoutVertex)>> globeMesh;
++        if (projectionVariant == gfx::ProjectionVariant::Globe) {
++            globeMesh.emplace(tileID.canonical, &HillshadeBucket::layoutVertex);
++            vertices = globeMesh->vertices;
++            indices = globeMesh->indices;
++            segments = &globeMesh->segments;
++        } else if (!bucket.vertices.empty() && !bucket.indices.empty() && !bucket.segments.empty()) {
+             vertices = bucket.sharedVertices;
+             indices = bucket.sharedIndices;
+             segments = &bucket.segments;
+diff --git a/src/mln/renderer/layers/render_hillshade_layer.hpp b/src/mln/renderer/layers/render_hillshade_layer.hpp
+index 4e77931d9457..473359251ed3 100644
+--- a/src/mln/renderer/layers/render_hillshade_layer.hpp
++++ b/src/mln/renderer/layers/render_hillshade_layer.hpp
+@@ -5,6 +5,7 @@
+ #include <mln/style/layers/hillshade_layer_impl.hpp>
+ #include <mln/style/layers/hillshade_layer_properties.hpp>
+ #include <mln/tile/tile_id.hpp>
++#include <mln/gfx/projection_variant.hpp>
+ 
+ namespace mln {
+ 
+@@ -55,6 +56,7 @@ private:
+ 
+     gfx::ShaderProgramBasePtr hillshadePrepareShader;
+     gfx::ShaderProgramBasePtr hillshadeShader;
++    gfx::ProjectionVariant projectionVariant = gfx::ProjectionVariant::Mercator;
+     std::vector<RenderTargetPtr> activatedRenderTargets;
+ 
+     using HillshadeVertexVector = gfx::VertexVector<HillshadeLayoutVertex>;
+diff --git a/src/mln/renderer/layers/render_raster_layer.cpp b/src/mln/renderer/layers/render_raster_layer.cpp
+index 434c3b2bf337..22d020ff3628 100644
+--- a/src/mln/renderer/layers/render_raster_layer.cpp
++++ b/src/mln/renderer/layers/render_raster_layer.cpp
+@@ -11,6 +11,9 @@
+ #include <mln/style/layers/raster_layer_impl.hpp>
+ #include <mln/util/logging.hpp>
+ 
++#include <optional>
++
++#include <mln/renderer/globe_tile_mesh.hpp>
+ #include <mln/renderer/layers/raster_layer_tweaker.hpp>
+ #include <mln/gfx/image_drawable_data.hpp>
+ #include <mln/gfx/drawable_impl.hpp>
+@@ -100,7 +103,7 @@ void RenderRasterLayer::layerIndexChanged(int32_t newLayerIndex, UniqueChangeReq
+ 
+ void RenderRasterLayer::update(gfx::ShaderRegistry& shaders,
+                                gfx::Context& context,
+-                               const TransformState& /*state*/,
++                               const TransformState& state,
+                                const std::shared_ptr<UpdateParameters>&,
+                                [[maybe_unused]] const PaintParameters& paintParameters,
+                                [[maybe_unused]] const RenderTree& renderTree,
+@@ -117,8 +120,11 @@ void RenderRasterLayer::update(gfx::ShaderRegistry& shaders,
+ 
+     constexpr auto renderPass = RenderPass::Translucent;
+ 
+-    if (!rasterShader) {
+-        rasterShader = context.getGenericShader(shaders, "RasterShader");
++    const gfx::ProjectionVariant variant =
++        state.isGlobeRendering() ? gfx::ProjectionVariant::Globe : gfx::ProjectionVariant::Mercator;
++    if (!rasterShader || projectionVariant != variant) {
++        projectionVariant = variant;
++        rasterShader = context.getGenericShader(shaders, "RasterShader", projectionVariant);
+         if (!rasterShader) {
+             return;
+         }
+@@ -185,7 +191,8 @@ void RenderRasterLayer::update(gfx::ShaderRegistry& shaders,
+     // Populates a drawable xor a drawable builder for creates and updates, respectively.
+     // Returns false if the drawable must be re-created.
+     const auto buildVertexData =
+-        [&](const gfx::UniqueDrawableBuilder& builder, gfx::Drawable* drawable, const RasterBucket& bucket) {
++        [&](const gfx::UniqueDrawableBuilder& builder, gfx::Drawable* drawable, const RasterBucket& bucket,
++            const OverscaledTileID* tileID) {
+             // The bucket may later add, remove, or change masking.  In that case, the tile's
+             // shared data and segments are not updated, and it needs to be re-created.
+             if (drawable && bucket.sharedVertices->isModifiedAfter(drawable->createTime)) {
+@@ -194,14 +201,19 @@ void RenderRasterLayer::update(gfx::ShaderRegistry& shaders,
+ 
+             // The bucket only fills in geometry for masked tiles,
+             // otherwise the standard tile extent geometry should be used.
+-            const bool shared = (!bucket.sharedVertices->empty() && !bucket.sharedTriangles->empty() &&
+-                                 !bucket.segments.empty());
+-            const auto& vertices = shared ? bucket.sharedVertices : staticDataVertices;
+-            const auto& indices = shared ? bucket.sharedTriangles : staticDataIndices;
+-            const auto* segments = shared ? &bucket.segments : staticDataSegments.get();
++            const bool globe = projectionVariant == gfx::ProjectionVariant::Globe && tileID;
++            const bool shared = !globe && !bucket.sharedVertices->empty() && !bucket.sharedTriangles->empty() &&
++                                !bucket.segments.empty();
++            std::optional<GlobeTileMesh<RasterLayoutVertex, decltype(&RasterBucket::layoutVertex)>> globeMesh;
++            if (globe) {
++                globeMesh.emplace(tileID->canonical, &RasterBucket::layoutVertex);
++            }
++            const auto& vertices = globe ? globeMesh->vertices : shared ? bucket.sharedVertices : staticDataVertices;
++            const auto& indices = globe ? globeMesh->indices : shared ? bucket.sharedTriangles : staticDataIndices;
++            const auto* segments = globe ? &globeMesh->segments : shared ? &bucket.segments : staticDataSegments.get();
+ 
+             gfx::VertexAttributeArrayPtr bucketAttrs;
+-            auto& vertexAttrs = shared ? bucketAttrs : staticAttrs;
++            auto& vertexAttrs = (shared || globe) ? bucketAttrs : staticAttrs;
+             if (!vertexAttrs) {
+                 vertexAttrs = context.createVertexAttributeArray();
+ 
+@@ -254,7 +266,7 @@ void RenderRasterLayer::update(gfx::ShaderRegistry& shaders,
+             // TODO: Share textures
+             builder = createBuilder();
+             for (const auto& matrix_ : imageData->matrices) {
+-                buildVertexData(builder, /*drawable=*/nullptr, bucket);
++                buildVertexData(builder, /*drawable=*/nullptr, bucket, nullptr);
+                 setTextures(builder, bucket);
+ 
+                 // finish
+@@ -328,7 +340,7 @@ void RenderRasterLayer::update(gfx::ShaderRegistry& shaders,
+                     }
+ 
+                     gfx::UniqueDrawableBuilder none;
+-                    if (!geometryChanged && !buildVertexData(none, &drawable, bucket)) {
++                    if (!geometryChanged && !buildVertexData(none, &drawable, bucket, &tileID)) {
+                         // Masking changed, need to rebuild this tile
+                         geometryChanged = true;
+                     }
+@@ -353,7 +365,7 @@ void RenderRasterLayer::update(gfx::ShaderRegistry& shaders,
+                 setTextures(builder, bucket);
+             };
+ 
+-            buildVertexData(builder, /*drawable=*/nullptr, bucket);
++            buildVertexData(builder, /*drawable=*/nullptr, bucket, &tileID);
+ 
+             // finish
+             builder->flush(context);
+diff --git a/src/mln/renderer/layers/render_raster_layer.hpp b/src/mln/renderer/layers/render_raster_layer.hpp
+index 36c315dd1906..4541962ff9ef 100644
+--- a/src/mln/renderer/layers/render_raster_layer.hpp
++++ b/src/mln/renderer/layers/render_raster_layer.hpp
+@@ -5,6 +5,7 @@
+ #include <mln/style/layers/raster_layer_impl.hpp>
+ #include <mln/style/layers/raster_layer_properties.hpp>
+ #include <mln/gfx/context.hpp>
++#include <mln/gfx/projection_variant.hpp>
+ 
+ namespace mln {
+ 
+@@ -51,6 +52,8 @@ private:
+     style::RasterPaintProperties::Unevaluated unevaluated;
+     const ImageSourceRenderData* imageData = nullptr;
+ 
++    gfx::ProjectionVariant projectionVariant = gfx::ProjectionVariant::Mercator;
++
+     gfx::ShaderProgramBasePtr rasterShader;
+     LayerGroupPtr imageLayerGroup;
+ 
