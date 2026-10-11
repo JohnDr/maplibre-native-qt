@@ -46,8 +46,8 @@ public:
 
     // Values must match QMapLibre::Map::ProjectionType (enforced in the .cpp).
     enum ProjectionType {
-        Mercator, // Default
-        Globe,
+        Mercator = 0, // Default
+        Globe = 1,
     };
     Q_ENUM(ProjectionType)
 

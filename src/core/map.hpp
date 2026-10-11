@@ -82,9 +82,11 @@ public:
     // Determines the map projection. Globe is not rendered yet; selecting it
     // records the request until the globe renderer lands. Values must match
     // mln::ProjectionType (enforced in the .cpp) and MapQuickItem::ProjectionType.
+    // Determines the map projection. Kept independent of mln::ProjectionType;
+    // the two are mapped explicitly in the .cpp.
     enum ProjectionType {
-        Mercator, // Default
-        Globe,
+        Mercator = 0, // Default
+        Globe = 1,
     };
     Q_ENUM(ProjectionType)
 

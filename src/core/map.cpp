@@ -90,10 +90,8 @@ static_assert(mln::underlying_type(QMapLibre::Map::NorthLeftwards) ==
                   mln::underlying_type(mln::NorthOrientation::Leftwards),
               "error");
 
-// mln::ProjectionType
-static_assert(mln::underlying_type(QMapLibre::Map::Mercator) == mln::underlying_type(mln::ProjectionType::Mercator),
-              "error");
-static_assert(mln::underlying_type(QMapLibre::Map::Globe) == mln::underlying_type(mln::ProjectionType::Globe), "error");
+// mln::ProjectionType is mapped explicitly below; the Qt enum is kept
+// independent of its layout.
 
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -905,17 +903,23 @@ void Map::setNorthOrientation(NorthOrientation orientation) {
     \return The map projection type.
 */
 Map::ProjectionType Map::projectionType() const {
-    return static_cast<Map::ProjectionType>(d_ptr->mapObj->getProjectionType());
+    switch (d_ptr->mapObj->getProjectionType()) {
+        case mln::ProjectionType::Globe:
+        case mln::ProjectionType::VerticalPerspective:
+            return Globe;
+        case mln::ProjectionType::Mercator:
+            break;
+    }
+    return Mercator;
 }
 
 /*!
     \brief Set the map projection type.
-    \param type The map projection type. Globe is not rendered yet; it is
-    recorded and rendered once the globe work lands.
+    \param type The map projection type.
 */
 void Map::setProjectionType(ProjectionType type) {
     const auto previous = projectionType();
-    d_ptr->mapObj->setProjectionType(static_cast<mln::ProjectionType>(type));
+    d_ptr->mapObj->setProjectionType(type == Globe ? mln::ProjectionType::Globe : mln::ProjectionType::Mercator);
     if (previous != type) emit projectionTypeChanged(type);
 }
 
