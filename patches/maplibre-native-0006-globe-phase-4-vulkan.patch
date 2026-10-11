@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index f97c16fff818..2afdfa707c38 100644
+index f97c16fff818..6150e5caf0cf 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -239,6 +239,7 @@ list(APPEND INCLUDE_FILES
@@ -10,7 +10,17 @@ index f97c16fff818..2afdfa707c38 100644
      ${PROJECT_SOURCE_DIR}/include/mln/gfx/shader_group.hpp
      ${PROJECT_SOURCE_DIR}/include/mln/gfx/shader_registry.hpp
      ${PROJECT_SOURCE_DIR}/include/mln/gfx/shader.hpp
-@@ -547,6 +548,8 @@ list(APPEND SRC_FILES
+@@ -444,6 +445,9 @@ list(APPEND INCLUDE_FILES
+     ${PROJECT_SOURCE_DIR}/include/mln/util/size.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/util/string_indexer.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/util/string.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/util/subdivision.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/util/subdivision_granularity.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/util/tile_mesh.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/util/symbol_error_observer.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/util/thread.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/util/tile_server_options.hpp
+@@ -547,6 +551,8 @@ list(APPEND SRC_FILES
      ${PROJECT_SOURCE_DIR}/src/mln/map/mercator_projection.cpp
      ${PROJECT_SOURCE_DIR}/src/mln/map/mercator_projection.hpp
      ${PROJECT_SOURCE_DIR}/src/mln/map/projection_base.hpp
@@ -19,8 +29,17 @@ index f97c16fff818..2afdfa707c38 100644
      ${PROJECT_SOURCE_DIR}/src/mln/map/transform.cpp
      ${PROJECT_SOURCE_DIR}/src/mln/map/transform.hpp
      ${PROJECT_SOURCE_DIR}/src/mln/map/transform_state.cpp
+@@ -986,6 +992,8 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/util/stopwatch.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/util/stopwatch.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/util/string.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/util/subdivision.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/util/tile_mesh.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/util/string_indexer.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/util/thread.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/util/thread_local.hpp
 diff --git a/bazel/core.bzl b/bazel/core.bzl
-index 7921b119bf6a..1e57ac3162f3 100644
+index 7921b119bf6a..c470dae72dad 100644
 --- a/bazel/core.bzl
 +++ b/bazel/core.bzl
 @@ -197,6 +197,8 @@ MLN_CORE_SOURCE = [
@@ -32,7 +51,31 @@ index 7921b119bf6a..1e57ac3162f3 100644
      "src/mln/map/transform.cpp",
      "src/mln/map/transform.hpp",
      "src/mln/map/transform_state.cpp",
-@@ -668,6 +670,7 @@ MLN_CORE_HEADERS = [
+@@ -229,6 +231,7 @@ MLN_CORE_SOURCE = [
+     "src/mln/renderer/cross_faded_property_evaluator.cpp",
+     "src/mln/renderer/cross_faded_property_evaluator.hpp",
+     "src/mln/renderer/data_driven_property_evaluator.hpp",
++    "src/mln/renderer/globe_tile_mesh.hpp",
+     "src/mln/renderer/group_by_layout.cpp",
+     "src/mln/renderer/group_by_layout.hpp",
+     "src/mln/renderer/image_manager.cpp",
+@@ -613,6 +616,7 @@ MLN_CORE_SOURCE = [
+     "src/mln/util/stopwatch.hpp",
+     "src/mln/util/string.cpp",
+     "src/mln/util/string_indexer.cpp",
++    "src/mln/util/subdivision.cpp",
+     "src/mln/util/thread.cpp",
+     "src/mln/util/thread_local.hpp",
+     "src/mln/util/thread_pool.cpp",
+@@ -622,6 +626,7 @@ MLN_CORE_SOURCE = [
+     "src/mln/util/tile_cover.hpp",
+     "src/mln/util/tile_cover_impl.cpp",
+     "src/mln/util/tile_cover_impl.hpp",
++    "src/mln/util/tile_mesh.cpp",
+     "src/mln/util/tile_range.hpp",
+     "src/mln/util/default_style.cpp",
+     "src/mln/util/tile_server_options.cpp",
+@@ -668,6 +673,7 @@ MLN_CORE_HEADERS = [
      "include/mln/gfx/gfx_types.hpp",
      "include/mln/gfx/polyline_generator.hpp",
      "include/mln/gfx/renderbuffer.hpp",
@@ -40,6 +83,20 @@ index 7921b119bf6a..1e57ac3162f3 100644
      "include/mln/gfx/renderable.hpp",
      "include/mln/gfx/renderer_backend.hpp",
      "include/mln/gfx/rendering_stats.hpp",
+@@ -868,10 +874,13 @@ MLN_CORE_HEADERS = [
+     "include/mln/util/scoped.hpp",
+     "include/mln/util/size.hpp",
+     "include/mln/util/string.hpp",
++    "include/mln/util/subdivision.hpp",
++    "include/mln/util/subdivision_granularity.hpp",
+     "include/mln/util/symbol_error_observer.hpp",
+     "include/mln/util/string_indexer.hpp",
+     "include/mln/util/tile_server_options.hpp",
+     "include/mln/util/thread.hpp",
++    "include/mln/util/tile_mesh.hpp",
+     "include/mln/util/tileset.hpp",
+     "include/mln/util/timer.hpp",
+     "include/mln/util/tiny_unordered_map.hpp",
 diff --git a/include/mln/gfx/context.hpp b/include/mln/gfx/context.hpp
 index 81e71d931d40..de0d6a8f1e57 100644
 --- a/include/mln/gfx/context.hpp
@@ -181,7 +238,7 @@ index 15a58cfbb90d..42b364e70ed1 100644
  };
  static_assert(sizeof(ProjectionUBO) == 11 * 16);
 diff --git a/include/mln/shaders/mtl/background.hpp b/include/mln/shaders/mtl/background.hpp
-index 3df37961d991..f79a7fe8fddf 100644
+index 3df37961d991..bb270194d965 100644
 --- a/include/mln/shaders/mtl/background.hpp
 +++ b/include/mln/shaders/mtl/background.hpp
 @@ -96,12 +96,13 @@ struct FragmentStage {
@@ -196,7 +253,7 @@ index 3df37961d991..f79a7fe8fddf 100644
  
      return {
 -        .position = drawable.matrix * float4(float2(in.position.xy), 0, 1)
-+        .position = projectTile(float2(in.position.xy), projectionVector[uboIndex])
++        .position = projectTile(float2(in.position.xy), float2(in.position.xy), projectionVector[uboIndex])
      };
  }
  
@@ -213,15 +270,15 @@ index 3df37961d991..f79a7fe8fddf 100644
                                           pos);
      return {
 -        .position = drawable.matrix * float4(float2(in.position.xy), 0, 1),
-+        .position = projectTile(float2(in.position.xy), projectionVector[uboIndex]),
++        .position = projectTile(float2(in.position.xy), float2(in.position.xy), projectionVector[uboIndex]),
          .pos_a = pos_a,
          .pos_b = pos_b,
      };
 diff --git a/include/mln/shaders/mtl/common.hpp b/include/mln/shaders/mtl/common.hpp
-index a5da3759b532..b08ab0b5add1 100644
+index a5da3759b532..d2eaefd17105 100644
 --- a/include/mln/shaders/mtl/common.hpp
 +++ b/include/mln/shaders/mtl/common.hpp
-@@ -231,17 +231,78 @@ struct alignas(16) ProjectionUBO {
+@@ -231,17 +231,96 @@ struct alignas(16) ProjectionUBO {
      /* 128 */ float4 tile_mercator_coords;
      /* 144 */ float4 clipping_plane;
      /* 160 */ float projection_transition;
@@ -235,7 +292,11 @@ index a5da3759b532..b08ab0b5add1 100644
  };
  static_assert(sizeof(ProjectionUBO) == 11 * 16, "wrong size");
  
-+#ifdef PROJECTION_GLOBE
++// Pole vertices carry these sentinel Y values in their raw position.
++#define GLOBE_POLE_NORTH_Y -32767.5
++#define GLOBE_POLE_SOUTH_Y 32766.5
++
++#if defined(PROJECTION_GLOBE)
 +
 +#define GLOBE_RADIUS 6371008.8
 +
@@ -250,10 +311,10 @@ index a5da3759b532..b08ab0b5add1 100644
 +    const float sin_sy = (t2 - 1.0) / denom;
 +    const float cos_sy = (2.0 * t) / denom;
 +    float3 pos = float3(sin(spherical_x) * cos_sy, sin_sy, cos(spherical_x) * cos_sy);
-+    if (rawPos.y < -32767.5) {
++    if (rawPos.y < GLOBE_POLE_NORTH_Y) {
 +        pos = float3(0.0, 1.0, 0.0);
 +    }
-+    if (rawPos.y > 32766.5) {
++    if (rawPos.y > GLOBE_POLE_SOUTH_Y) {
 +        pos = float3(0.0, -1.0, 0.0);
 +    }
 +    return pos;
@@ -280,7 +341,7 @@ index a5da3759b532..b08ab0b5add1 100644
 +    float4 result = globePosition;
 +    result.z = mix(0.0, globePosition.z, clamp((projection.projection_transition - z_globeness_threshold) / (1.0 - z_globeness_threshold), 0.0, 1.0));
 +    result.xyw = mix(flatPosition.xyw, globePosition.xyw, projection.projection_transition);
-+    if ((posInTile.y < -32767.5) || (posInTile.y > 32766.5)) {
++    if ((posInTile.y < GLOBE_POLE_NORTH_Y) || (posInTile.y > GLOBE_POLE_SOUTH_Y)) {
 +        result = globePosition;
 +        const float poles_hidden_anim_percentage = 0.02;
 +        result.z = mix(globePosition.z, 100.0, pow(max((1.0 - projection.projection_transition) / poles_hidden_anim_percentage, 0.0), 8.0));
@@ -292,12 +353,26 @@ index a5da3759b532..b08ab0b5add1 100644
 +    return interpolateProjection(pos, projectToSphere(pos, float2(0.0, 0.0), projection), 0.0, projection);
 +}
 +
++// The variant for geometry that can carry pole vertices; rawPos is the untranslated position.
++inline float4 projectTile(float2 pos, float2 rawPos, device const ProjectionUBO& projection) {
++    return interpolateProjection(pos, projectToSphere(pos, rawPos, projection), 0.0, projection);
++}
++
 +#else
 +
  inline float4 projectTile(float2 pos, device const ProjectionUBO& projection) {
      return projection.matrix * float4(pos, 0.0, 1.0);
  }
  
++// Pole vertices only exist on the globe; put them behind the near plane so their triangles are clipped.
++inline float4 projectTile(float2 pos, float2 rawPos, device const ProjectionUBO& projection) {
++    float4 result = projection.matrix * float4(pos, 0.0, 1.0);
++    if (rawPos.y < GLOBE_POLE_NORTH_Y || rawPos.y > GLOBE_POLE_SOUTH_Y) {
++        result.z = -10000000.0;
++    }
++    return result;
++}
++
 +#endif
 +
  enum {
@@ -335,7 +410,7 @@ index f52a3275e70a..9dcc445bce68 100644
              auto& context = static_cast<Context&>(gfxContext);
              const auto shaderSource = std::string(shaders::prelude) + prelude + source;
 diff --git a/include/mln/shaders/vulkan/background.hpp b/include/mln/shaders/vulkan/background.hpp
-index 8dee2e39de7c..366e6506283b 100644
+index 8dee2e39de7c..396438244086 100644
 --- a/include/mln/shaders/vulkan/background.hpp
 +++ b/include/mln/shaders/vulkan/background.hpp
 @@ -40,10 +40,14 @@ layout(std140, set = LAYER_SET_INDEX, binding = idBackgroundDrawableUBO) readonl
@@ -350,7 +425,7 @@ index 8dee2e39de7c..366e6506283b 100644
      const BackgroundDrawableUBO drawable = drawableVector.drawable_ubo[constant.ubo_index];
  
 -    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
-+    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
      applySurfaceTransform();
  }
  )";
@@ -370,15 +445,15 @@ index 8dee2e39de7c..366e6506283b 100644
                                   in_position);
  
 -    gl_Position = drawable.matrix * vec4(in_position, 0.0, 1.0);
-+    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
      applySurfaceTransform();
  }
  )";
 diff --git a/include/mln/shaders/vulkan/common.hpp b/include/mln/shaders/vulkan/common.hpp
-index a57798cb8d88..61a1f9adefb0 100644
+index a57798cb8d88..784502aa4dc4 100644
 --- a/include/mln/shaders/vulkan/common.hpp
 +++ b/include/mln/shaders/vulkan/common.hpp
-@@ -128,15 +128,76 @@ struct ProjectionUBO {
+@@ -128,15 +128,92 @@ struct ProjectionUBO {
      vec4 tile_mercator_coords;
      vec4 clipping_plane;
      float projection_transition;
@@ -388,11 +463,13 @@ index a57798cb8d88..61a1f9adefb0 100644
 -    float pad3;
  };
  
++// Pole vertices carry these sentinel Y values in their raw position.
++#define GLOBE_POLE_NORTH_Y -32767.5
++#define GLOBE_POLE_SOUTH_Y 32766.5
++
 +#ifdef PROJECTION_GLOBE
 +
 +#define GLOBE_RADIUS 6371008.8
-+#define GLOBE_POLE_NORTH_Y -32767.5
-+#define GLOBE_POLE_SOUTH_Y 32766.5
 +
 +// Tile position (0..EXTENT) to a point on the unit sphere; the pole sentinels in rawPos map to the poles.
 +vec3 projectToSphere(vec2 translatedPos, vec2 rawPos, ProjectionUBO projection) {
@@ -445,12 +522,26 @@ index a57798cb8d88..61a1f9adefb0 100644
 +    return interpolateProjection(pos, projectToSphere(pos, vec2(0.0, 0.0), projection), 0.0, projection);
 +}
 +
++// The variant for geometry that can carry pole vertices; rawPos is the untranslated position.
++vec4 projectTile(vec2 pos, vec2 rawPos, ProjectionUBO projection) {
++    return interpolateProjection(pos, projectToSphere(pos, rawPos, projection), 0.0, projection);
++}
++
 +#else
 +
  vec4 projectTile(vec2 pos, ProjectionUBO projection) {
      return projection.matrix * vec4(pos, 0.0, 1.0);
  }
  
++// Pole vertices only exist on the globe; put them behind the near plane so their triangles are clipped.
++vec4 projectTile(vec2 pos, vec2 rawPos, ProjectionUBO projection) {
++    vec4 result = projection.matrix * vec4(pos, 0.0, 1.0);
++    if (rawPos.y < GLOBE_POLE_NORTH_Y || rawPos.y > GLOBE_POLE_SOUTH_Y) {
++        result.z = -10000000.0;
++    }
++    return result;
++}
++
 +#endif
 +
  void applySurfaceTransform() {
@@ -1077,10 +1168,26 @@ index 8b9ac132e73b..a1f9af183157 100644
          const auto projection = getProjectionData(
              tileID, parameters, {0.f, 0.f}, TranslateAnchorType::Viewport, false, false, drawable);
 diff --git a/src/mln/renderer/layers/render_background_layer.cpp b/src/mln/renderer/layers/render_background_layer.cpp
-index b8f7fc16aace..c95ebde4365a 100644
+index b8f7fc16aace..22b93868bab0 100644
 --- a/src/mln/renderer/layers/render_background_layer.cpp
 +++ b/src/mln/renderer/layers/render_background_layer.cpp
-@@ -168,11 +168,19 @@ void RenderBackgroundLayer::update(gfx::ShaderRegistry& shaders,
+@@ -1,4 +1,7 @@
+ #include <mln/renderer/layers/render_background_layer.hpp>
++#include <mln/util/logging.hpp>
++#include <mln/util/subdivision_granularity.hpp>
++#include <mln/renderer/globe_tile_mesh.hpp>
+ #include <mln/gfx/context.hpp>
+ #include <mln/gfx/cull_face_mode.hpp>
+ #include <mln/map/transform_state.hpp>
+@@ -12,7 +15,6 @@
+ #include <mln/style/layer_properties.hpp>
+ #include <mln/util/tile_cover.hpp>
+ #include <mln/util/convert.hpp>
+-#include <mln/util/logging.hpp>
+ 
+ #include <mln/renderer/layers/background_layer_tweaker.hpp>
+ #include <mln/gfx/drawable_builder.hpp>
+@@ -168,11 +170,19 @@ void RenderBackgroundLayer::update(gfx::ShaderRegistry& shaders,
          layerGroup->addLayerTweaker(layerTweaker);
      }
  
@@ -1102,6 +1209,27 @@ index b8f7fc16aace..c95ebde4365a 100644
      }
  
      const auto& curShader = hasPattern ? patternShader : plainShader;
+@@ -218,10 +228,17 @@ void RenderBackgroundLayer::update(gfx::ShaderRegistry& shaders,
+                                                                         : gfx::ColorMode::unblended());
+         }
+ 
+-        auto verticesCopy = rawVertices;
+         builder->setVertexAttrId(idBackgroundPosVertexAttribute);
+-        builder->setRawVertices(std::move(verticesCopy), vertexCount, gfx::AttributeDataType::Short2);
+-        builder->setSegments(gfx::Triangles(), indexes.vector(), segs.data(), segs.size());
++        if (projectionVariant == gfx::ProjectionVariant::Globe) {
++            // The background is not depth tested, so it needs no tile border.
++            auto mesh = rawGlobeTileMesh(tileID.canonical, false);
++            builder->setRawVertices(std::move(mesh.vertices), mesh.vertexCount, gfx::AttributeDataType::Short2);
++            builder->setSegments(gfx::Triangles(), std::move(mesh.indices), mesh.segments.data(), mesh.segments.size());
++        } else {
++            auto verticesCopy = rawVertices;
++            builder->setRawVertices(std::move(verticesCopy), vertexCount, gfx::AttributeDataType::Short2);
++            builder->setSegments(gfx::Triangles(), indexes.vector(), segs.data(), segs.size());
++        }
+         builder->flush(context);
+ 
+         for (auto& drawable : builder->clearDrawables()) {
 diff --git a/src/mln/renderer/layers/render_background_layer.hpp b/src/mln/renderer/layers/render_background_layer.hpp
 index 1a0e95554c9b..1ea8890df0e6 100644
 --- a/src/mln/renderer/layers/render_background_layer.hpp
@@ -1216,10 +1344,20 @@ index 84ffd60b4345..7f7972a14040 100644
      gfx::ShaderGroupPtr outlineShaderGroup;
      gfx::ShaderGroupPtr patternShaderGroup;
 diff --git a/src/mln/renderer/paint_parameters.cpp b/src/mln/renderer/paint_parameters.cpp
-index a55243c508b2..c6e216c5d11f 100644
+index a55243c508b2..edca32167f58 100644
 --- a/src/mln/renderer/paint_parameters.cpp
 +++ b/src/mln/renderer/paint_parameters.cpp
-@@ -186,6 +186,11 @@ void PaintParameters::clearStencil() {
+@@ -119,7 +119,8 @@ ProjectionData PaintParameters::projectionDataForTile(const UnwrappedTileID& til
+ }
+ 
+ gfx::DepthMode PaintParameters::depthModeForSublayer([[maybe_unused]] uint8_t n, gfx::DepthMaskType mask) const {
+-    if (currentLayer < opaquePassCutoff) {
++    // On the globe, 2D layers are ordered by draw order alone; their Z is the back-hemisphere clip.
++    if (currentLayer < opaquePassCutoff || state.isGlobeRendering()) {
+         return gfx::DepthMode::disabled();
+     }
+ 
+@@ -186,6 +187,11 @@ void PaintParameters::clearStencil() {
  }
  
  bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
@@ -1231,7 +1369,7 @@ index a55243c508b2..c6e216c5d11f 100644
      // We can avoid updating the mask if it already contains the same set of tiles.
      if (!renderTiles || tileIDsCovered(renderTiles, tileClippingMaskIDs)) {
          return true;
-@@ -366,6 +371,9 @@ bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
+@@ -366,6 +372,9 @@ bool PaintParameters::renderTileClippingMasks(const RenderTiles& renderTiles) {
  }
  
  gfx::StencilMode PaintParameters::stencilModeForClipping(const UnwrappedTileID& tileID) const {
@@ -1303,7 +1441,7 @@ index ec205d599dfe..825e726f8aa0 100644
 +    };
 +    const UnwrappedTileID world{0, 0, 0};
 +    const double half = util::EXTENT / 2.0;
-+    // (0┬░, 0┬░) is the +Z axis; the equator runs through ┬▒X; latitude is Y.
++    // (0°, 0°) is the +Z axis; the equator runs through ±X; latitude is Y.
 +    EXPECT_TRUE(near({{0, 0, 1}}, VerticalPerspectiveProjection::tileCoordinatesToSphere({half, half}, world)));
 +    EXPECT_TRUE(near({{1, 0, 0}}, VerticalPerspectiveProjection::tileCoordinatesToSphere({half * 1.5, half}, world)));
 +    EXPECT_TRUE(near({{-1, 0, 0}}, VerticalPerspectiveProjection::tileCoordinatesToSphere({half * 0.5, half}, world)));

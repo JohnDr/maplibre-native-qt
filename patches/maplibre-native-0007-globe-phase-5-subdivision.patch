@@ -1,0 +1,1899 @@
+diff --git a/include/mln/gfx/fill_generator.hpp b/include/mln/gfx/fill_generator.hpp
+index 5d27068cd552..4ee309c3ddd5 100644
+--- a/include/mln/gfx/fill_generator.hpp
++++ b/include/mln/gfx/fill_generator.hpp
+@@ -22,7 +22,9 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
+                                   gfx::IndexVector<gfx::Triangles>& fillIndexes,
+                                   SegmentVector& fillSegments,
+                                   gfx::IndexVector<gfx::Lines>& lineIndexes,
+-                                  SegmentVector& lineSegments);
++                                  SegmentVector& lineSegments,
++                                  const CanonicalTileID& canonical,
++                                  uint32_t subdivisionGranularity = 1);
+ 
+ /// Generate fill and outline buffers, where the outlines are built with triangle primitives
+ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
+@@ -42,7 +44,9 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
+                                   gfx::IndexVector<gfx::Triangles>& lineIndexes,
+                                   SegmentVector& lineSegments,
+                                   gfx::IndexVector<gfx::Lines>& basicLineIndexes,
+-                                  SegmentVector& basicLineSegments);
++                                  SegmentVector& basicLineSegments,
++                                  const CanonicalTileID& canonical,
++                                  uint32_t subdivisionGranularity = 1);
+ 
+ } // namespace gfx
+ } // namespace mln
+diff --git a/include/mln/shaders/mtl/fill.hpp b/include/mln/shaders/mtl/fill.hpp
+index eeaf34d70205..86bd8c60cd7e 100644
+--- a/include/mln/shaders/mtl/fill.hpp
++++ b/include/mln/shaders/mtl/fill.hpp
+@@ -183,7 +183,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+     device const FillDrawableUBO& drawable = drawableVector[uboIndex].fillDrawableUBO;
+ 
+     return {
+-        .position = projectTile(float2(vertx.position), projectionVector[uboIndex]),
++        .position = projectTile(float2(vertx.position), float2(vertx.position), projectionVector[uboIndex]),
+ #if !defined(HAS_UNIFORM_u_color)
+         .color    = half4(unpack_mix_color(vertx.color, drawable.color_t)),
+ #endif
+@@ -254,7 +254,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+ 
+     device const FillOutlineDrawableUBO& drawable = drawableVector[uboIndex].fillOutlineDrawableUBO;
+ 
+-    const float4 position = projectTile(float2(vertx.position), projectionVector[uboIndex]);
++    const float4 position = projectTile(float2(vertx.position), float2(vertx.position), projectionVector[uboIndex]);
+     return {
+         .position       = position,
+         .pos            = (position.xy / position.w + 1.0) / 2.0 * paintParams.world_size,
+@@ -377,7 +377,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+     const float2 postion = float2(vertx.position);
+ 
+     return {
+-        .position       = projectTile(postion, projectionVector[uboIndex]),
++        .position       = projectTile(postion, postion, projectionVector[uboIndex]),
+         .v_pos_a        = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, fromScale * display_size_a, tileZoomRatio, postion),
+         .v_pos_b        = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, toScale * display_size_b, tileZoomRatio, postion),
+ #if !defined(HAS_UNIFORM_u_pattern_from)
+@@ -524,7 +524,7 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+     const float2 display_size_a = float2((pattern_br_a.x - pattern_tl_a.x) / pixelRatio, (pattern_br_a.y - pattern_tl_a.y) / pixelRatio);
+     const float2 display_size_b = float2((pattern_br_b.x - pattern_tl_b.x) / pixelRatio, (pattern_br_b.y - pattern_tl_b.y) / pixelRatio);
+     const float2 pos2 = float2(vertx.position);
+-    const float4 position = projectTile(pos2, projectionVector[uboIndex]);
++    const float4 position = projectTile(pos2, pos2, projectionVector[uboIndex]);
+ 
+     return {
+         .position       = position,
+@@ -649,8 +649,8 @@ FragmentStage vertex vertexMain(thread const VertexStage vertx [[stage_in]],
+     // Scale the extrusion vector down to a normal and then up by the line width of this vertex.
+     const float2 dist = outset * a_extrude * LINE_NORMAL_SCALE;
+ 
+-    const float4 projected_extrude = drawable.matrix * float4(dist / drawable.ratio, 0.0, 0.0);
+-    const float4 position = projectTile(pos, projectionVector[uboIndex]) + projected_extrude;
++    const float4 projected_extrude = projectionVector[uboIndex].fallback_matrix * float4(dist / drawable.ratio, 0.0, 0.0);
++    const float4 position = projectTile(pos, pos, projectionVector[uboIndex]) + projected_extrude;
+ 
+     // calculate how much the perspective view squishes or stretches the extrude
+     const float extrude_length_without_perspective = length(dist);
+diff --git a/include/mln/shaders/vulkan/fill.hpp b/include/mln/shaders/vulkan/fill.hpp
+index b147e7126140..cd7ed80b708e 100644
+--- a/include/mln/shaders/vulkan/fill.hpp
++++ b/include/mln/shaders/vulkan/fill.hpp
+@@ -76,7 +76,7 @@ void main() {
+     frag_opacity = unpack_mix_float(in_opacity, drawable.opacity_t);
+ #endif
+ 
+-    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ }
+ )";
+@@ -185,7 +185,7 @@ void main() {
+     frag_opacity = unpack_mix_float(in_opacity, drawable.opacity_t);
+ #endif
+ 
+-    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+     frag_position = (gl_Position.xy / gl_Position.w + 1.0) / 2.0 * paintParams.world_size;
+@@ -361,7 +361,7 @@ void main() {
+     frag_pos_a = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, fromScale * display_size_a, tileZoomRatio, in_position),
+     frag_pos_b = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, toScale * display_size_b, tileZoomRatio, in_position),
+ 
+-    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ }
+ )";
+@@ -576,7 +576,7 @@ void main() {
+     const vec2 display_size_b = vec2((pattern_br_b.x - pattern_tl_b.x) / pixelRatio, (pattern_br_b.y - pattern_tl_b.y) / pixelRatio);
+ 
+     const vec2 position2 = in_position.xy;
+-    gl_Position = projectTile(in_position, projectionVector.projection_ubo[constant.ubo_index]);
++    gl_Position = projectTile(in_position, in_position, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+ 
+     frag_pos_a = get_pattern_pos(drawable.pixel_coord_upper, drawable.pixel_coord_lower, fromScale * display_size_a, tileZoomRatio, position2),
+@@ -746,8 +746,8 @@ void main() {
+     // of this vertex.
+     mediump vec2 dist = outset * a_extrude * LINE_NORMAL_SCALE;
+ 
+-    vec4 projected_extrude = drawable.matrix * vec4(dist / drawable.ratio, 0.0, 0.0);
+-    gl_Position = projectTile(pos, projectionVector.projection_ubo[constant.ubo_index]) + projected_extrude;
++    vec4 projected_extrude = projectionVector.projection_ubo[constant.ubo_index].fallback_matrix * vec4(dist / drawable.ratio, 0.0, 0.0);
++    gl_Position = projectTile(pos, pos, projectionVector.projection_ubo[constant.ubo_index]) + projected_extrude;
+     applySurfaceTransform();
+ 
+     // calculate how much the perspective view squishes or stretches the extrude
+diff --git a/include/mln/util/subdivision.hpp b/include/mln/util/subdivision.hpp
+new file mode 100644
+index 000000000000..a23dbc91f60d
+--- /dev/null
++++ b/include/mln/util/subdivision.hpp
+@@ -0,0 +1,52 @@
++#pragma once
++
++#include <mln/tile/tile_id.hpp>
++#include <mln/tile/geometry_tile_data.hpp>
++
++#include <cstdint>
++#include <vector>
++
++namespace mln {
++namespace util {
++
++/// Pole vertices carry these Y coordinates; the globe vertex shader maps them to the poles.
++constexpr int16_t NORTH_POLE_Y = -32768;
++constexpr int16_t SOUTH_POLE_Y = 32767;
++
++struct SubdivisionResult {
++    /// Flattened `x, y, x, y, ...` positions; every index below refers into this buffer.
++    std::vector<int16_t> vertices;
++    std::vector<uint32_t> triangleIndices;
++    /// One line list per input ring, as index pairs.
++    std::vector<std::vector<uint32_t>> lineIndexLists;
++};
++
++/// Triangulates a polygon and splits the triangles on a grid of `granularity` cells per axis. Port of GL JS
++/// `render/subdivision.ts`: earcut, then a scanline pass per cell row, then pole quads on the pole tiles and
++/// removal of geometry outside the tile on zoom 0. Output triangles are counter-clockwise in tile space.
++SubdivisionResult subdividePolygon(const GeometryCollection& polygon,
++                                   const CanonicalTileID& canonical,
++                                   uint32_t granularity,
++                                   bool generateOutlineLines = true);
++
++/// `subdividePolygon` at the finest granularity whose result fits in `maxVertices` (the 16-bit index space of a
++/// segment), halving from `granularity` down to 2. A polygon that cannot fit even unsubdivided comes back as is.
++SubdivisionResult subdividePolygonWithinLimit(const GeometryCollection& polygon,
++                                              const CanonicalTileID& canonical,
++                                              uint32_t granularity,
++                                              bool generateOutlineLines,
++                                              std::size_t maxVertices);
++
++/// Inserts a vertex wherever the line crosses a cell boundary; `isRing` closes the line first.
++GeometryCoordinates subdivideVertexLine(const GeometryCoordinates& line, uint32_t granularity, bool isRing = false);
++
++/// Reorders every triangle to counter-clockwise winding in tile space.
++std::vector<uint32_t> fixWindingOrder(const std::vector<int16_t>& vertices, const std::vector<uint32_t>& indices);
++
++/// Triangulates an ordered convex ring of vertex indices by walking outward from its leftmost vertex.
++void scanlineTriangulateVertexRing(const std::vector<int16_t>& vertices,
++                                   const std::vector<uint32_t>& ring,
++                                   std::vector<uint32_t>& outIndices);
++
++} // namespace util
++} // namespace mln
+diff --git a/include/mln/util/subdivision_granularity.hpp b/include/mln/util/subdivision_granularity.hpp
+new file mode 100644
+index 000000000000..4f5b51ff1f27
+--- /dev/null
++++ b/include/mln/util/subdivision_granularity.hpp
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <algorithm>
++#include <cassert>
++#include <cstdint>
++
++namespace mln {
++
++/// How finely tile geometry is split so the vertex shader can bend it onto the globe; port of GL JS
++/// `subdivision_granularity_settings.ts`.
++class SubdivisionGranularityExpression {
++public:
++    constexpr SubdivisionGranularityExpression(uint32_t baseZoomGranularity_, uint32_t minGranularity_)
++        : baseZoomGranularity(baseZoomGranularity_),
++          minGranularity(minGranularity_) {
++        assert(minGranularity <= baseZoomGranularity || baseZoomGranularity == 0);
++    }
++
++    /// The base granularity halves with every zoom level, down to the minimum and never below 1.
++    uint32_t getGranularityForZoomLevel(uint8_t zoom) const {
++        return std::max({zoom < 32 ? baseZoomGranularity >> zoom : 0u, minGranularity, 1u});
++    }
++
++    bool operator==(const SubdivisionGranularityExpression&) const = default;
++
++private:
++    uint32_t baseZoomGranularity;
++    uint32_t minGranularity;
++};
++
++struct SubdivisionGranularitySetting {
++    SubdivisionGranularityExpression fill{0, 0};
++    SubdivisionGranularityExpression line{0, 0};
++    SubdivisionGranularityExpression tile{0, 0};
++    SubdivisionGranularityExpression stencil{0, 0};
++    /// Circle vertices per axis: 1, 3, 5 or 7.
++    uint8_t circle = 1;
++
++    bool operator==(const SubdivisionGranularitySetting&) const = default;
++
++    static constexpr SubdivisionGranularitySetting none() { return {}; }
++
++    /// GL JS's globe values.
++    static constexpr SubdivisionGranularitySetting globe() {
++        return {.fill = {128, 2}, .line = {512, 0}, .tile = {128, 32}, .stencil = {128, 1}, .circle = 3};
++    }
++};
++
++} // namespace mln
+diff --git a/include/mln/util/tile_mesh.hpp b/include/mln/util/tile_mesh.hpp
+new file mode 100644
+index 000000000000..c0de0eef314b
+--- /dev/null
++++ b/include/mln/util/tile_mesh.hpp
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++namespace mln {
++namespace util {
++
++struct TileMeshOptions {
++    /// Quads per axis; 1 is the plain tile quad.
++    uint32_t granularity = 1;
++    /// Adds a ring of quads `EXTENT / 128` units outside the tile, for stencil masks.
++    bool generateBorders = false;
++    /// Replaces the north border with geometry reaching the north pole vertex.
++    bool extendToNorthPole = false;
++    bool extendToSouthPole = false;
++
++    bool operator==(const TileMeshOptions&) const = default;
++};
++
++struct TileMesh {
++    /// Flattened `x, y` pairs in tile units.
++    std::vector<int16_t> vertices;
++    std::vector<uint16_t> indices;
++};
++
++/// A grid mesh covering one tile, optionally with borders and pole caps; port of GL JS `util/create_tile_mesh.ts`.
++/// Triangles are counter-clockwise in tile space.
++TileMesh createTileMesh(const TileMeshOptions&);
++
++} // namespace util
++} // namespace mln
+diff --git a/src/mln/gfx/fill_generator.cpp b/src/mln/gfx/fill_generator.cpp
+index 4a890cd1a7b6..a0375ad6bbb9 100644
+--- a/src/mln/gfx/fill_generator.cpp
++++ b/src/mln/gfx/fill_generator.cpp
+@@ -1,5 +1,6 @@
+ #include <mln/gfx/fill_generator.hpp>
+ #include <mln/gfx/polyline_generator.hpp>
++#include <mln/util/subdivision.hpp>
+ 
+ #ifdef _MSC_VER
+ #pragma warning(push)
+@@ -104,6 +105,42 @@ void addOutlineIndices(const std::size_t base,
+     lineSegment.indexLength += nVertices * 2;
+ }
+ 
++void addSubdividedPolygon(const util::SubdivisionResult& subdivided,
++                          gfx::VertexVector<FillLayoutVertex>& fillVertices,
++                          gfx::IndexVector<gfx::Triangles>& fillIndexes,
++                          SegmentVector& fillSegments,
++                          gfx::IndexVector<gfx::Lines>& lineIndexes,
++                          SegmentVector& lineSegments) {
++    const std::size_t totalVertices = subdivided.vertices.size() / 2;
++    if (totalVertices > maxSegmentVertices) {
++        throw GeometryTooLongException();
++    }
++    const std::size_t startVertices = fillVertices.elements();
++    for (std::size_t i = 0; i < totalVertices; i++) {
++        fillVertices.emplace_back(
++            FillBucket::layoutVertex({subdivided.vertices[i * 2], subdivided.vertices[i * 2 + 1]}));
++    }
++    addFillIndices(fillSegments, fillIndexes, subdivided.triangleIndices, startVertices, totalVertices);
++
++    for (const auto& line : subdivided.lineIndexLists) {
++        if (line.empty()) {
++            continue;
++        }
++        if (lineSegments.empty() || lineSegments.back().vertexLength + totalVertices > maxSegmentVertices) {
++            lineSegments.emplace_back(startVertices, lineIndexes.elements());
++        }
++        auto& lineSegment = lineSegments.back();
++        const auto base = static_cast<uint16_t>(lineSegment.vertexLength);
++        for (std::size_t i = 0; i + 1 < line.size(); i += 2) {
++            lineIndexes.emplace_back(static_cast<uint16_t>(base + line[i]), static_cast<uint16_t>(base + line[i + 1]));
++        }
++        lineSegment.indexLength += line.size();
++    }
++    if (!lineSegments.empty()) {
++        lineSegments.back().vertexLength += totalVertices;
++    }
++}
++
+ } // namespace
+ 
+ void generateFillBuffers(const GeometryCollection& geometry,
+@@ -131,11 +168,27 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
+                                   gfx::IndexVector<gfx::Triangles>& fillIndexes,
+                                   SegmentVector& fillSegments,
+                                   gfx::IndexVector<gfx::Lines>& lineIndexes,
+-                                  SegmentVector& lineSegments) {
++                                  SegmentVector& lineSegments,
++                                  const CanonicalTileID& canonical,
++                                  uint32_t subdivisionGranularity) {
+     for (auto& polygon : classifyRings(geometry)) {
+         // Optimize polygons with many interior rings for earcut tessellation.
+         limitHoles(polygon, 500);
+ 
++        if (subdivisionGranularity >= 2) {
++            addSubdividedPolygon(util::subdividePolygonWithinLimit(polygon,
++                                                                   canonical,
++                                                                   subdivisionGranularity,
++                                                                   /*generateOutlineLines=*/true,
++                                                                   maxSegmentVertices),
++                                 vertices,
++                                 fillIndexes,
++                                 fillSegments,
++                                 lineIndexes,
++                                 lineSegments);
++            continue;
++        }
++
+         std::size_t totalVertices = totalVerticesCheck(polygon);
+         std::size_t startVertices = vertices.elements();
+ 
+@@ -195,7 +248,9 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
+                                   gfx::IndexVector<gfx::Triangles>& lineIndexes,
+                                   SegmentVector& lineSegments,
+                                   gfx::IndexVector<gfx::Lines>& basicLineIndexes,
+-                                  SegmentVector& basicLineSegments) {
++                                  SegmentVector& basicLineSegments,
++                                  const CanonicalTileID& canonical,
++                                  uint32_t subdivisionGranularity) {
+     gfx::PolylineGenerator<LineLayoutVertex, SegmentBase> lineGenerator(
+         lineVertices,
+         LineBucket::layoutVertex,
+@@ -226,6 +281,24 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
+         // Optimize polygons with many interior rings for earcut tessellation.
+         limitHoles(polygon, 500);
+ 
++        if (subdivisionGranularity >= 2) {
++            for (const auto& ring : polygon) {
++                lineGenerator.generate(util::subdivideVertexLine(ring, subdivisionGranularity, /*isRing=*/true),
++                                       lineOptions);
++            }
++            addSubdividedPolygon(util::subdividePolygonWithinLimit(polygon,
++                                                                   canonical,
++                                                                   subdivisionGranularity,
++                                                                   /*generateOutlineLines=*/true,
++                                                                   maxSegmentVertices),
++                                 fillVertices,
++                                 fillIndexes,
++                                 fillSegments,
++                                 basicLineIndexes,
++                                 basicLineSegments);
++            continue;
++        }
++
+         const std::size_t totalVertices = totalVerticesCheck(polygon);
+         const std::size_t startVertices = fillVertices.elements();
+ 
+diff --git a/src/mln/layout/pattern_layout.hpp b/src/mln/layout/pattern_layout.hpp
+index f348d6c4059c..5fe0367fea7b 100644
+--- a/src/mln/layout/pattern_layout.hpp
++++ b/src/mln/layout/pattern_layout.hpp
+@@ -98,6 +98,7 @@ public:
+         : sourceLayer(std::move(sourceLayer_)),
+           zoom(parameters.tileID.overscaledZ),
+           overscaling(parameters.tileID.overscaleFactor()),
++          subdivisionGranularity(parameters.subdivisionGranularity),
+           hasPattern(false) {
+         assert(!group.empty());
+         auto leaderLayerProperties = staticImmutableCast<LayerPropertiesType>(group.front());
+@@ -188,6 +189,9 @@ public:
+                       const bool /*showCollisionBoxes*/,
+                       const CanonicalTileID& canonical) override {
+         auto bucket = std::make_shared<BucketType>(layout, layerPropertiesMap, zoom, overscaling);
++        if constexpr (requires(BucketType& b) { b.setSubdivisionGranularity(subdivisionGranularity); }) {
++            bucket->setSubdivisionGranularity(subdivisionGranularity);
++        }
+         for (auto& patternFeature : features) {
+             const auto i = patternFeature.i;
+             std::unique_ptr<GeometryTileFeature> feature = std::move(patternFeature.feature);
+@@ -214,6 +218,7 @@ protected:
+ 
+     const float zoom;
+     const uint32_t overscaling;
++    const SubdivisionGranularitySetting subdivisionGranularity;
+     std::string sourceLayerID;
+     bool hasPattern;
+ };
+diff --git a/src/mln/renderer/bucket_parameters.hpp b/src/mln/renderer/bucket_parameters.hpp
+index 3adca03ffd72..0fef64f2f567 100644
+--- a/src/mln/renderer/bucket_parameters.hpp
++++ b/src/mln/renderer/bucket_parameters.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <mln/map/mode.hpp>
+ #include <mln/tile/tile_id.hpp>
++#include <mln/util/subdivision_granularity.hpp>
+ 
+ namespace mln {
+ namespace style {
+@@ -14,6 +15,7 @@ public:
+     const MapMode mode;
+     const float pixelRatio;
+     const style::LayerTypeInfo* layerType;
++    const SubdivisionGranularitySetting subdivisionGranularity{};
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/renderer/buckets/fill_bucket.cpp b/src/mln/renderer/buckets/fill_bucket.cpp
+index 0d71a2a85e16..edb06548bf42 100644
+--- a/src/mln/renderer/buckets/fill_bucket.cpp
++++ b/src/mln/renderer/buckets/fill_bucket.cpp
+@@ -40,7 +40,9 @@ void FillBucket::addFeature(const GeometryTileFeature& feature,
+                                       lineIndexes,
+                                       lineSegments,
+                                       basicLines,
+-                                      basicLineSegments);
++                                      basicLineSegments,
++                                      canonical,
++                                      subdivisionGranularity.fill.getGranularityForZoomLevel(canonical.z));
+ 
+     for (auto& pair : paintPropertyBinders) {
+         const auto it = patternDependencies.find(pair.first);
+@@ -60,7 +62,14 @@ void FillBucket::addFeature(const GeometryTileFeature& feature,
+                             std::size_t index,
+                             const CanonicalTileID& canonical) {
+     // generate buffers
+-    gfx::generateFillAndOutineBuffers(geometry, vertices, triangles, triangleSegments, basicLines, basicLineSegments);
++    gfx::generateFillAndOutineBuffers(geometry,
++                                      vertices,
++                                      triangles,
++                                      triangleSegments,
++                                      basicLines,
++                                      basicLineSegments,
++                                      canonical,
++                                      subdivisionGranularity.fill.getGranularityForZoomLevel(canonical.z));
+ 
+     for (auto& pair : paintPropertyBinders) {
+         const auto it = patternDependencies.find(pair.first);
+diff --git a/src/mln/renderer/buckets/fill_bucket.hpp b/src/mln/renderer/buckets/fill_bucket.hpp
+index adb1736ea5ba..ccddc8451d1a 100644
+--- a/src/mln/renderer/buckets/fill_bucket.hpp
++++ b/src/mln/renderer/buckets/fill_bucket.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/renderer/bucket.hpp>
++#include <mln/util/subdivision_granularity.hpp>
+ #include <mln/renderer/paint_property_binder.hpp>
+ #include <mln/tile/geometry_tile_data.hpp>
+ #include <mln/gfx/vertex_buffer.hpp>
+@@ -30,6 +31,8 @@ using FillLayoutVertex = gfx::Vertex<TypeList<attributes::pos>>;
+ class FillBucket final : public Bucket {
+ public:
+     ~FillBucket() override;
++
++    void setSubdivisionGranularity(const SubdivisionGranularitySetting& value) { subdivisionGranularity = value; }
+     using PossiblyEvaluatedLayoutProperties = style::FillLayoutProperties::PossiblyEvaluated;
+ 
+     FillBucket(const PossiblyEvaluatedLayoutProperties& layout,
+@@ -82,6 +85,8 @@ public:
+ 
+     SegmentVector triangleSegments;
+ 
++    SubdivisionGranularitySetting subdivisionGranularity;
++
+     std::map<std::string, FillBinders> paintPropertyBinders;
+ };
+ 
+diff --git a/src/mln/renderer/buckets/line_bucket.cpp b/src/mln/renderer/buckets/line_bucket.cpp
+index edb9a2dbbc43..f041e1bb8dd8 100644
+--- a/src/mln/renderer/buckets/line_bucket.cpp
++++ b/src/mln/renderer/buckets/line_bucket.cpp
+@@ -1,4 +1,5 @@
+ #include <mln/renderer/buckets/line_bucket.hpp>
++#include <mln/util/subdivision.hpp>
+ #include <mln/renderer/bucket_parameters.hpp>
+ #include <mln/style/layers/line_layer_impl.hpp>
+ #include <mln/util/math.hpp>
+@@ -51,13 +52,19 @@ void LineBucket::addFeature(const GeometryTileFeature& feature,
+     }
+ }
+ 
+-void LineBucket::addGeometry(const GeometryCoordinates& coordinates,
++void LineBucket::addGeometry(const GeometryCoordinates& inputCoordinates,
+                              const GeometryTileFeature& feature,
+                              const CanonicalTileID& canonical) {
+     // Ignore empty coordinates.
+-    if (coordinates.empty()) {
++    if (inputCoordinates.empty()) {
+         return;
+     }
++    const uint32_t granularity = subdivisionGranularity.line.getGranularityForZoomLevel(canonical.z);
++    GeometryCoordinates subdivided;
++    if (granularity >= 2) {
++        subdivided = util::subdivideVertexLine(inputCoordinates, granularity);
++    }
++    const GeometryCoordinates& coordinates = granularity >= 2 ? subdivided : inputCoordinates;
+     gfx::PolylineGenerator<LineLayoutVertex, SegmentBase> generator(
+         vertices,
+         LineBucket::layoutVertex,
+diff --git a/src/mln/renderer/buckets/line_bucket.hpp b/src/mln/renderer/buckets/line_bucket.hpp
+index 06eaccc326cd..f6030970cf95 100644
+--- a/src/mln/renderer/buckets/line_bucket.hpp
++++ b/src/mln/renderer/buckets/line_bucket.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <mln/renderer/bucket.hpp>
++#include <mln/util/subdivision_granularity.hpp>
+ #include <mln/renderer/paint_property_binder.hpp>
+ #include <mln/tile/geometry_tile_data.hpp>
+ #include <mln/gfx/vertex_buffer.hpp>
+@@ -26,6 +27,8 @@ public:
+                uint32_t overscaling);
+     ~LineBucket() override;
+ 
++    void setSubdivisionGranularity(const SubdivisionGranularitySetting& value) { subdivisionGranularity = value; }
++
+     void addFeature(const GeometryTileFeature&,
+                     const GeometryCollection&,
+                     const mln::ImagePositions& patternPositions,
+@@ -100,6 +103,7 @@ private:
+ 
+     const float zoom;
+     const uint32_t overscaling;
++    SubdivisionGranularitySetting subdivisionGranularity;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/renderer/globe_tile_mesh.hpp b/src/mln/renderer/globe_tile_mesh.hpp
+new file mode 100644
+index 000000000000..56853f7d4eb3
+--- /dev/null
++++ b/src/mln/renderer/globe_tile_mesh.hpp
+@@ -0,0 +1,71 @@
++#pragma once
++
++#include <mln/gfx/index_vector.hpp>
++#include <mln/gfx/vertex_vector.hpp>
++#include <mln/renderer/render_static_data.hpp>
++#include <mln/tile/tile_id.hpp>
++#include <mln/util/constants.hpp>
++#include <mln/util/subdivision_granularity.hpp>
++#include <mln/util/tile_mesh.hpp>
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <vector>
++
++namespace mln {
++
++/// The pole-capped globe grid for a tile, as position + texture-position vertices; texture positions stay inside
++/// the tile so the pole rows sample the tile's edge. `layoutVertex(Point<int16_t>, Point<uint16_t>)` is the bucket's.
++template <typename Vertex, typename LayoutVertexFn>
++struct GlobeTileMesh {
++    std::shared_ptr<gfx::VertexVector<Vertex>> vertices;
++    std::shared_ptr<gfx::IndexVector<gfx::Triangles>> indices;
++    SegmentVector segments;
++
++    GlobeTileMesh(const CanonicalTileID& canonical, LayoutVertexFn layoutVertex)
++        : vertices(std::make_shared<gfx::VertexVector<Vertex>>()),
++          indices(std::make_shared<gfx::IndexVector<gfx::Triangles>>()) {
++        const util::TileMesh mesh = util::createTileMesh(
++            {.granularity = SubdivisionGranularitySetting::globe().tile.getGranularityForZoomLevel(canonical.z),
++             .generateBorders = false,
++             .extendToNorthPole = canonical.y == 0,
++             .extendToSouthPole = canonical.y == (1u << canonical.z) - 1});
++        for (std::size_t i = 0; i + 1 < mesh.vertices.size(); i += 2) {
++            const Point<int16_t> position{mesh.vertices[i], mesh.vertices[i + 1]};
++            const Point<uint16_t> texture{static_cast<uint16_t>(std::clamp<int32_t>(position.x, 0, util::EXTENT)),
++                                          static_cast<uint16_t>(std::clamp<int32_t>(position.y, 0, util::EXTENT))};
++            vertices->emplace_back(layoutVertex(position, texture));
++        }
++        for (std::size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
++            indices->emplace_back(mesh.indices[i], mesh.indices[i + 1], mesh.indices[i + 2]);
++        }
++        segments.emplace_back(0, 0, vertices->elements(), indices->elements());
++    }
++};
++
++/// The same grid as raw `Short2` positions, for drawables built from raw vertex bytes.
++struct RawGlobeTileMesh {
++    std::vector<std::uint8_t> vertices;
++    std::size_t vertexCount = 0;
++    std::vector<uint16_t> indices;
++    SegmentVector segments;
++};
++
++inline RawGlobeTileMesh rawGlobeTileMesh(const CanonicalTileID& canonical, bool generateBorders) {
++    const util::TileMesh mesh = util::createTileMesh(
++        {.granularity = SubdivisionGranularitySetting::globe().tile.getGranularityForZoomLevel(canonical.z),
++         .generateBorders = generateBorders,
++         .extendToNorthPole = canonical.y == 0,
++         .extendToSouthPole = canonical.y == (1u << canonical.z) - 1});
++    RawGlobeTileMesh raw;
++    raw.vertices.resize(mesh.vertices.size() * sizeof(int16_t));
++    std::memcpy(raw.vertices.data(), mesh.vertices.data(), raw.vertices.size());
++    raw.vertexCount = mesh.vertices.size() / 2;
++    raw.indices.assign(mesh.indices.begin(), mesh.indices.end());
++    raw.segments.emplace_back(0, 0, raw.vertexCount, raw.indices.size());
++    return raw;
++}
++
++} // namespace mln
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index f6a5cb12a668..f724664f17b4 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -401,7 +401,9 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
+ 
+             // Handle layers without source.
+             if (layerIsVisible && zoomFitsLayer && sourceImpl.get() == sourceImpls->at(0).get()) {
+-                if (backgroundLayerAsColor && layer.baseImpl == layerImpls->front()) {
++                // On the globe the background is a sphere mesh, not the backdrop, so it stays a layer.
++                if (backgroundLayerAsColor && !updateParameters->transformState.isGlobeRendering() &&
++                    layer.baseImpl == layerImpls->front()) {
+                     const auto& solidBackground = layer.getSolidBackground();
+                     if (solidBackground) {
+                         renderTreeParameters->backgroundColor = *solidBackground;
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+index 0c0f427c6584..b6c6aee30587 100644
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -389,12 +389,23 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+         parameters.depthRangeSize = 1 - (orchestrator.numLayerGroups() + 2) * PaintParameters::numSublayers *
+                                             PaintParameters::depthEpsilon;
+ 
+-        // draw layer groups, opaque pass
+-        parameters.currentLayer = 0;
+-        orchestrator.visitLayerGroupsReversed([&](LayerGroupBase& layerGroup) {
+-            layerGroup.render(orchestrator, parameters);
+-            parameters.currentLayer++;
+-        });
++        // draw layer groups, opaque pass: front to back with the depth buffer, except on the globe,
++        // where 2D layers carry no depth and are painted bottom to top.
++        if (renderTreeParameters.transformParams.state.isGlobeRendering()) {
++            parameters.currentLayer = static_cast<uint32_t>(orchestrator.numLayerGroups()) - 1;
++            orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) {
++                layerGroup.render(orchestrator, parameters);
++                if (parameters.currentLayer > 0) {
++                    parameters.currentLayer--;
++                }
++            });
++        } else {
++            parameters.currentLayer = 0;
++            orchestrator.visitLayerGroupsReversed([&](LayerGroupBase& layerGroup) {
++                layerGroup.render(orchestrator, parameters);
++                parameters.currentLayer++;
++            });
++        }
+     };
+ 
+     const auto drawableTranslucentPass = [&] {
+diff --git a/src/mln/renderer/tile_pyramid.cpp b/src/mln/renderer/tile_pyramid.cpp
+index 41e899dfd2a9..fd29d007dce4 100644
+--- a/src/mln/renderer/tile_pyramid.cpp
++++ b/src/mln/renderer/tile_pyramid.cpp
+@@ -55,13 +55,19 @@ const Tile* TilePyramid::getRenderedTile(const UnwrappedTileID& tileID) const {
+ 
+ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& layers,
+                          const bool needsRendering,
+-                         const bool needsRelayout,
++                         const bool needsRelayoutForLayers,
+                          const TileParameters& parameters,
+                          const style::Source::Impl& sourceImpl,
+                          const uint16_t tileSize,
+                          const Range<uint8_t> zoomRange,
+                          std::optional<LatLngBounds> bounds,
+                          std::function<std::unique_ptr<Tile>(const OverscaledTileID&, TileObserver*)> createTile) {
++    const bool globeRendering = parameters.transformState.isGlobeRendering();
++    const auto subdivisionGranularity = globeRendering ? SubdivisionGranularitySetting::globe()
++                                                       : SubdivisionGranularitySetting::none();
++    const bool needsRelayout = needsRelayoutForLayers || globeRendering != lastGlobeRendering;
++    lastGlobeRendering = globeRendering;
++
+     // If we need a relayout, abandon any cached tiles; they're now stale.
+     if (needsRelayout) {
+         cache.clear();
+@@ -164,6 +170,7 @@ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& l
+         }
+ 
+         if (needsRelayout) {
++            tile.setSubdivisionGranularity(subdivisionGranularity);
+             tile.setLayers(layers);
+         }
+     };
+@@ -190,6 +197,7 @@ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& l
+         if (!tile) {
+             tile = createTile(tileID, observer);
+             if (!tile) return nullptr;
++            tile->setSubdivisionGranularity(subdivisionGranularity);
+             tile->setLayers(layers);
+         }
+ 
+diff --git a/src/mln/renderer/tile_pyramid.hpp b/src/mln/renderer/tile_pyramid.hpp
+index 0f0a92362c9a..e906c3897f26 100644
+--- a/src/mln/renderer/tile_pyramid.hpp
++++ b/src/mln/renderer/tile_pyramid.hpp
+@@ -77,6 +77,7 @@ private:
+ 
+     std::map<OverscaledTileID, std::unique_ptr<Tile>> tiles;
+     TileCache cache;
++    bool lastGlobeRendering = false;
+ 
+     std::map<UnwrappedTileID, std::reference_wrapper<Tile>> renderedTiles; // Sorted by tile id.
+     TileObserver* observer = nullptr;
+diff --git a/src/mln/shaders/segment.hpp b/src/mln/shaders/segment.hpp
+index cfd36102ad1c..879eb9b8bb34 100644
+--- a/src/mln/shaders/segment.hpp
++++ b/src/mln/shaders/segment.hpp
+@@ -3,6 +3,8 @@
+ #include <mln/gfx/draw_scope.hpp>
+ 
+ #include <cstddef>
++#include <cstdint>
++#include <limits>
+ #include <vector>
+ #include <map>
+ #include <string>
+@@ -56,4 +58,7 @@ public:
+ 
+ using SegmentVector = std::vector<SegmentBase>;
+ 
++/// A segment's vertices are addressed by 16-bit indices.
++constexpr std::size_t maxSegmentVertices = std::numeric_limits<uint16_t>::max();
++
+ } // namespace mln
+diff --git a/src/mln/tile/geometry_tile.cpp b/src/mln/tile/geometry_tile.cpp
+index 1909c3afaa72..cc800ce3530c 100644
+--- a/src/mln/tile/geometry_tile.cpp
++++ b/src/mln/tile/geometry_tile.cpp
+@@ -336,6 +336,16 @@ void GeometryTile::setShowCollisionBoxes(const bool showCollisionBoxes_) {
+     }
+ }
+ 
++void GeometryTile::setSubdivisionGranularity(const SubdivisionGranularitySetting& subdivisionGranularity_) {
++    MLN_TRACE_FUNC();
++
++    if (subdivisionGranularity != subdivisionGranularity_) {
++        subdivisionGranularity = subdivisionGranularity_;
++        ++correlationID;
++        worker.self().invoke(&GeometryTileWorker::setSubdivisionGranularity, subdivisionGranularity, correlationID);
++    }
++}
++
+ void GeometryTile::onLayout(std::shared_ptr<LayoutResult>&& result, const uint64_t resultCorrelationID) {
+     MLN_TRACE_FUNC();
+ 
+diff --git a/src/mln/tile/geometry_tile.hpp b/src/mln/tile/geometry_tile.hpp
+index 92ada761ae86..8cc0dedfa445 100644
+--- a/src/mln/tile/geometry_tile.hpp
++++ b/src/mln/tile/geometry_tile.hpp
+@@ -43,6 +43,7 @@ public:
+     std::unique_ptr<TileRenderData> createRenderData() override;
+     void setLayers(const std::vector<Immutable<style::LayerProperties>>&) override;
+     void setShowCollisionBoxes(bool showCollisionBoxes) override;
++    void setSubdivisionGranularity(const SubdivisionGranularitySetting&) override;
+ 
+     void onGlyphsAvailable(GlyphMap, HBShapeRequests) override;
+     void onImagesAvailable(ImageMap, ImageMap, ImageVersionMap versionMap, uint64_t imageCorrelationID) override;
+@@ -130,6 +131,7 @@ private:
+     const MapMode mode;
+ 
+     bool showCollisionBoxes;
++    SubdivisionGranularitySetting subdivisionGranularity;
+ 
+     enum class FadeState {
+         Loaded,
+diff --git a/src/mln/tile/geometry_tile_worker.cpp b/src/mln/tile/geometry_tile_worker.cpp
+index 459142dd2864..cb9ab5b8b1ea 100644
+--- a/src/mln/tile/geometry_tile_worker.cpp
++++ b/src/mln/tile/geometry_tile_worker.cpp
+@@ -235,6 +235,33 @@ void GeometryTileWorker::setShowCollisionBoxes(bool showCollisionBoxes_, uint64_
+     }
+ }
+ 
++void GeometryTileWorker::setSubdivisionGranularity(const SubdivisionGranularitySetting& subdivisionGranularity_,
++                                                   uint64_t correlationID_) {
++    MLN_TRACE_FUNC();
++
++    try {
++        subdivisionGranularity = subdivisionGranularity_;
++        correlationID = correlationID_;
++
++        switch (state) {
++            case Idle:
++                parse();
++                coalesce();
++                break;
++
++            case Coalescing:
++            case NeedsSymbolLayout:
++                state = NeedsParse;
++                break;
++
++            case NeedsParse:
++                break;
++        }
++    } catch (...) {
++        parent.invoke(&GeometryTile::onError, std::current_exception(), correlationID);
++    }
++}
++
+ void GeometryTileWorker::symbolDependenciesChanged() {
+     MLN_TRACE_FUNC();
+ 
+@@ -456,8 +483,11 @@ void GeometryTileWorker::parse() {
+         }
+ 
+         const style::Layer::Impl& leaderImpl = *(group.at(0)->baseImpl);
+-        BucketParameters parameters{
+-            .tileID = id, .mode = mode, .pixelRatio = pixelRatio, .layerType = leaderImpl.getTypeInfo()};
++        BucketParameters parameters{.tileID = id,
++                                    .mode = mode,
++                                    .pixelRatio = pixelRatio,
++                                    .layerType = leaderImpl.getTypeInfo(),
++                                    .subdivisionGranularity = subdivisionGranularity};
+ 
+         auto geometryLayer = (*data)->getLayer(leaderImpl.sourceLayer);
+         if (!geometryLayer) {
+diff --git a/src/mln/tile/geometry_tile_worker.hpp b/src/mln/tile/geometry_tile_worker.hpp
+index 67172512e875..803b8bd57f08 100644
+--- a/src/mln/tile/geometry_tile_worker.hpp
++++ b/src/mln/tile/geometry_tile_worker.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <mln/map/mode.hpp>
+ #include <mln/tile/tile_id.hpp>
++#include <mln/util/subdivision_granularity.hpp>
+ #include <mln/style/image_impl.hpp>
+ #include <mln/text/glyph.hpp>
+ #include <mln/text/glyph_manager.hpp>
+@@ -58,6 +59,7 @@ public:
+                  uint64_t correlationID);
+     void reset(uint64_t correlationID_);
+     void setShowCollisionBoxes(bool showCollisionBoxes_, uint64_t correlationID_);
++    void setSubdivisionGranularity(const SubdivisionGranularitySetting&, uint64_t correlationID_);
+ 
+     void onGlyphsAvailable(GlyphMap glyphs, HBShapeResults requests);
+ 
+@@ -121,6 +123,7 @@ private:
+     std::set<std::string> availableImages;
+ 
+     bool showCollisionBoxes;
++    SubdivisionGranularitySetting subdivisionGranularity;
+     bool firstLoad = true;
+ 
+     gfx::DynamicTextureAtlasPtr dynamicTextureAtlas;
+diff --git a/src/mln/tile/tile.hpp b/src/mln/tile/tile.hpp
+index 13615273b175..dba4ade1de0f 100644
+--- a/src/mln/tile/tile.hpp
++++ b/src/mln/tile/tile.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <mln/util/subdivision_granularity.hpp>
+ #include <mln/util/noncopyable.hpp>
+ #include <mln/util/chrono.hpp>
+ #include <mln/util/feature.hpp>
+@@ -80,6 +81,7 @@ public:
+     // tile (and i.e. it was successfully updated); returns `false` otherwise.
+     virtual bool layerPropertiesUpdated(const Immutable<style::LayerProperties>& layerProperties) = 0;
+     virtual void setShowCollisionBoxes(const bool) {}
++    virtual void setSubdivisionGranularity(const SubdivisionGranularitySetting&) {}
+     virtual void setLayers(const std::vector<Immutable<style::LayerProperties>>&) {}
+     virtual void setMask(TileMask&&) {}
+ 
+diff --git a/src/mln/util/subdivision.cpp b/src/mln/util/subdivision.cpp
+new file mode 100644
+index 000000000000..413bc7eb35e9
+--- /dev/null
++++ b/src/mln/util/subdivision.cpp
+@@ -0,0 +1,594 @@
++#include <mln/util/subdivision.hpp>
++#include <mln/util/constants.hpp>
++
++#ifdef _MSC_VER
++#pragma warning(push)
++#pragma warning(disable : 4244)
++#endif
++
++#include <mapbox/earcut.hpp>
++
++#ifdef _MSC_VER
++#pragma warning(pop)
++#endif
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <limits>
++#include <stdexcept>
++#include <unordered_map>
++
++namespace mapbox {
++namespace util {
++template <>
++struct nth<0, mln::GeometryCoordinate> {
++    static int64_t get(const mln::GeometryCoordinate& t) { return t.x; };
++};
++template <>
++struct nth<1, mln::GeometryCoordinate> {
++    static int64_t get(const mln::GeometryCoordinate& t) { return t.y; };
++};
++} // namespace util
++} // namespace mapbox
++
++namespace mln {
++namespace util {
++
++namespace {
++
++class Subdivider {
++public:
++    Subdivider(uint32_t granularity_, const CanonicalTileID& canonical_)
++        : canonical(canonical_),
++          granularity(granularity_),
++          cellSize(static_cast<double>(EXTENT) / granularity_) {}
++
++    SubdivisionResult subdivide(const GeometryCollection& polygon, bool generateOutlineLines) {
++        std::vector<GeometryCoordinate> flattened;
++        for (const auto& ring : polygon) {
++            for (const auto& point : ring) {
++                flattened.push_back(point);
++                vertexToIndex(point.x, point.y);
++            }
++        }
++
++        std::vector<uint32_t> triangles = convertIndices(flattened, mapbox::earcut(polygon));
++        triangles = subdivideTrianglesScanline(triangles);
++
++        std::vector<std::vector<uint32_t>> lines;
++        if (generateOutlineLines) {
++            lines = generateOutline(polygon);
++        }
++
++        ensureNoPoleVertices();
++        handlePoles(triangles);
++
++        if (granularity >= 2 && canonical.z == 0) {
++            triangles = removeTrianglesOutsideTileX(triangles);
++            for (auto& line : lines) {
++                line = removeLinesOutsideTileX(line);
++            }
++        }
++
++        return {.vertices = std::move(vertices),
++                .triangleIndices = std::move(triangles),
++                .lineIndexLists = std::move(lines)};
++    }
++
++private:
++    static uint32_t key(int32_t x, int32_t y) {
++        return (static_cast<uint32_t>(x + 32768) << 16) | static_cast<uint32_t>(y + 32768);
++    }
++
++    uint32_t vertexToIndex(double x, double y) {
++        if (x < -32768 || y < -32768 || x > 32767 || y > 32767) {
++            throw std::out_of_range("Vertex coordinates are out of signed 16 bit integer range.");
++        }
++        const auto xInt = static_cast<int32_t>(std::lround(x));
++        const auto yInt = static_cast<int32_t>(std::lround(y));
++        const uint32_t k = key(xInt, yInt);
++        if (const auto it = dictionary.find(k); it != dictionary.end()) {
++            return it->second;
++        }
++        const auto index = static_cast<uint32_t>(vertices.size() / 2);
++        dictionary.emplace(k, index);
++        vertices.push_back(static_cast<int16_t>(xInt));
++        vertices.push_back(static_cast<int16_t>(yInt));
++        return index;
++    }
++
++    std::vector<uint32_t> convertIndices(const std::vector<GeometryCoordinate>& flattened,
++                                         const std::vector<uint32_t>& indices) {
++        std::vector<uint32_t> converted;
++        converted.reserve(indices.size());
++        for (const uint32_t index : indices) {
++            converted.push_back(vertexToIndex(flattened[index].x, flattened[index].y));
++        }
++        return converted;
++    }
++
++    std::vector<uint32_t> subdivideTrianglesScanline(const std::vector<uint32_t>& inputIndices) {
++        if (granularity < 2) {
++            return fixWindingOrder(vertices, inputIndices);
++        }
++
++        std::vector<uint32_t> finalIndices;
++        for (std::size_t primitive = 0; primitive + 2 < inputIndices.size(); primitive += 3) {
++            const std::array<uint32_t, 3> triangleIndices{
++                inputIndices[primitive], inputIndices[primitive + 1], inputIndices[primitive + 2]};
++            std::array<double, 6> triangle{};
++            double minX = std::numeric_limits<double>::infinity();
++            double minY = minX;
++            double maxX = -std::numeric_limits<double>::infinity();
++            double maxY = maxX;
++            for (std::size_t i = 0; i < 3; i++) {
++                triangle[i * 2] = vertices[triangleIndices[i] * 2];
++                triangle[i * 2 + 1] = vertices[triangleIndices[i] * 2 + 1];
++                minX = std::min(minX, triangle[i * 2]);
++                maxX = std::max(maxX, triangle[i * 2]);
++                minY = std::min(minY, triangle[i * 2 + 1]);
++                maxY = std::max(maxY, triangle[i * 2 + 1]);
++            }
++            if (minX == maxX || minY == maxY) {
++                continue;
++            }
++
++            const auto cellXmin = static_cast<int32_t>(std::floor(minX / cellSize));
++            const auto cellXmax = static_cast<int32_t>(std::ceil(maxX / cellSize));
++            const auto cellYmin = static_cast<int32_t>(std::floor(minY / cellSize));
++            const auto cellYmax = static_cast<int32_t>(std::ceil(maxY / cellSize));
++
++            if (cellXmin == cellXmax && cellYmin == cellYmax) {
++                finalIndices.insert(finalIndices.end(), triangleIndices.begin(), triangleIndices.end());
++                continue;
++            }
++
++            for (int32_t cellRow = cellYmin; cellRow < cellYmax; cellRow++) {
++                const std::vector<uint32_t> ring = generateVertexRingForCellRow(cellRow, triangle, triangleIndices);
++                scanlineTriangulateVertexRing(vertices, ring, finalIndices);
++            }
++        }
++        return finalIndices;
++    }
++
++    std::vector<uint32_t> generateVertexRingForCellRow(int32_t cellRow,
++                                                       const std::array<double, 6>& triangle,
++                                                       const std::array<uint32_t, 3>& triangleIndices) {
++        const double cellRowYTop = cellRow * cellSize;
++        const double cellRowYBottom = cellRowYTop + cellSize;
++        std::vector<uint32_t> ring;
++
++        for (std::size_t edge = 0; edge < 3; edge++) {
++            const double aX = triangle[edge * 2];
++            const double aY = triangle[edge * 2 + 1];
++            const double bX = triangle[((edge + 1) * 2) % 6];
++            const double bY = triangle[((edge + 1) * 2 + 1) % 6];
++            const double cX = triangle[((edge + 2) * 2) % 6];
++            const double cY = triangle[((edge + 2) * 2 + 1) % 6];
++            const double dirX = bX - aX;
++            const double dirY = bY - aY;
++            const bool isParallelY = dirX == 0;
++            const bool isParallelX = dirY == 0;
++
++            const double tTop = (cellRowYTop - aY) / dirY;
++            const double tBottom = (cellRowYBottom - aY) / dirY;
++            const double tEnter = std::min(tTop, tBottom);
++            const double tExit = std::max(tTop, tBottom);
++
++            if ((!isParallelX && (tEnter >= 1 || tExit <= 0)) ||
++                (isParallelX && (aY < cellRowYTop || aY > cellRowYBottom))) {
++                if (bY >= cellRowYTop && bY <= cellRowYBottom) {
++                    ring.push_back(triangleIndices[(edge + 1) % 3]);
++                }
++                continue;
++            }
++
++            if (!isParallelX && tEnter > 0) {
++                ring.push_back(vertexToIndex(aX + dirX * tEnter, aY + dirY * tEnter));
++            }
++
++            const double enterX = aX + dirX * std::max(tEnter, 0.0);
++            const double exitX = aX + dirX * std::min(tExit, 1.0);
++
++            if (!isParallelY) {
++                generateIntraEdgeVertices(ring, aX, aY, bX, bY, enterX, exitX);
++            }
++
++            if (!isParallelX && tExit < 1) {
++                ring.push_back(vertexToIndex(aX + dirX * tExit, aY + dirY * tExit));
++            }
++
++            if (isParallelX || (bY >= cellRowYTop && bY <= cellRowYBottom)) {
++                ring.push_back(triangleIndices[(edge + 1) % 3]);
++            }
++
++            if (!isParallelX && (bY <= cellRowYTop || bY >= cellRowYBottom)) {
++                generateInterEdgeVertices(ring, aX, aY, bX, bY, cX, cY, exitX, cellRowYTop, cellRowYBottom);
++            }
++        }
++        return ring;
++    }
++
++    void generateIntraEdgeVertices(
++        std::vector<uint32_t>& ring, double aX, double aY, double bX, double bY, double enterX, double exitX) {
++        const double dirX = bX - aX;
++        const double dirY = bY - aY;
++        const bool isParallelX = dirY == 0;
++        const double leftX = isParallelX ? std::min(aX, bX) : std::min(enterX, exitX);
++        const double rightX = isParallelX ? std::max(aX, bX) : std::max(enterX, exitX);
++        const auto leftCellX = static_cast<int32_t>(std::floor(leftX / cellSize)) + 1;
++        const auto rightCellX = static_cast<int32_t>(std::ceil(rightX / cellSize)) - 1;
++        const bool leftToRight = isParallelX ? (aX < bX) : (enterX < exitX);
++
++        const auto emit = [&](int32_t cellX) {
++            const double x = cellX * cellSize;
++            ring.push_back(vertexToIndex(x, aY + dirY * (x - aX) / dirX));
++        };
++        if (leftToRight) {
++            for (int32_t cellX = leftCellX; cellX <= rightCellX; cellX++) {
++                emit(cellX);
++            }
++        } else {
++            for (int32_t cellX = rightCellX; cellX >= leftCellX; cellX--) {
++                emit(cellX);
++            }
++        }
++    }
++
++    void generateInterEdgeVertices(std::vector<uint32_t>& ring,
++                                   double aX,
++                                   double aY,
++                                   double bX,
++                                   double bY,
++                                   double cX,
++                                   double cY,
++                                   double exitX,
++                                   double cellRowYTop,
++                                   double cellRowYBottom) {
++        const double dirY = bY - aY;
++        const double dir2X = cX - bX;
++        const double dir2Y = cY - bY;
++        const double t2Top = (cellRowYTop - bY) / dir2Y;
++        const double t2Bottom = (cellRowYBottom - bY) / dir2Y;
++        const double t2Enter = std::min(t2Top, t2Bottom);
++        const double t2Exit = std::max(t2Top, t2Bottom);
++        const double enter2X = bX + dir2X * t2Enter;
++
++        auto leftCellX = static_cast<int32_t>(std::floor(std::min(enter2X, exitX) / cellSize)) + 1;
++        auto rightCellX = static_cast<int32_t>(std::ceil(std::max(enter2X, exitX) / cellSize)) - 1;
++        bool leftToRight = exitX < enter2X;
++
++        const bool isParallelX2 = dir2Y == 0;
++        if (isParallelX2 && (cY == cellRowYTop || cY == cellRowYBottom)) {
++            return;
++        }
++
++        if (isParallelX2 || t2Enter >= 1 || t2Exit <= 0) {
++            const double dir3X = aX - cX;
++            const double dir3Y = aY - cY;
++            const double t3Top = (cellRowYTop - cY) / dir3Y;
++            const double t3Bottom = (cellRowYBottom - cY) / dir3Y;
++            const double t3Enter = std::min(t3Top, t3Bottom);
++            const double enter3X = cX + dir3X * t3Enter;
++            leftCellX = static_cast<int32_t>(std::floor(std::min(enter3X, exitX) / cellSize)) + 1;
++            rightCellX = static_cast<int32_t>(std::ceil(std::max(enter3X, exitX) / cellSize)) - 1;
++            leftToRight = exitX < enter3X;
++        }
++
++        const double boundaryY = dirY > 0 ? cellRowYBottom : cellRowYTop;
++        if (leftToRight) {
++            for (int32_t cellX = leftCellX; cellX <= rightCellX; cellX++) {
++                ring.push_back(vertexToIndex(cellX * cellSize, boundaryY));
++            }
++        } else {
++            for (int32_t cellX = rightCellX; cellX >= leftCellX; cellX--) {
++                ring.push_back(vertexToIndex(cellX * cellSize, boundaryY));
++            }
++        }
++    }
++
++    std::vector<std::vector<uint32_t>> generateOutline(const GeometryCollection& polygon) {
++        std::vector<std::vector<uint32_t>> lines;
++        for (const auto& ring : polygon) {
++            const GeometryCoordinates path = subdivideVertexLine(ring, granularity, true);
++            std::vector<uint32_t> lineIndices;
++            for (std::size_t i = 1; i < path.size(); i++) {
++                lineIndices.push_back(vertexToIndex(path[i - 1].x, path[i - 1].y));
++                lineIndices.push_back(vertexToIndex(path[i].x, path[i].y));
++            }
++            lines.push_back(std::move(lineIndices));
++        }
++        return lines;
++    }
++
++    void ensureNoPoleVertices() {
++        for (std::size_t i = 1; i < vertices.size(); i += 2) {
++            if (vertices[i] == NORTH_POLE_Y) {
++                vertices[i] = NORTH_POLE_Y + 1;
++            }
++            if (vertices[i] == SOUTH_POLE_Y) {
++                vertices[i] = SOUTH_POLE_Y - 1;
++            }
++        }
++    }
++
++    void handlePoles(std::vector<uint32_t>& triangles) {
++        const bool north = canonical.y == 0;
++        const bool south = canonical.y == (1u << canonical.z) - 1;
++        if (north || south) {
++            fillPoles(triangles, north, south);
++        }
++    }
++
++    void generatePoleQuad(
++        std::vector<uint32_t>& indices, uint32_t i0, uint32_t i1, int16_t v0x, int16_t v1x, int16_t poleY) {
++        const bool flip = (v0x > v1x) != (poleY == NORTH_POLE_Y);
++        const uint32_t p0 = vertexToIndex(v0x, poleY);
++        const uint32_t p1 = vertexToIndex(v1x, poleY);
++        if (flip) {
++            indices.insert(indices.end(), {i0, i1, p0, i1, p1, p0});
++        } else {
++            indices.insert(indices.end(), {i1, i0, p0, p1, i1, p0});
++        }
++    }
++
++    void fillPoles(std::vector<uint32_t>& indices, bool north, bool south) {
++        constexpr int16_t northEdge = 0;
++        constexpr int16_t southEdge = EXTENT;
++        const std::size_t count = indices.size();
++        for (std::size_t primitive = 2; primitive < count; primitive += 3) {
++            const uint32_t i0 = indices[primitive - 2];
++            const uint32_t i1 = indices[primitive - 1];
++            const uint32_t i2 = indices[primitive];
++            const int16_t v0x = vertices[i0 * 2];
++            const int16_t v0y = vertices[i0 * 2 + 1];
++            const int16_t v1x = vertices[i1 * 2];
++            const int16_t v1y = vertices[i1 * 2 + 1];
++            const int16_t v2x = vertices[i2 * 2];
++            const int16_t v2y = vertices[i2 * 2 + 1];
++            if (north) {
++                if (v0y == northEdge && v1y == northEdge) generatePoleQuad(indices, i0, i1, v0x, v1x, NORTH_POLE_Y);
++                if (v1y == northEdge && v2y == northEdge) generatePoleQuad(indices, i1, i2, v1x, v2x, NORTH_POLE_Y);
++                if (v2y == northEdge && v0y == northEdge) generatePoleQuad(indices, i2, i0, v2x, v0x, NORTH_POLE_Y);
++            }
++            if (south) {
++                if (v0y == southEdge && v1y == southEdge) generatePoleQuad(indices, i0, i1, v0x, v1x, SOUTH_POLE_Y);
++                if (v1y == southEdge && v2y == southEdge) generatePoleQuad(indices, i1, i2, v1x, v2x, SOUTH_POLE_Y);
++                if (v2y == southEdge && v0y == southEdge) generatePoleQuad(indices, i2, i0, v2x, v0x, SOUTH_POLE_Y);
++            }
++        }
++    }
++
++    bool vertexOutsideTileX(uint32_t index) const {
++        const int16_t x = vertices[index * 2];
++        return x < 0 || x > EXTENT;
++    }
++
++    std::vector<uint32_t> removeTrianglesOutsideTileX(const std::vector<uint32_t>& indices) const {
++        std::vector<uint32_t> result;
++        for (std::size_t i = 0; i + 2 < indices.size(); i += 3) {
++            if (vertexOutsideTileX(indices[i]) && vertexOutsideTileX(indices[i + 1]) &&
++                vertexOutsideTileX(indices[i + 2])) {
++                continue;
++            }
++            result.insert(result.end(), {indices[i], indices[i + 1], indices[i + 2]});
++        }
++        return result;
++    }
++
++    std::vector<uint32_t> removeLinesOutsideTileX(const std::vector<uint32_t>& indices) const {
++        std::vector<uint32_t> result;
++        for (std::size_t i = 0; i + 1 < indices.size(); i += 2) {
++            if (vertexOutsideTileX(indices[i]) && vertexOutsideTileX(indices[i + 1])) {
++                continue;
++            }
++            result.insert(result.end(), {indices[i], indices[i + 1]});
++        }
++        return result;
++    }
++
++    std::vector<int16_t> vertices;
++    std::unordered_map<uint32_t, uint32_t> dictionary;
++    const CanonicalTileID canonical;
++    const uint32_t granularity;
++    const double cellSize;
++};
++
++} // namespace
++
++SubdivisionResult subdividePolygon(const GeometryCollection& polygon,
++                                   const CanonicalTileID& canonical,
++                                   uint32_t granularity,
++                                   bool generateOutlineLines) {
++    return Subdivider(granularity, canonical).subdivide(polygon, generateOutlineLines);
++}
++
++SubdivisionResult subdividePolygonWithinLimit(const GeometryCollection& polygon,
++                                              const CanonicalTileID& canonical,
++                                              uint32_t granularity,
++                                              bool generateOutlineLines,
++                                              std::size_t maxVertices) {
++    while (true) {
++        SubdivisionResult result = subdividePolygon(polygon, canonical, granularity, generateOutlineLines);
++        if (result.vertices.size() / 2 <= maxVertices || granularity < 2) {
++            return result;
++        }
++        granularity /= 2;
++    }
++}
++
++GeometryCoordinates subdivideVertexLine(const GeometryCoordinates& line, uint32_t granularity, bool isRing) {
++    if (line.size() < 2) {
++        return {};
++    }
++
++    const bool closeRing = isRing && line.front() != line.back();
++    if (granularity < 2) {
++        GeometryCoordinates result = line;
++        if (closeRing) {
++            result.push_back(line.front());
++        }
++        return result;
++    }
++
++    const double cellSize = std::floor(static_cast<double>(EXTENT) / granularity);
++    GeometryCoordinates result;
++    result.push_back(line.front());
++
++    const auto pushUnique = [&](double x, double y) {
++        const GeometryCoordinate next{static_cast<int16_t>(x), static_cast<int16_t>(y)};
++        if (result.back() != next) {
++            result.push_back(next);
++        }
++    };
++
++    const std::size_t total = line.size();
++    const std::size_t lastIndex = closeRing ? total : total - 1;
++    for (std::size_t pointIndex = 0; pointIndex < lastIndex; pointIndex++) {
++        const GeometryCoordinate& p0 = line[pointIndex];
++        const GeometryCoordinate& p1 = pointIndex < total - 1 ? line[pointIndex + 1] : line[0];
++        const double v0x = p0.x;
++        const double v0y = p0.y;
++        const double v1x = p1.x;
++        const double v1y = p1.y;
++
++        const bool dirXnonZero = v0x != v1x;
++        const bool dirYnonZero = v0y != v1y;
++        if (!dirXnonZero && !dirYnonZero) {
++            continue;
++        }
++
++        const double dirX = v1x - v0x;
++        const double dirY = v1y - v0y;
++        const double absDirX = std::abs(dirX);
++        const double absDirY = std::abs(dirY);
++        double lastX = v0x;
++        double lastY = v0y;
++
++        while (true) {
++            const double nextBoundaryX = dirX > 0 ? (std::floor(lastX / cellSize) + 1) * cellSize
++                                                  : (std::ceil(lastX / cellSize) - 1) * cellSize;
++            const double nextBoundaryY = dirY > 0 ? (std::floor(lastY / cellSize) + 1) * cellSize
++                                                  : (std::ceil(lastY / cellSize) - 1) * cellSize;
++            const double axisDistanceToBoundaryX = std::abs(lastX - nextBoundaryX);
++            const double axisDistanceToBoundaryY = std::abs(lastY - nextBoundaryY);
++            const double axisDistanceToEndX = std::abs(lastX - v1x);
++            const double axisDistanceToEndY = std::abs(lastY - v1y);
++            const double realDistanceToBoundaryX = dirXnonZero ? axisDistanceToBoundaryX / absDirX
++                                                               : std::numeric_limits<double>::infinity();
++            const double realDistanceToBoundaryY = dirYnonZero ? axisDistanceToBoundaryY / absDirY
++                                                               : std::numeric_limits<double>::infinity();
++
++            if ((axisDistanceToEndX <= axisDistanceToBoundaryX || !dirXnonZero) &&
++                (axisDistanceToEndY <= axisDistanceToBoundaryY || !dirYnonZero)) {
++                break;
++            }
++
++            if ((realDistanceToBoundaryX < realDistanceToBoundaryY && dirXnonZero) || !dirYnonZero) {
++                lastX = nextBoundaryX;
++                lastY = lastY + dirY * realDistanceToBoundaryX;
++                pushUnique(lastX, std::round(lastY));
++            } else {
++                lastX = lastX + dirX * realDistanceToBoundaryY;
++                lastY = nextBoundaryY;
++                pushUnique(std::round(lastX), lastY);
++            }
++        }
++        pushUnique(v1x, v1y);
++    }
++    return result;
++}
++
++std::vector<uint32_t> fixWindingOrder(const std::vector<int16_t>& vertices, const std::vector<uint32_t>& indices) {
++    std::vector<uint32_t> corrected;
++    corrected.reserve(indices.size());
++    for (std::size_t i = 0; i + 2 < indices.size(); i += 3) {
++        const uint32_t i0 = indices[i];
++        const uint32_t i1 = indices[i + 1];
++        const uint32_t i2 = indices[i + 2];
++        const double e0x = vertices[i1 * 2] - vertices[i0 * 2];
++        const double e0y = vertices[i1 * 2 + 1] - vertices[i0 * 2 + 1];
++        const double e1x = vertices[i2 * 2] - vertices[i0 * 2];
++        const double e1y = vertices[i2 * 2 + 1] - vertices[i0 * 2 + 1];
++        if (e0x * e1y - e0y * e1x > 0) {
++            corrected.insert(corrected.end(), {i0, i2, i1});
++        } else {
++            corrected.insert(corrected.end(), {i0, i1, i2});
++        }
++    }
++    return corrected;
++}
++
++void scanlineTriangulateVertexRing(const std::vector<int16_t>& vertices,
++                                   const std::vector<uint32_t>& ring,
++                                   std::vector<uint32_t>& outIndices) {
++    if (ring.empty()) {
++        throw std::invalid_argument("Subdivision vertex ring is empty.");
++    }
++
++    std::size_t leftmostIndex = 0;
++    int16_t leftmostX = vertices[ring[0] * 2];
++    for (std::size_t i = 1; i < ring.size(); i++) {
++        const int16_t x = vertices[ring[i] * 2];
++        if (x < leftmostX) {
++            leftmostX = x;
++            leftmostIndex = i;
++        }
++    }
++
++    const std::size_t length = ring.size();
++    std::size_t lastEdgeA = leftmostIndex;
++    std::size_t lastEdgeB = (lastEdgeA + 1) % length;
++
++    while (true) {
++        const std::size_t candidateA = lastEdgeA >= 1 ? lastEdgeA - 1 : length - 1;
++        const std::size_t candidateB = (lastEdgeB + 1) % length;
++
++        const double candidateAx = vertices[ring[candidateA] * 2];
++        const double candidateAy = vertices[ring[candidateA] * 2 + 1];
++        const double candidateBx = vertices[ring[candidateB] * 2];
++        const double candidateBy = vertices[ring[candidateB] * 2 + 1];
++        const double lastEdgeAx = vertices[ring[lastEdgeA] * 2];
++        const double lastEdgeAy = vertices[ring[lastEdgeA] * 2 + 1];
++        const double lastEdgeBx = vertices[ring[lastEdgeB] * 2];
++        const double lastEdgeBy = vertices[ring[lastEdgeB] * 2 + 1];
++
++        bool pickA = false;
++        if (candidateAx < candidateBx) {
++            pickA = true;
++        } else if (candidateAx > candidateBx) {
++            pickA = false;
++        } else {
++            const double nx = lastEdgeBy - lastEdgeAy;
++            const double ny = -(lastEdgeBx - lastEdgeAx);
++            const double sign = lastEdgeAy < lastEdgeBy ? 1 : -1;
++            const double aRight = ((candidateAx - lastEdgeAx) * nx + (candidateAy - lastEdgeAy) * ny) * sign;
++            const double bRight = ((candidateBx - lastEdgeAx) * nx + (candidateBy - lastEdgeAy) * ny) * sign;
++            pickA = aRight > bRight;
++        }
++
++        const uint32_t a = ring[lastEdgeA];
++        const uint32_t b = ring[lastEdgeB];
++        if (pickA) {
++            const uint32_t c = ring[candidateA];
++            if (c != a && c != b && a != b) {
++                outIndices.insert(outIndices.end(), {b, a, c});
++            }
++            lastEdgeA = lastEdgeA >= 1 ? lastEdgeA - 1 : length - 1;
++        } else {
++            const uint32_t c = ring[candidateB];
++            if (c != a && c != b && a != b) {
++                outIndices.insert(outIndices.end(), {b, a, c});
++            }
++            lastEdgeB = (lastEdgeB + 1) % length;
++        }
++
++        if (candidateA == candidateB) {
++            break;
++        }
++    }
++}
++
++} // namespace util
++} // namespace mln
+diff --git a/src/mln/util/tile_mesh.cpp b/src/mln/util/tile_mesh.cpp
+new file mode 100644
+index 000000000000..9f7a81933aeb
+--- /dev/null
++++ b/src/mln/util/tile_mesh.cpp
+@@ -0,0 +1,69 @@
++#include <mln/util/tile_mesh.hpp>
++#include <mln/util/constants.hpp>
++#include <mln/util/subdivision.hpp>
++
++#include <algorithm>
++#include <stdexcept>
++
++namespace mln {
++namespace util {
++
++namespace {
++constexpr int32_t EXTENT_STENCIL_BORDER = EXTENT / 128;
++} // namespace
++
++TileMesh createTileMesh(const TileMeshOptions& options) {
++    const int32_t granularity = static_cast<int32_t>(std::max(options.granularity, 1u));
++
++    const int32_t quadsPerAxisX = granularity + (options.generateBorders ? 2 : 0);
++    const int32_t quadsPerAxisY = granularity + ((options.extendToNorthPole || options.generateBorders) ? 1 : 0) +
++                                  ((options.extendToSouthPole || options.generateBorders) ? 1 : 0);
++    const int32_t verticesPerAxisX = quadsPerAxisX + 1;
++    const int32_t verticesPerAxisY = quadsPerAxisY + 1;
++    const int32_t offsetX = options.generateBorders ? -1 : 0;
++    const int32_t offsetY = (options.generateBorders || options.extendToNorthPole) ? -1 : 0;
++    const int32_t endX = granularity + (options.generateBorders ? 1 : 0);
++    const int32_t endY = granularity + ((options.generateBorders || options.extendToSouthPole) ? 1 : 0);
++
++    if (verticesPerAxisX * verticesPerAxisY > (1 << 16)) {
++        throw std::invalid_argument("Tile mesh granularity is too large for 16 bit indices.");
++    }
++
++    TileMesh mesh;
++    mesh.vertices.reserve(static_cast<std::size_t>(verticesPerAxisX) * verticesPerAxisY * 2);
++    for (int32_t y = offsetY; y <= endY; y++) {
++        for (int32_t x = offsetX; x <= endX; x++) {
++            int32_t vx = x * EXTENT / granularity;
++            if (x == -1) {
++                vx = -EXTENT_STENCIL_BORDER;
++            }
++            if (x == granularity + 1) {
++                vx = EXTENT + EXTENT_STENCIL_BORDER;
++            }
++            int32_t vy = y * EXTENT / granularity;
++            if (y == -1) {
++                vy = options.extendToNorthPole ? NORTH_POLE_Y : -EXTENT_STENCIL_BORDER;
++            }
++            if (y == granularity + 1) {
++                vy = options.extendToSouthPole ? SOUTH_POLE_Y : EXTENT + EXTENT_STENCIL_BORDER;
++            }
++            mesh.vertices.push_back(static_cast<int16_t>(vx));
++            mesh.vertices.push_back(static_cast<int16_t>(vy));
++        }
++    }
++
++    mesh.indices.reserve(static_cast<std::size_t>(quadsPerAxisX) * quadsPerAxisY * 6);
++    for (int32_t y = 0; y < quadsPerAxisY; y++) {
++        for (int32_t x = 0; x < quadsPerAxisX; x++) {
++            const auto v0 = static_cast<uint16_t>(x + y * verticesPerAxisX);
++            const auto v1 = static_cast<uint16_t>((x + 1) + y * verticesPerAxisX);
++            const auto v2 = static_cast<uint16_t>(x + (y + 1) * verticesPerAxisX);
++            const auto v3 = static_cast<uint16_t>((x + 1) + (y + 1) * verticesPerAxisX);
++            mesh.indices.insert(mesh.indices.end(), {v0, v2, v1, v1, v2, v3});
++        }
++    }
++    return mesh;
++}
++
++} // namespace util
++} // namespace mln
+diff --git a/test/util/subdivision.test.cpp b/test/util/subdivision.test.cpp
+new file mode 100644
+index 000000000000..1b162af4e81d
+--- /dev/null
++++ b/test/util/subdivision.test.cpp
+@@ -0,0 +1,309 @@
++#include <mln/test/util.hpp>
++
++#include <mln/util/constants.hpp>
++#include <mln/util/subdivision.hpp>
++#include <mln/util/subdivision_granularity.hpp>
++#include <mln/util/tile_mesh.hpp>
++
++#include <map>
++#include <set>
++
++using namespace mln;
++using namespace mln::util;
++
++namespace {
++
++GeometryCollection square(int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
++    return {{{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}, {x0, y0}}};
++}
++
++template <typename Index>
++double signedArea(const std::vector<int16_t>& v, Index i0, Index i1, Index i2) {
++    const double e0x = v[i1 * 2] - v[i0 * 2];
++    const double e0y = v[i1 * 2 + 1] - v[i0 * 2 + 1];
++    const double e1x = v[i2 * 2] - v[i0 * 2];
++    const double e1y = v[i2 * 2 + 1] - v[i0 * 2 + 1];
++    return e0x * e1y - e0y * e1x;
++}
++
++double totalArea(const SubdivisionResult& r) {
++    double area = 0;
++    for (std::size_t i = 0; i + 2 < r.triangleIndices.size(); i += 3) {
++        area += std::abs(
++                    signedArea(r.vertices, r.triangleIndices[i], r.triangleIndices[i + 1], r.triangleIndices[i + 2])) /
++                2;
++    }
++    return area;
++}
++
++using Edge = std::pair<uint32_t, uint32_t>;
++
++std::map<Edge, int> edgeCounts(const SubdivisionResult& r) {
++    std::map<Edge, int> edges;
++    for (std::size_t i = 0; i + 2 < r.triangleIndices.size(); i += 3) {
++        for (std::size_t k = 0; k < 3; k++) {
++            const uint32_t a = r.triangleIndices[i + k];
++            const uint32_t b = r.triangleIndices[i + (k + 1) % 3];
++            edges[{std::min(a, b), std::max(a, b)}]++;
++        }
++    }
++    return edges;
++}
++
++// Every triangle with an edge on the tile's polar side gets its own quad up to the pole, and a polygon that reaches
++// past that side has triangles on both sides of it, so edges into a pole and edges along that side are shared more
++// than twice and are not part of the outline.
++bool touchesPole(const SubdivisionResult& r, const Edge& edge) {
++    const int16_t y0 = r.vertices[edge.first * 2 + 1];
++    const int16_t y1 = r.vertices[edge.second * 2 + 1];
++    const auto atPole = [](int16_t y) {
++        return y == NORTH_POLE_Y || y == SOUTH_POLE_Y;
++    };
++    if (atPole(y0) || atPole(y1)) return true;
++    if (y0 != y1) return false;
++    const auto hasVertexAt = [&](int16_t pole) {
++        for (std::size_t i = 1; i < r.vertices.size(); i += 2) {
++            if (r.vertices[i] == pole) return true;
++        }
++        return false;
++    };
++    return (y0 == 0 && hasVertexAt(NORTH_POLE_Y)) || (y0 == EXTENT && hasVertexAt(SOUTH_POLE_Y));
++}
++
++// The checks GL JS `subdivision.test.ts` runs on every polygon: no vertex twice, every interior edge shared by exactly
++// two triangles, no T-junctions, and the line lists are exactly the exposed edges of the mesh. At zoom 0 the
++// triangles left and right of the tile are dropped, which exposes cut edges that were never outline, so that
++// comparison is skipped for a clipped mesh, and for one built without outlines.
++void expectSoundMesh(const SubdivisionResult& r, bool clippedAtZoomZero = false) {
++    std::set<std::pair<int16_t, int16_t>> seen;
++    for (std::size_t i = 0; i + 1 < r.vertices.size(); i += 2) {
++        EXPECT_TRUE(seen.insert({r.vertices[i], r.vertices[i + 1]}).second) << "duplicate vertex " << i / 2;
++    }
++
++    const auto edges = edgeCounts(r);
++    for (const auto& [edge, count] : edges) {
++        if (count > 2 && !touchesPole(r, edge)) {
++            ADD_FAILURE() << "edge (" << r.vertices[edge.first * 2] << ", " << r.vertices[edge.first * 2 + 1] << ")-("
++                          << r.vertices[edge.second * 2] << ", " << r.vertices[edge.second * 2 + 1] << ") is shared by "
++                          << count << " triangles";
++        }
++    }
++
++    // T-junctions show up as boundary edges with a vertex lying strictly inside them.
++    std::size_t tJunctions = 0;
++    for (const auto& [edge, count] : edges) {
++        if (count != 1) continue;
++        const double ax = r.vertices[edge.first * 2], ay = r.vertices[edge.first * 2 + 1];
++        const double bx = r.vertices[edge.second * 2], by = r.vertices[edge.second * 2 + 1];
++        for (std::size_t v = 0; v < r.vertices.size() / 2; v++) {
++            if (v == edge.first || v == edge.second) continue;
++            const double px = r.vertices[v * 2], py = r.vertices[v * 2 + 1];
++            const double cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
++            if (cross != 0) continue;
++            const double dot = (px - ax) * (bx - ax) + (py - ay) * (by - ay);
++            const double len2 = (bx - ax) * (bx - ax) + (py - ay) * (by - ay);
++            if (dot > 0 && dot < len2) {
++                tJunctions++;
++                break;
++            }
++        }
++    }
++    EXPECT_EQ(0u, tJunctions);
++
++    if (clippedAtZoomZero || r.lineIndexLists.empty()) {
++        return;
++    }
++    std::set<Edge> exposed;
++    for (const auto& [edge, count] : edges) {
++        if (count == 1 && !touchesPole(r, edge)) {
++            exposed.insert(edge);
++        }
++    }
++    std::set<Edge> outline;
++    for (const auto& lines : r.lineIndexLists) {
++        for (std::size_t i = 0; i + 1 < lines.size(); i += 2) {
++            const Edge edge{std::min(lines[i], lines[i + 1]), std::max(lines[i], lines[i + 1])};
++            if (touchesPole(r, edge)) continue;
++            EXPECT_TRUE(outline.insert(edge).second) << "outline edge " << edge.first << "-" << edge.second << " twice";
++        }
++    }
++    EXPECT_EQ(exposed, outline);
++}
++
++} // namespace
++
++TEST(Subdivision, Granularity) {
++    const SubdivisionGranularityExpression fill{128, 2};
++    EXPECT_EQ(128u, fill.getGranularityForZoomLevel(0));
++    EXPECT_EQ(64u, fill.getGranularityForZoomLevel(1));
++    EXPECT_EQ(2u, fill.getGranularityForZoomLevel(6));
++    EXPECT_EQ(2u, fill.getGranularityForZoomLevel(12));
++    EXPECT_EQ(1u, SubdivisionGranularityExpression(0, 0).getGranularityForZoomLevel(3));
++}
++
++TEST(Subdivision, NoSubdivisionKeepsTriangles) {
++    // GL JS "Polygon is unchanged when granularity=1".
++    const auto result = subdividePolygon(square(0, 0, 20000, 20000), CanonicalTileID(3, 1, 1), 1);
++    EXPECT_EQ((std::vector<int16_t>{0, 0, 20000, 0, 20000, 20000, 0, 20000}), result.vertices);
++    // Two triangles on one diagonal (earcut's pick), wound the same way as GL JS's [2, 0, 3, 2, 1, 0].
++    EXPECT_EQ(6u, result.triangleIndices.size());
++    EXPECT_DOUBLE_EQ(20000.0 * 20000.0, totalArea(result));
++    for (std::size_t i = 0; i + 2 < result.triangleIndices.size(); i += 3) {
++        EXPECT_LT(signedArea(result.vertices,
++                             result.triangleIndices[i],
++                             result.triangleIndices[i + 1],
++                             result.triangleIndices[i + 2]),
++                  0.0);
++    }
++    ASSERT_EQ(1u, result.lineIndexLists.size());
++    EXPECT_EQ((std::vector<uint32_t>{0, 1, 1, 2, 2, 3, 3, 0}), result.lineIndexLists[0]);
++    expectSoundMesh(result);
++}
++
++TEST(Subdivision, SplitsOnCellBoundariesAndKeepsArea) {
++    const auto full = square(0, 0, EXTENT, EXTENT);
++    const auto result = subdividePolygon(full, CanonicalTileID(3, 1, 1), 4);
++    // A 4x4 grid: 25 unique vertices, 32 triangles.
++    EXPECT_EQ(25u, result.vertices.size() / 2);
++    EXPECT_EQ(32u * 3u, result.triangleIndices.size());
++    EXPECT_DOUBLE_EQ(static_cast<double>(EXTENT) * EXTENT, totalArea(result));
++    for (std::size_t i = 0; i + 2 < result.triangleIndices.size(); i += 3) {
++        EXPECT_LT(signedArea(result.vertices,
++                             result.triangleIndices[i],
++                             result.triangleIndices[i + 1],
++                             result.triangleIndices[i + 2]),
++                  0.0);
++    }
++    ASSERT_EQ(1u, result.lineIndexLists.size());
++    EXPECT_EQ(16u * 2u, result.lineIndexLists[0].size());
++    expectSoundMesh(result);
++}
++
++TEST(Subdivision, PoleTilesGetPoleQuads) {
++    const auto full = square(0, 0, EXTENT, EXTENT);
++    const auto north = subdividePolygon(full, CanonicalTileID(1, 0, 0), 2);
++    std::set<int16_t> ys;
++    for (std::size_t i = 1; i < north.vertices.size(); i += 2) {
++        ys.insert(north.vertices[i]);
++    }
++    EXPECT_TRUE(ys.contains(NORTH_POLE_Y));
++    EXPECT_FALSE(ys.contains(SOUTH_POLE_Y));
++    expectSoundMesh(north);
++
++    const auto south = subdividePolygon(full, CanonicalTileID(1, 0, 1), 2);
++    ys.clear();
++    for (std::size_t i = 1; i < south.vertices.size(); i += 2) {
++        ys.insert(south.vertices[i]);
++    }
++    EXPECT_TRUE(ys.contains(SOUTH_POLE_Y));
++    EXPECT_FALSE(ys.contains(NORTH_POLE_Y));
++    expectSoundMesh(south);
++
++    const auto middle = subdividePolygon(full, CanonicalTileID(2, 1, 1), 2);
++    for (std::size_t i = 1; i < middle.vertices.size(); i += 2) {
++        EXPECT_NE(NORTH_POLE_Y, middle.vertices[i]);
++        EXPECT_NE(SOUTH_POLE_Y, middle.vertices[i]);
++    }
++    expectSoundMesh(middle);
++}
++
++TEST(Subdivision, ZoomZeroDropsGeometryOutsideTheTile) {
++    const auto wide = square(-2000, 1000, EXTENT + 2000, 2000);
++    const auto result = subdividePolygon(wide, CanonicalTileID(0, 0, 0), 8);
++    for (std::size_t i = 0; i + 2 < result.triangleIndices.size(); i += 3) {
++        bool inside = false;
++        for (std::size_t k = 0; k < 3; k++) {
++            const int16_t x = result.vertices[result.triangleIndices[i + k] * 2];
++            inside |= x >= 0 && x <= EXTENT;
++        }
++        EXPECT_TRUE(inside);
++    }
++    expectSoundMesh(result, true);
++}
++
++TEST(Subdivision, VertexLine) {
++    const GeometryCoordinates line{{0, 0}, {EXTENT, 0}};
++    EXPECT_EQ(line, subdivideVertexLine(line, 1));
++    const auto split = subdivideVertexLine(line, 4);
++    ASSERT_EQ(5u, split.size());
++    EXPECT_EQ(GeometryCoordinate(EXTENT / 4, 0), split[1]);
++    EXPECT_EQ(GeometryCoordinate(EXTENT, 0), split.back());
++
++    const GeometryCoordinates diagonal{{0, 0}, {EXTENT, EXTENT}};
++    const auto diagonalSplit = subdivideVertexLine(diagonal, 2);
++    ASSERT_EQ(3u, diagonalSplit.size());
++    EXPECT_EQ(GeometryCoordinate(EXTENT / 2, EXTENT / 2), diagonalSplit[1]);
++
++    const GeometryCoordinates ring{{0, 0}, {EXTENT, 0}, {EXTENT, EXTENT}};
++    const auto closed = subdivideVertexLine(ring, 1, true);
++    EXPECT_EQ(ring.front(), closed.back());
++    EXPECT_EQ(4u, closed.size());
++}
++
++TEST(Subdivision, WorldPolygonWithBufferIsSound) {
++    constexpr int16_t buffer = 512;
++    const auto world = square(-buffer, -buffer, EXTENT + buffer, EXTENT + buffer);
++    for (const uint8_t z : {0, 1}) {
++        const auto result = subdividePolygon(world, CanonicalTileID(z, 0, 0), 128u >> z);
++        expectSoundMesh(result, z == 0);
++    }
++}
++
++TEST(Subdivision, PolygonBeyondTheIndexLimitCoarsens) {
++    // A comb of 400 teeth hanging from a thin bar: 800 vertical edges each crossing 127 cell rows need more vertices
++    // than a 16-bit index space holds; the fallback halves the granularity until the polygon fits rather than
++    // dropping it.
++    GeometryCoordinates ring;
++    constexpr int16_t teeth = 400;
++    constexpr int16_t step = EXTENT / (teeth * 2);
++    constexpr int16_t bar = EXTENT - step;
++    for (int16_t i = 0; i < teeth; ++i) {
++        const auto x0 = static_cast<int16_t>(i * 2 * step);
++        const auto x1 = static_cast<int16_t>(x0 + step);
++        ring.emplace_back(x0, bar);
++        ring.emplace_back(x0, 0);
++        ring.emplace_back(x1, 0);
++        ring.emplace_back(x1, bar);
++    }
++    ring.emplace_back(EXTENT, bar);
++    ring.emplace_back(EXTENT, EXTENT);
++    ring.emplace_back(0, EXTENT);
++    ring.emplace_back(0, bar);
++    const GeometryCollection polygon{ring};
++    const CanonicalTileID tile(3, 4, 4);
++    constexpr std::size_t limit = std::numeric_limits<uint16_t>::max();
++
++    const auto full = subdividePolygon(polygon, tile, 128, false);
++    EXPECT_GT(full.vertices.size() / 2, limit);
++
++    // 800 edges crossing the cell rows: 128 and 64 both overflow, 32 is the first granularity that fits.
++    EXPECT_GT(subdividePolygon(polygon, tile, 64, false).vertices.size() / 2, limit);
++    const auto coarse = subdividePolygon(polygon, tile, 32, false);
++    EXPECT_LE(coarse.vertices.size() / 2, limit);
++
++    const auto fitted = subdividePolygonWithinLimit(polygon, tile, 128, false, limit);
++    EXPECT_EQ(coarse.vertices, fitted.vertices);
++    EXPECT_EQ(coarse.triangleIndices, fitted.triangleIndices);
++    EXPECT_EQ(coarse.lineIndexLists, fitted.lineIndexLists);
++    // The comb is about the vertex count; earcut's triangulation of it is not what is under test here.
++}
++
++TEST(TileMesh, QuadAndGrid) {
++    const auto quad = createTileMesh({.granularity = 1});
++    EXPECT_EQ(4u, quad.vertices.size() / 2);
++    EXPECT_EQ(6u, quad.indices.size());
++
++    const auto grid = createTileMesh({.granularity = 4, .generateBorders = true});
++    EXPECT_EQ(7u * 7u, grid.vertices.size() / 2);
++    EXPECT_EQ(6u * 6u * 6u, grid.indices.size());
++    EXPECT_EQ(-EXTENT / 128, grid.vertices[0]);
++    EXPECT_EQ(EXTENT + EXTENT / 128, grid.vertices[(7 * 7 - 1) * 2]);
++
++    const auto polar = createTileMesh({.granularity = 2, .extendToNorthPole = true, .extendToSouthPole = true});
++    EXPECT_EQ(3u * 5u, polar.vertices.size() / 2);
++    EXPECT_EQ(NORTH_POLE_Y, polar.vertices[1]);
++    EXPECT_EQ(SOUTH_POLE_Y, polar.vertices[(3 * 5 - 1) * 2 + 1]);
++    for (std::size_t i = 0; i + 2 < polar.indices.size(); i += 3) {
++        EXPECT_LT(signedArea(polar.vertices, polar.indices[i], polar.indices[i + 1], polar.indices[i + 2]), 0.0);
++    }
++}
