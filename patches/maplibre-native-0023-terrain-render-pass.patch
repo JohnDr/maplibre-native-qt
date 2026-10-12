@@ -1,0 +1,581 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 10bc21aca042..12b68d1cff5c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -640,6 +640,8 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_static_data.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/globe_depth_pass.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/globe_depth_pass.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/terrain_pass.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/terrain_pass.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_tile.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_tile.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_tree.hpp
+diff --git a/cmake/vulkan.cmake b/cmake/vulkan.cmake
+index ec7601ffcd79..bab41bb543bd 100644
+--- a/cmake/vulkan.cmake
++++ b/cmake/vulkan.cmake
+@@ -55,6 +55,7 @@ list(APPEND
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/location_indicator.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/raster.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/symbol.hpp
++        ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/terrain.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/widevector.hpp
+ )
+ 
+@@ -102,5 +103,6 @@ list(APPEND
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/location_indicator.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/raster.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/symbol.cpp
++        ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/terrain.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/widevector.cpp
+ )
+diff --git a/include/mln/shaders/shader_defines.hpp b/include/mln/shaders/shader_defines.hpp
+index b89283bb8454..5bb038214c80 100644
+--- a/include/mln/shaders/shader_defines.hpp
++++ b/include/mln/shaders/shader_defines.hpp
+@@ -485,6 +485,11 @@ enum {
+     globeDepthVertexAttributeCount
+ };
+ 
++enum {
++    idTerrainPosVertexAttribute,
++    terrainVertexAttributeCount
++};
++
+ enum {
+     idHeatmapPosVertexAttribute,
+ 
+diff --git a/include/mln/shaders/shader_source.hpp b/include/mln/shaders/shader_source.hpp
+index 026a1fcfda26..922ac654ebc4 100644
+--- a/include/mln/shaders/shader_source.hpp
++++ b/include/mln/shaders/shader_source.hpp
+@@ -29,6 +29,7 @@ enum class BuiltIn {
+     FillExtrusionPatternShader,
+     FillExtrusionPatternInstancedShader,
+     GlobeDepthShader,
++    TerrainShader,
+     HeatmapShader,
+     HeatmapTextureShader,
+     HillshadePrepareShader,
+diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
+new file mode 100644
+index 000000000000..108ef5e98e68
+--- /dev/null
++++ b/include/mln/shaders/vulkan/terrain.hpp
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <mln/shaders/shader_source.hpp>
++#include <mln/shaders/vulkan/shader_program.hpp>
++
++namespace mln {
++namespace shaders {
++
++/// Renders the terrain surface: a 3D mesh whose vertices carry a world-pixel elevation and a precomputed shade.
++/// The third vertex component is already in world pixels (metres converted with `pixelsPerMeter` on the CPU), so the
++/// vertex shader is the same projection the other 3D layers use.
++template <>
++struct ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan> {
++    static constexpr const char* name = "TerrainShader";
++
++    static const std::array<AttributeInfo, 1> attributes;
++    static constexpr std::array<AttributeInfo, 0> instanceAttributes{};
++    static const std::array<TextureInfo, 0> textures;
++
++    static constexpr auto prelude = R"(
++)";
++    static constexpr auto vertex = R"(
++
++// xy: tile units (0..EXTENT); z: world-pixel elevation; w: shade in [0, 1].
++layout(location = 0) in vec4 in_position;
++
++layout(push_constant) uniform Constants {
++    int ubo_index;
++} constant;
++
++layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer ProjectionUBOVector {
++    ProjectionUBO projection_ubo[];
++} projectionVector;
++
++layout(location = 0) out float v_shade;
++
++void main() {
++    gl_Position = projectTileFor3D(in_position.xy, in_position.z, projectionVector.projection_ubo[constant.ubo_index]);
++    applySurfaceTransform();
++    v_shade = in_position.w;
++}
++)";
++
++    static constexpr auto fragment = R"(
++
++layout(location = 0) in float v_shade;
++layout(location = 0) out vec4 out_color;
++
++void main() {
++    // A simple hypsometric-ish ramp: greener valleys, paler peaks, darkened by the precomputed shade.
++    const vec3 low = vec3(0.24, 0.42, 0.24);
++    const vec3 high = vec3(0.86, 0.83, 0.72);
++    out_color = vec4(mix(low, high, clamp(v_shade, 0.0, 1.0)), 1.0);
++}
++)";
++};
++
++} // namespace shaders
++} // namespace mln
+diff --git a/src/mln/map/map_impl.cpp b/src/mln/map/map_impl.cpp
+index 2a2589637c8a..f45415075a97 100644
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -4,6 +4,9 @@
+ #include <mln/storage/file_source.hpp>
+ #include <mln/style/style_impl.hpp>
+ #include <mln/style/projection_impl.hpp>
++#include <mln/style/terrain.hpp>
++#include <mln/style/source.hpp>
++#include <mln/style/sources/tile_source.hpp>
+ #include <mln/util/exception.hpp>
+ #include <mln/util/logging.hpp>
+ #include <mln/util/traits.hpp>
+@@ -145,6 +148,18 @@ void Map::Impl::onUpdate() {
+                                .tileLodMode = tileLodMode,
+                                .backgroundColor = backgroundColor};
+ 
++    // 3D terrain: hand the renderer the DEM tileset and exaggeration of the style's terrain source.
++    if (auto* terrain = style->impl->getTerrain(); terrain != nullptr && terrain->isEnabled()) {
++        if (auto* source = style->impl->getSource(terrain->getSource());
++            source != nullptr && source->getType() == style::SourceType::RasterDEM) {
++            const auto& urlOrTileset = static_cast<style::TileSource*>(source)->getURLOrTileset();
++            if (urlOrTileset.is<Tileset>()) {
++                params.terrainTileset = urlOrTileset.get<Tileset>();
++                params.terrainExaggeration = terrain->getExaggeration();
++            }
++        }
++    }
++
+     rendererFrontend.update(std::make_shared<UpdateParameters>(std::move(params)));
+ }
+ 
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index 49831e398cc5..ba0ec1bc7bd6 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -1000,6 +1000,7 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+     addChanges(changes);
+ 
+     globeDepthPass.update(shaders, context, state, *updateParameters, has3D);
++    terrainPass.update(shaders, context, state, *updateParameters);
+ }
+ 
+ void RenderOrchestrator::processChanges() {
+diff --git a/src/mln/renderer/render_orchestrator.hpp b/src/mln/renderer/render_orchestrator.hpp
+index 903e7db59374..fd8279828f9a 100644
+--- a/src/mln/renderer/render_orchestrator.hpp
++++ b/src/mln/renderer/render_orchestrator.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/renderer/globe_depth_pass.hpp>
++#include <mln/renderer/terrain_pass.hpp>
+ #include <mln/renderer/layer_group.hpp>
+ #include <mln/actor/scheduler.hpp>
+ #include <mln/renderer/renderer.hpp>
+@@ -111,6 +112,8 @@ public:
+ 
+     LayerGroupBase* getGlobeDepthLayerGroup() const { return globeDepthPass.getLayerGroup(); }
+ 
++    LayerGroupBase* getTerrainLayerGroup() const { return terrainPass.getLayerGroup(); }
++
+     template <typename Func /* void(LayerGroupBase&) */>
+     void visitLayerGroups(Func f) {
+         for (auto& pair : layerGroupsByLayerIndex) {
+@@ -250,6 +253,7 @@ private:
+     std::vector<RenderTargetPtr> renderTargets;
+     RenderItem::DebugLayerGroupMap debugLayerGroups;
+     GlobeDepthPass globeDepthPass;
++    TerrainPass terrainPass;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+index adfa99499f50..c5fa79fd12f8 100644
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -293,6 +293,9 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+         if (auto* globeDepth = orchestrator.getGlobeDepthLayerGroup()) {
+             globeDepth->upload(*uploadPass);
+         }
++        if (auto* terrain = orchestrator.getTerrainLayerGroup()) {
++            terrain->upload(*uploadPass);
++        }
+ 
+         // Give the render targets a chance to upload
+         orchestrator.visitRenderTargets([&](RenderTarget& renderTarget) { renderTarget.upload(*uploadPass); });
+@@ -445,6 +448,11 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+                 item.render(parameters);
+             }
+         }
++
++        // Terrain is drawn last, over the flat map, so the elevated surface is visible (draping lands later).
++        if (auto* terrain = orchestrator.getTerrainLayerGroup()) {
++            terrain->render(orchestrator, parameters);
++        }
+     };
+ 
+     const auto drawableDebugOverlays = [&] {
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+new file mode 100644
+index 000000000000..1bf74595bf41
+--- /dev/null
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -0,0 +1,222 @@
++#include <mln/renderer/terrain_pass.hpp>
++
++#include <mln/geometry/dem_data.hpp>
++#include <mln/gfx/context.hpp>
++#include <mln/gfx/cull_face_mode.hpp>
++#include <mln/gfx/drawable.hpp>
++#include <mln/gfx/drawable_builder.hpp>
++#include <mln/gfx/drawable_tweaker.hpp>
++#include <mln/gfx/projection_variant.hpp>
++#include <mln/gfx/shader_registry.hpp>
++#include <mln/gfx/uniform_buffer.hpp>
++#include <mln/map/transform_state.hpp>
++#include <mln/renderer/globe_tile_mesh.hpp> // SegmentVector
++#include <mln/renderer/layer_tweaker.hpp>
++#include <mln/renderer/paint_parameters.hpp>
++#include <mln/renderer/render_pass.hpp>
++#include <mln/renderer/terrain_tile_manager.hpp>
++#include <mln/renderer/update_parameters.hpp>
++#include <mln/shaders/shader_defines.hpp>
++#include <mln/util/constants.hpp>
++#include <mln/util/projection.hpp>
++#include <mln/util/tile_cover.hpp>
++
++#include <algorithm>
++#include <cmath>
++#include <unordered_set>
++
++namespace mln {
++
++namespace {
++
++constexpr std::string_view TerrainShaderName = "TerrainShader";
++
++// Grid resolution per DEM tile (segments, so the vertex grid is one larger).
++constexpr std::size_t TerrainGridSegments = 16;
++constexpr std::size_t TerrainGridPoints = TerrainGridSegments + 1;
++
++// A light pointing from the north-west, 45 degrees up.
++constexpr double LightX = -0.7071067811865476 * 0.7071067811865476;
++constexpr double LightY = -0.7071067811865476 * 0.7071067811865476;
++constexpr double LightZ = 0.7071067811865476;
++
++class TerrainTweaker : public gfx::DrawableTweaker {
++public:
++    void init(gfx::Drawable&) override {}
++
++    void execute(gfx::Drawable& drawable, PaintParameters& parameters) override {
++        if (!drawable.getTileID()) {
++            return;
++        }
++        const auto ubo = LayerTweaker::toProjectionUBO(
++            parameters.projectionDataForTile(drawable.getTileID()->toUnwrapped()));
++        drawable.mutableUniformBuffers().createOrUpdate(shaders::idProjectionUBO, &ubo, parameters.context);
++    }
++};
++
++struct TerrainMesh {
++    std::vector<uint8_t> vertices;
++    std::size_t vertexCount = 0;
++    std::vector<uint16_t> indices;
++};
++
++/// Builds a grid over one DEM tile: xy in tile units (0..EXTENT), z the elevation in world pixels, w a hillshade.
++TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double metersPerPixel) {
++    const std::size_t n = TerrainGridPoints;
++    const double dim = static_cast<double>(dem.dim);
++    const double metersPerTile = metersPerPixel * util::tileSize_D;
++    const double cellMeters = metersPerTile / static_cast<double>(TerrainGridSegments);
++    const double pixelsPerMeter = 1.0 / metersPerPixel;
++    const double extent = static_cast<double>(util::EXTENT);
++
++    std::vector<double> elevation(n * n);
++    for (std::size_t j = 0; j < n; j++) {
++        for (std::size_t i = 0; i < n; i++) {
++            const double u = static_cast<double>(i) / static_cast<double>(TerrainGridSegments);
++            const double v = static_cast<double>(j) / static_cast<double>(TerrainGridSegments);
++            elevation[j * n + i] = dem.getElevation(u * dim, v * dim);
++        }
++    }
++
++    const auto sample = [&](std::size_t i, std::size_t j) {
++        return elevation[std::min(j, n - 1) * n + std::min(i, n - 1)];
++    };
++
++    TerrainMesh mesh;
++    mesh.vertices.resize(n * n * 4 * sizeof(float));
++    auto* out = reinterpret_cast<float*>(mesh.vertices.data());
++    for (std::size_t j = 0; j < n; j++) {
++        for (std::size_t i = 0; i < n; i++) {
++            const double e = elevation[j * n + i];
++            const double dzdx = (sample(i + 1, j) - sample(i == 0 ? 0 : i - 1, j)) / (2.0 * cellMeters);
++            const double dzdy = (sample(i, j + 1) - sample(i, j == 0 ? 0 : j - 1)) / (2.0 * cellMeters);
++            const double length = std::sqrt(dzdx * dzdx + dzdy * dzdy + 1.0);
++            // normal . light, with normal = (-dzdx, -dzdy, 1) / length
++            const double diffuse = std::clamp((LightX * -dzdx + LightY * -dzdy + LightZ) / length, 0.0, 1.0);
++            const double shade = 0.35 + 0.65 * diffuse;
++
++            float* vertex = out + (j * n + i) * 4;
++            vertex[0] = static_cast<float>(static_cast<double>(i) / static_cast<double>(TerrainGridSegments) * extent);
++            vertex[1] = static_cast<float>(static_cast<double>(j) / static_cast<double>(TerrainGridSegments) * extent);
++            vertex[2] = static_cast<float>(e * exaggeration * pixelsPerMeter);
++            vertex[3] = static_cast<float>(shade);
++        }
++    }
++    mesh.vertexCount = n * n;
++
++    mesh.indices.reserve(TerrainGridSegments * TerrainGridSegments * 6);
++    for (std::size_t j = 0; j < TerrainGridSegments; j++) {
++        for (std::size_t i = 0; i < TerrainGridSegments; i++) {
++            const auto a = static_cast<uint16_t>(j * n + i);
++            const auto b = static_cast<uint16_t>(a + 1);
++            const auto c = static_cast<uint16_t>(a + n);
++            const auto d = static_cast<uint16_t>(c + 1);
++            mesh.indices.insert(mesh.indices.end(), {a, c, b, b, c, d});
++        }
++    }
++    return mesh;
++}
++
++} // namespace
++
++TerrainPass::TerrainPass() = default;
++TerrainPass::~TerrainPass() = default;
++
++void TerrainPass::update(gfx::ShaderRegistry& shaders,
++                         gfx::Context& context,
++                         const TransformState& state,
++                         const UpdateParameters& updateParameters) {
++    if (!updateParameters.terrainTileset || updateParameters.terrainTileset->tiles.empty()) {
++        if (layerGroup) {
++            layerGroup->clearDrawables();
++        }
++        terrain.reset();
++        tileset.reset();
++        return;
++    }
++
++    if (!tileset || *tileset != *updateParameters.terrainTileset) {
++        tileset = updateParameters.terrainTileset;
++        terrain = std::make_unique<TerrainTileManager>(updateParameters.fileSource.get(), *tileset);
++        if (layerGroup) {
++            layerGroup->clearDrawables();
++        }
++        builtZoom = -1;
++    }
++
++    if (!shader) {
++        shader = context.getGenericShader(shaders, std::string(TerrainShaderName), gfx::ProjectionVariant::Mercator);
++    }
++    if (!shader) {
++        return;
++    }
++    if (!layerGroup) {
++        constexpr std::size_t initialCapacity = 64;
++        layerGroup = context.createTileLayerGroup(0, initialCapacity, "terrain");
++    }
++
++    const double zoom = state.getZoom();
++    const auto newDemZoom = static_cast<uint8_t>(std::clamp(std::floor(zoom) + 2.0, 0.0, 14.0));
++    if (newDemZoom != demZoom || builtZoom < 0 || std::abs(builtZoom - zoom) > 0.25 ||
++        builtExaggeration != updateParameters.terrainExaggeration) {
++        demZoom = newDemZoom;
++        builtZoom = zoom;
++        builtExaggeration = updateParameters.terrainExaggeration;
++        layerGroup->clearDrawables();
++    }
++
++    const double metersPerPixel = Projection::getMetersPerPixelAtLatitude(state.getLatLng().latitude(), zoom);
++
++    const auto tileCover = util::tileCover({.transformState = state,
++                                            .tileLodMinRadius = updateParameters.tileLodMinRadius,
++                                            .tileLodScale = updateParameters.tileLodScale,
++                                            .tileLodPitchThreshold = updateParameters.tileLodPitchThreshold,
++                                            .tileLodMode = updateParameters.tileLodMode},
++                                           demZoom,
++                                           Range<uint8_t>(demZoom, demZoom));
++
++    const std::unordered_set<OverscaledTileID> covered(tileCover.begin(), tileCover.end());
++    layerGroup->removeDrawablesIf(
++        [&](gfx::Drawable& drawable) { return drawable.getTileID() && !covered.contains(*drawable.getTileID()); });
++
++    std::unique_ptr<gfx::DrawableBuilder> builder;
++    for (const auto& tileID : tileCover) {
++        if (layerGroup->getDrawableCount(RenderPass::Translucent, tileID) > 0) {
++            continue;
++        }
++        const auto& canonical = tileID.canonical;
++        const auto data = terrain->getTileData(canonical);
++        if (!data) {
++            continue; // still loading
++        }
++
++        if (!builder) {
++            builder = context.createDrawableBuilder("terrain");
++            builder->setShader(shader);
++            builder->setRenderPass(RenderPass::Translucent);
++            builder->setIs3D(true);
++            builder->setEnableColor(true);
++            builder->setEnableDepth(true);
++            builder->setDepthType(gfx::DepthMaskType::ReadWrite);
++            builder->setCullFaceMode(gfx::CullFaceMode::disabled());
++            builder->setVertexAttrId(shaders::idTerrainPosVertexAttribute);
++            builder->addTweaker(std::make_shared<TerrainTweaker>());
++        }
++
++        auto mesh = buildTerrainMesh(*data, updateParameters.terrainExaggeration, metersPerPixel);
++        const auto vertexCount = mesh.vertexCount;
++        const auto indexCount = mesh.indices.size();
++        builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float4);
++        SegmentVector segments;
++        segments.emplace_back(0, 0, vertexCount, indexCount);
++        builder->setSegments(gfx::Triangles(), std::move(mesh.indices), segments.data(), segments.size());
++        builder->flush(context);
++
++        for (auto& drawable : builder->clearDrawables()) {
++            drawable->setTileID(tileID);
++            layerGroup->addDrawable(RenderPass::Translucent, tileID, std::move(drawable));
++        }
++    }
++}
++
++} // namespace mln
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+new file mode 100644
+index 000000000000..e42a26ee18c0
+--- /dev/null
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <mln/renderer/layer_group.hpp>
++#include <mln/shaders/shader_program_base.hpp>
++#include <mln/util/tileset.hpp>
++
++#include <cstdint>
++#include <memory>
++#include <optional>
++
++namespace mln {
++
++namespace gfx {
++class Context;
++class ShaderRegistry;
++} // namespace gfx
++
++class TransformState;
++class UpdateParameters;
++class TerrainTileManager;
++
++/// Renders the terrain as a shaded, elevated surface: for each DEM tile, a grid mesh whose vertices carry a
++/// world-pixel elevation and a precomputed hillshade. Depth-writing; drawn after the flat layers (draping lands later).
++class TerrainPass {
++public:
++    TerrainPass();
++    ~TerrainPass();
++
++    void update(gfx::ShaderRegistry&, gfx::Context&, const TransformState&, const UpdateParameters&);
++
++    /// The layer group holding the terrain drawables, or null before the first enable.
++    LayerGroupBase* getLayerGroup() const { return layerGroup.get(); }
++
++private:
++    TileLayerGroupPtr layerGroup;
++    gfx::ShaderProgramBasePtr shader;
++    std::unique_ptr<TerrainTileManager> terrain;
++    std::optional<Tileset> tileset;
++    uint8_t demZoom = 0;
++    double builtZoom = -1;
++    double builtExaggeration = -1;
++};
++
++} // namespace mln
+diff --git a/src/mln/renderer/terrain_tile_manager.hpp b/src/mln/renderer/terrain_tile_manager.hpp
+index 2b1a255ddbba..35bd91c254aa 100644
+--- a/src/mln/renderer/terrain_tile_manager.hpp
++++ b/src/mln/renderer/terrain_tile_manager.hpp
+@@ -36,6 +36,9 @@ public:
+     /// Whether any DEM tile has been loaded.
+     bool hasData() const;
+ 
++    /// The DEM data for a tile, requesting it when necessary. Null until it has loaded.
++    std::shared_ptr<DEMData> getTileData(const CanonicalTileID& id) { return getDEMData(id); }
++
+ protected:
+     /// The DEM data for a tile, requesting it when necessary. Overridable so tests can inject data.
+     virtual std::shared_ptr<DEMData> getDEMData(const CanonicalTileID&);
+diff --git a/src/mln/renderer/update_parameters.hpp b/src/mln/renderer/update_parameters.hpp
+index cc5de92fa90e..d4c1e05ec085 100644
+--- a/src/mln/renderer/update_parameters.hpp
++++ b/src/mln/renderer/update_parameters.hpp
+@@ -10,6 +10,7 @@
+ #include <mln/util/chrono.hpp>
+ #include <mln/util/color.hpp>
+ #include <mln/util/immutable.hpp>
++#include <mln/util/tileset.hpp>
+ 
+ #include <numbers>
+ #include <optional>
+@@ -60,6 +61,10 @@ public:
+ 
+     // CFID: custom backdrop colour (space) applied to the render-tree background.
+     std::optional<Color> backgroundColor;
++
++    // CFID: 3D terrain. When the tileset is set, the terrain pass fetches this raster-dem source and drapes it.
++    std::optional<Tileset> terrainTileset;
++    double terrainExaggeration = 1.0;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/shaders/vulkan/terrain.cpp b/src/mln/shaders/vulkan/terrain.cpp
+new file mode 100644
+index 000000000000..7be9b678410c
+--- /dev/null
++++ b/src/mln/shaders/vulkan/terrain.cpp
+@@ -0,0 +1,15 @@
++#include <mln/shaders/vulkan/terrain.hpp>
++#include <mln/shaders/shader_defines.hpp>
++
++namespace mln {
++namespace shaders {
++
++using TerrainShaderSource = ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan>;
++
++const std::array<AttributeInfo, 1> TerrainShaderSource::attributes = {
++    AttributeInfo{0, gfx::AttributeDataType::Float4, idTerrainPosVertexAttribute},
++};
++const std::array<TextureInfo, 0> TerrainShaderSource::textures = {};
++
++} // namespace shaders
++} // namespace mln
+diff --git a/src/mln/vulkan/renderer_backend.cpp b/src/mln/vulkan/renderer_backend.cpp
+index 63c8d79001e6..f039103d57db 100644
+--- a/src/mln/vulkan/renderer_backend.cpp
++++ b/src/mln/vulkan/renderer_backend.cpp
+@@ -27,6 +27,7 @@
+ #include <mln/shaders/vulkan/location_indicator.hpp>
+ #include <mln/shaders/vulkan/raster.hpp>
+ #include <mln/shaders/vulkan/symbol.hpp>
++#include <mln/shaders/vulkan/terrain.hpp>
+ #include <mln/shaders/vulkan/widevector.hpp>
+ 
+ #include <cassert>
+@@ -727,6 +728,7 @@ void RendererBackend::initShaders(gfx::ShaderRegistry& shaders, const ProgramPar
+                   shaders::BuiltIn::SymbolIconShader,
+                   shaders::BuiltIn::SymbolSDFShader,
+                   shaders::BuiltIn::SymbolTextAndIconShader,
++                  shaders::BuiltIn::TerrainShader,
+                   shaders::BuiltIn::WideVectorShader>(shaders, programParameters);
+ }
+ 
