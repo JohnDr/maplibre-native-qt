@@ -511,6 +511,9 @@ void MapQuickItemPrivate::initialize() {
     m_map = std::make_unique<Map>(nullptr, m_settings, viewportSize, pixelRatio);
     m_map->setConnectionEstablished();
 
+    // CFID: allow the map to tilt further than the MapLibre default of 60 degrees.
+    m_map->setMaxPitch(85);
+
     // Connect before the style load is started below. Connecting later (e.g. when the scene graph
     // node is first created) races the load: a style that resolves quickly, such as one already in
     // the cache, emits MapChangeDidFinishLoadingStyle with nothing listening and the event is lost.

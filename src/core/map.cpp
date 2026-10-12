@@ -882,6 +882,12 @@ void Map::pitchBy(double pitch) {
     d_ptr->mapObj->pitchBy(pitch);
 }
 
+// CFID addition: raise the pitch clamp (MapLibre defaults to 60 degrees) so the
+// embedder can tilt further, e.g. up to 85 degrees.
+void Map::setMaxPitch(double maxPitch) {
+    d_ptr->mapObj->setBounds(mln::BoundOptions().withMaxPitch(maxPitch));
+}
+
 /*!
     \brief Get the map north orientation mode.
     \return The map north orientation mode.

@@ -125,6 +125,9 @@ public:
     void setPitch(double pitch);
     void pitchBy(double pitch);
 
+    // Raises/lowers the pitch clamp (default 60 degrees).
+    void setMaxPitch(double maxPitch);
+
     [[nodiscard]] NorthOrientation northOrientation() const;
     void setNorthOrientation(NorthOrientation);
 
