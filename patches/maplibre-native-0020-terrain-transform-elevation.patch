@@ -1,0 +1,104 @@
+diff --git a/src/mln/map/transform.cpp b/src/mln/map/transform.cpp
+index fd3e571b3014..b120a02f06fe 100644
+--- a/src/mln/map/transform.cpp
++++ b/src/mln/map/transform.cpp
+@@ -529,6 +529,20 @@ double Transform::getFieldOfView() const {
+     return state.getFieldOfView();
+ }
+ 
++// MARK: - Elevation
++
++double Transform::getElevation() const {
++    return state.getElevation();
++}
++
++void Transform::setElevation(double elevation) {
++    state.setElevation(elevation);
++}
++
++double Transform::getCameraAltitude() const {
++    return state.getCameraAltitude();
++}
++
+ // MARK: - North Orientation
+ 
+ void Transform::setProjectionDefinition(const ProjectionDefinition& definition) {
+diff --git a/src/mln/map/transform.hpp b/src/mln/map/transform.hpp
+index 0d7edf7062fc..6959125e44fb 100644
+--- a/src/mln/map/transform.hpp
++++ b/src/mln/map/transform.hpp
+@@ -94,6 +94,14 @@ public:
+     double getRoll() const;
+     double getFieldOfView() const;
+ 
++    // Elevation (3D terrain)
++    /** The ground elevation (metres above sea level) under the centre; 0 on a flat map. */
++    double getElevation() const;
++    /** Sets the centre's altitude to the terrain elevation under it. */
++    void setElevation(double);
++    /** The camera's altitude above sea level, in metres. */
++    double getCameraAltitude() const;
++
+     // North Orientation
+     void setProjectionDefinition(const ProjectionDefinition&);
+     void setNorthOrientation(NorthOrientation);
+diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
+index 3acb83876b99..13a0bd0cbaac 100644
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -599,6 +599,17 @@ double TransformState::getCenterAltitude() const {
+     return z * Projection::getMetersPerPixelAtLatitude(getLatLng().latitude(), getZoom());
+ }
+ 
++double TransformState::getElevation() const {
++    // The centre's altitude and the ground elevation under it are the same quantity: the map centre sits on the surface.
++    return getCenterAltitude();
++}
++
++double TransformState::getCameraAltitude() const {
++    return std::cos(getPitch()) * getCameraToCenterDistance() *
++               Projection::getMetersPerPixelAtLatitude(getLatLng().latitude(), getZoom()) +
++           getElevation();
++}
++
+ double TransformState::pixel_x() const {
+     const double center = (size.width - Projection::worldSize(scale)) / 2;
+     return center + x;
+@@ -1180,6 +1191,10 @@ void TransformState::setCenterAltitude(double alt_m) {
+     requestMatricesUpdate = true;
+ }
+ 
++void TransformState::setElevation(double elevation) {
++    setCenterAltitude(elevation);
++}
++
+ void TransformState::setScalePoint(const double newScale, const ScreenCoordinate& point) {
+     double constrainedScale = newScale;
+     ScreenCoordinate constrainedPoint = point;
+diff --git a/src/mln/map/transform_state.hpp b/src/mln/map/transform_state.hpp
+index 78541becebf2..e91a22f3904b 100644
+--- a/src/mln/map/transform_state.hpp
++++ b/src/mln/map/transform_state.hpp
+@@ -193,6 +193,12 @@ public:
+     // Position
+     LatLng getLatLng(LatLng::WrapMode = LatLng::Unwrapped) const;
+     double getCenterAltitude() const;
++    /// The ground elevation (metres above sea level) under the centre, i.e. the altitude the map centre sits at. With
++    /// 3D terrain this is the sampled DEM height; on a flat map it is 0.
++    double getElevation() const;
++    /// The camera's altitude above sea level, in metres: the centre altitude plus the vertical component of the camera's
++    /// distance to the centre. Mirrors GL JS `transform.getCameraAltitude()`.
++    double getCameraAltitude() const;
+     double pixel_x() const;
+     double pixel_y() const;
+ 
+@@ -281,6 +287,9 @@ public:
+     void moveLatLng(const LatLng&, const ScreenCoordinate&);
+     void setLatLngZoom(const LatLng& latLng, double zoom);
+     void setCenterAltitude(double alt_m);
++    /// Sets the centre's altitude to the ground elevation under it (metres above sea level). The camera is lifted with
++    /// it, so the map keeps its height above the terrain. Mirrors GL JS `transform.setElevation()`.
++    void setElevation(double elevation);
+ 
+     void constrain(double& scale, double& x, double& y) const;
+     bool constrainScreen(double& scale_, double& x_, double& y_) const;
