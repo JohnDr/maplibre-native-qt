@@ -103,17 +103,18 @@ index 5fb6704..08ca1e3 100644
      return impl->style->impl->isLoaded() && impl->rendererFullyLoaded;
  }
 diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
-index 986c018..11f2e76 100644
+index 986c018..49831e3 100644
 --- a/src/mln/renderer/render_orchestrator.cpp
 +++ b/src/mln/renderer/render_orchestrator.cpp
-@@ -429,6 +429,13 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
+@@ -429,6 +429,14 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
          addChanges(changes);
      }
  
-+    // CFID: a custom backdrop colour overrides the style background for the render-tree
-+    // background (the clear colour) - including on the globe, where the style background is
-+    // drawn as a sphere mesh and would otherwise leave the space unpainted.
-+    if (updateParameters->backgroundColor) {
++    // CFID: a custom backdrop colour overrides the render-tree background (clear colour) only
++    // on the globe, where the style background is drawn as a sphere mesh and would otherwise
++    // leave the space around it unpainted. On the flat map the style background (or its clear
++    // colour) is left untouched, so the map itself is unaffected.
++    if (updateParameters->backgroundColor && updateParameters->transformState.isGlobeRendering()) {
 +        renderTreeParameters->backgroundColor = *updateParameters->backgroundColor;
 +    }
 +
@@ -121,15 +122,17 @@ index 986c018..11f2e76 100644
      if (!isMapModeContinuous && !renderTreeParameters->loaded) {
          return nullptr;
 diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
-index b6446f3..1e83aa7 100644
+index b6446f3..adfa994 100644
 --- a/src/mln/renderer/renderer_impl.cpp
 +++ b/src/mln/renderer/renderer_impl.cpp
-@@ -369,7 +369,7 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+@@ -369,7 +369,9 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
              std::optional<Color> color;
              if (parameters.debugOptions & MapDebugOptions::Overdraw) {
                  color = Color::black();
 -            } else if (!backend.contextIsShared()) {
-+            } else if (!backend.contextIsShared() || renderTreeParameters.backgroundColor.a > 0.0f) {
++            } else if (!backend.contextIsShared() ||
++                       (renderTreeParameters.transformParams.state.isGlobeRendering() &&
++                        renderTreeParameters.backgroundColor.a > 0.0f)) {
                  color = renderTreeParameters.backgroundColor;
              }
              parameters.renderPass = parameters.encoder->createRenderPass(

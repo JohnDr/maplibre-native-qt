@@ -42,7 +42,7 @@ index 413bc7e..f5626d1 100644
              }
              result.insert(result.end(), {indices[i], indices[i + 1]});
 diff --git a/src/mln/gfx/fill_generator.cpp b/src/mln/gfx/fill_generator.cpp
-index a0375ad..31f77a9 100644
+index a0375ad..1cbb2cc 100644
 --- a/src/mln/gfx/fill_generator.cpp
 +++ b/src/mln/gfx/fill_generator.cpp
 @@ -37,6 +37,47 @@ struct GeometryTooLongException : std::exception {};
@@ -93,7 +93,7 @@ index a0375ad..31f77a9 100644
  std::size_t addRingVertices(gfx::VertexVector<FillLayoutVertex>& vertices, const GeometryCoordinates& ring) {
      for (auto& point : ring) {
          vertices.emplace_back(FillBucket::layoutVertex(point));
-@@ -131,10 +172,24 @@ void addSubdividedPolygon(const util::SubdivisionResult& subdivided,
+@@ -131,10 +172,28 @@ void addSubdividedPolygon(const util::SubdivisionResult& subdivided,
          }
          auto& lineSegment = lineSegments.back();
          const auto base = static_cast<uint16_t>(lineSegment.vertexLength);
@@ -102,14 +102,18 @@ index a0375ad..31f77a9 100644
 -            lineIndexes.emplace_back(static_cast<uint16_t>(base + line[i]), static_cast<uint16_t>(base + line[i + 1]));
 +            const uint32_t i0 = line[i];
 +            const uint32_t i1 = line[i + 1];
-+            // Skip outline segments lying along the tile's vertical boundary (x == 0 / x == EXTENT).
++            // Skip outline segments lying along the tile's boundary (x or y == 0 / EXTENT).
 +            // These are artifacts of clipping the fill to the tile, not real polygon edges. Both
-+            // neighbouring tiles would otherwise stroke the shared meridian, doubling into a darker line.
++            // neighbouring tiles would otherwise stroke the shared edge, doubling into a darker line.
 +            const bool onLeftEdge =
 +                subdivided.vertices[i0 * 2] == 0 && subdivided.vertices[i1 * 2] == 0;
 +            const bool onRightEdge = subdivided.vertices[i0 * 2] == util::EXTENT &&
 +                                     subdivided.vertices[i1 * 2] == util::EXTENT;
-+            if (onLeftEdge || onRightEdge) {
++            const bool onBottomEdge =
++                subdivided.vertices[i0 * 2 + 1] == 0 && subdivided.vertices[i1 * 2 + 1] == 0;
++            const bool onTopEdge = subdivided.vertices[i0 * 2 + 1] == util::EXTENT &&
++                                   subdivided.vertices[i1 * 2 + 1] == util::EXTENT;
++            if (onLeftEdge || onRightEdge || onBottomEdge || onTopEdge) {
 +                continue;
 +            }
 +            lineIndexes.emplace_back(static_cast<uint16_t>(base + i0), static_cast<uint16_t>(base + i1));
@@ -120,7 +124,7 @@ index a0375ad..31f77a9 100644
      }
      if (!lineSegments.empty()) {
          lineSegments.back().vertexLength += totalVertices;
-@@ -176,7 +231,7 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
+@@ -176,7 +235,7 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
          limitHoles(polygon, 500);
  
          if (subdivisionGranularity >= 2) {
