@@ -134,6 +134,9 @@ public:
     [[nodiscard]] ProjectionType projectionType() const;
     void setProjectionType(ProjectionType type);
 
+    // Backdrop colour (space) drawn behind the map - relevant when rendering the globe.
+    void setBackgroundColor(const QColor &color);
+
     [[nodiscard]] Coordinate coordinate() const;
     void setCoordinate(const Coordinate &coordinate);
     void setCoordinateZoom(const Coordinate &coordinate, double zoom);

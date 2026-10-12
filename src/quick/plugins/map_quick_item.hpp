@@ -35,6 +35,8 @@ class MapQuickItem : public QQuickItem {
     // globe renderer lands. Exposed on this element so QML can write
     // `projectionType: MapLibre.Globe`.
     Q_PROPERTY(ProjectionType projectionType READ projectionType WRITE setProjectionType NOTIFY projectionTypeChanged)
+    // CFID addition: backdrop colour (space) drawn behind the map (visible around the globe).
+    Q_PROPERTY(QColor backgroundColor READ backgroundColor WRITE setBackgroundColor NOTIFY backgroundColorChanged)
 
 public:
     enum SyncState : int {
@@ -69,6 +71,9 @@ public:
     [[nodiscard]] ProjectionType projectionType() const;
     void setProjectionType(ProjectionType type);
 
+    [[nodiscard]] QColor backgroundColor() const;
+    void setBackgroundColor(const QColor &color);
+
     Q_INVOKABLE void pan(const QPointF &offset);
     Q_INVOKABLE void scale(double scale, const QPointF &center);
     Q_INVOKABLE void easeTo(const QVariantMap &camera, const QVariantMap &animation = QVariantMap());
@@ -83,6 +88,7 @@ signals:
     void zoomLevelChanged();
     void styleLoadedChanged();
     void projectionTypeChanged();
+    void backgroundColorChanged();
 
 protected:
     void componentComplete() override;

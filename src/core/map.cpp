@@ -888,6 +888,14 @@ void Map::setMaxPitch(double maxPitch) {
     d_ptr->mapObj->setBounds(mln::BoundOptions().withMaxPitch(maxPitch));
 }
 
+// CFID addition: set the backdrop colour (space) drawn behind the map.
+void Map::setBackgroundColor(const QColor &color) {
+    d_ptr->mapObj->setBackgroundColor(mln::Color(static_cast<float>(color.redF()),
+                                                 static_cast<float>(color.greenF()),
+                                                 static_cast<float>(color.blueF()),
+                                                 static_cast<float>(color.alphaF())));
+}
+
 /*!
     \brief Get the map north orientation mode.
     \return The map north orientation mode.

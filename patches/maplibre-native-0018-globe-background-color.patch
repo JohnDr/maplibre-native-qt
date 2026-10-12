@@ -1,0 +1,135 @@
+diff --git a/src/mln/renderer/update_parameters.hpp b/src/mln/renderer/update_parameters.hpp
+index 64ee8d5..cc5de92 100644
+--- a/src/mln/renderer/update_parameters.hpp
++++ b/src/mln/renderer/update_parameters.hpp
+@@ -8,9 +8,11 @@
+ #include <mln/style/layer.hpp>
+ #include <mln/text/glyph.hpp>
+ #include <mln/util/chrono.hpp>
++#include <mln/util/color.hpp>
+ #include <mln/util/immutable.hpp>
+ 
+ #include <numbers>
++#include <optional>
+ #include <vector>
+ 
+ #include <mapbox/std/weak.hpp>
+@@ -55,6 +57,9 @@ public:
+     double tileLodPitchThreshold = (60.0 / 180.0) * std::numbers::pi;
+     double tileLodZoomShift = 0;
+     TileLodMode tileLodMode = TileLodMode::Default;
++
++    // CFID: custom backdrop colour (space) applied to the render-tree background.
++    std::optional<Color> backgroundColor;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/map/map_impl.hpp b/src/mln/map/map_impl.hpp
+index d12e050..e59db98 100644
+--- a/src/mln/map/map_impl.hpp
++++ b/src/mln/map/map_impl.hpp
+@@ -41,6 +41,12 @@ public:
+     Impl(RendererFrontend&, MapObserver&, std::shared_ptr<FileSource>, const MapOptions&);
+     ~Impl() final;
+ 
++    // CFID: set the backdrop colour (space) used by the renderer.
++    void setBackgroundColor(const Color& color) {
++        backgroundColor = color;
++        onUpdate();
++    }
++
+     // TransformObserver
+     void onCameraWillChange(MapObserver::CameraChangeMode) final;
+     void onCameraIsChanging() final;
+@@ -115,6 +121,9 @@ public:
+     double tileLodPitchThreshold = (60.0 / 180.0) * std::numbers::pi;
+     double tileLodZoomShift = 0;
+     TileLodMode tileLodMode = TileLodMode::Default;
++
++    // CFID: custom backdrop colour applied to the render-tree background.
++    std::optional<Color> backgroundColor;
+ };
+ 
+ // Forward declaration of this method is required for the MapProjection class
+diff --git a/src/mln/map/map_impl.cpp b/src/mln/map/map_impl.cpp
+index 6c66f24..2a25896 100644
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -142,7 +142,8 @@ void Map::Impl::onUpdate() {
+                                .tileLodScale = tileLodScale,
+                                .tileLodPitchThreshold = tileLodPitchThreshold,
+                                .tileLodZoomShift = tileLodZoomShift,
+-                               .tileLodMode = tileLodMode};
++                               .tileLodMode = tileLodMode,
++                               .backgroundColor = backgroundColor};
+ 
+     rendererFrontend.update(std::make_shared<UpdateParameters>(std::move(params)));
+ }
+diff --git a/include/mln/map/map.hpp b/include/mln/map/map.hpp
+index 55804db..2e369d7 100644
+--- a/include/mln/map/map.hpp
++++ b/include/mln/map/map.hpp
+@@ -5,6 +5,7 @@
+ #include <mln/map/map_observer.hpp>
+ #include <mln/map/map_options.hpp>
+ #include <mln/map/mode.hpp>
++#include <mln/util/color.hpp>
+ #include <mln/util/noncopyable.hpp>
+ #include <mln/util/size.hpp>
+ #include <mln/annotation/annotation.hpp>
+@@ -148,6 +149,9 @@ public:
+     void setPrefetchZoomDelta(uint8_t delta);
+     uint8_t getPrefetchZoomDelta() const;
+ 
++    // CFID: backdrop colour (space) drawn behind the map - relevant when rendering the globe.
++    void setBackgroundColor(const Color& color);
++
+     // Debug
+     void setDebug(MapDebugOptions);
+     MapDebugOptions getDebug() const;
+diff --git a/src/mln/map/map.cpp b/src/mln/map/map.cpp
+index 5fb6704..08ca1e3 100644
+--- a/src/mln/map/map.cpp
++++ b/src/mln/map/map.cpp
+@@ -552,6 +552,10 @@ uint8_t Map::getPrefetchZoomDelta() const {
+     return impl->prefetchZoomDelta;
+ }
+ 
++void Map::setBackgroundColor(const Color& color) {
++    impl->setBackgroundColor(color);
++}
++
+ bool Map::isFullyLoaded() const {
+     return impl->style->impl->isLoaded() && impl->rendererFullyLoaded;
+ }
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index 986c018..11f2e76 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -429,6 +429,13 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
+         addChanges(changes);
+     }
+ 
++    // CFID: a custom backdrop colour overrides the style background for the render-tree
++    // background (the clear colour) - including on the globe, where the style background is
++    // drawn as a sphere mesh and would otherwise leave the space unpainted.
++    if (updateParameters->backgroundColor) {
++        renderTreeParameters->backgroundColor = *updateParameters->backgroundColor;
++    }
++
+     renderTreeParameters->loaded = updateParameters->styleLoaded && isLoaded();
+     if (!isMapModeContinuous && !renderTreeParameters->loaded) {
+         return nullptr;
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+index b6446f3..1e83aa7 100644
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -369,7 +369,7 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+             std::optional<Color> color;
+             if (parameters.debugOptions & MapDebugOptions::Overdraw) {
+                 color = Color::black();
+-            } else if (!backend.contextIsShared()) {
++            } else if (!backend.contextIsShared() || renderTreeParameters.backgroundColor.a > 0.0f) {
+                 color = renderTreeParameters.backgroundColor;
+             }
+             parameters.renderPass = parameters.encoder->createRenderPass(

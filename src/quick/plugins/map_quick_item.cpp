@@ -136,6 +136,21 @@ void MapQuickItem::setProjectionType(ProjectionType type) {
     emit projectionTypeChanged();
 }
 
+QColor MapQuickItem::backgroundColor() const {
+    Q_D(const MapQuickItem);
+    return d->m_backgroundColor;
+}
+
+void MapQuickItem::setBackgroundColor(const QColor &color) {
+    Q_D(MapQuickItem);
+
+    d->m_backgroundColor = color;
+    if (d->m_map != nullptr) {
+        d->m_map->setBackgroundColor(color);
+    }
+    emit backgroundColorChanged();
+}
+
 void MapQuickItem::setZoomLevel(double zoomLevel) {
     Q_D(MapQuickItem);
 
@@ -513,6 +528,10 @@ void MapQuickItemPrivate::initialize() {
 
     // CFID: allow the map to tilt further than the MapLibre default of 60 degrees.
     m_map->setMaxPitch(85);
+
+    if (m_backgroundColor.isValid()) {
+        m_map->setBackgroundColor(m_backgroundColor);
+    }
 
     // Connect before the style load is started below. Connecting later (e.g. when the scene graph
     // node is first created) races the load: a style that resolves quickly, such as one already in
