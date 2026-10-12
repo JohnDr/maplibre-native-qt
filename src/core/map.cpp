@@ -938,6 +938,22 @@ void Map::setProjectionType(ProjectionType type) {
 }
 
 /*!
+    \brief Drape the elevation of a raster-dem source over the map.
+    \param source The id of a raster-dem source in the style.
+    \param exaggeration Vertical exaggeration of the terrain.
+*/
+void Map::setTerrain(const QString &source, double exaggeration) {
+    d_ptr->mapObj->setTerrain(source.toStdString(), exaggeration);
+}
+
+/*!
+    \brief Remove the terrain, returning the map to a flat surface.
+*/
+void Map::clearTerrain() {
+    d_ptr->mapObj->clearTerrain();
+}
+
+/*!
     \brief Set gesture in progress status.
     \param progress The gesture in progress status.
 

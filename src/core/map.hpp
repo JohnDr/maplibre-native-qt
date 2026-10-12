@@ -134,6 +134,12 @@ public:
     [[nodiscard]] ProjectionType projectionType() const;
     void setProjectionType(ProjectionType type);
 
+    // Terrain: drapes the elevation of a `raster-dem` source over the map. An
+    // empty `source` clears it. Throws (as a std::runtime_error) if the source
+    // is missing or is not a raster-dem source.
+    void setTerrain(const QString &source, double exaggeration = 1.0);
+    void clearTerrain();
+
     // Backdrop colour (space) drawn behind the map - relevant when rendering the globe.
     void setBackgroundColor(const QColor &color);
 

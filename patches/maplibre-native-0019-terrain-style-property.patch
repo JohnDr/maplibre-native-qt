@@ -1,0 +1,627 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4477628ebe46..5e964a6d0acb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -308,6 +308,7 @@ list(APPEND INCLUDE_FILES
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/layer.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/light.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/projection.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/terrain.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/position.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/property_value.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/conversion/rotation.hpp
+@@ -380,6 +381,7 @@ list(APPEND INCLUDE_FILES
+     ${PROJECT_SOURCE_DIR}/include/mln/style/property_expression.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/property_value.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/rotation.hpp
++    ${PROJECT_SOURCE_DIR}/include/mln/style/terrain.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/source.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/sources/custom_geometry_source.hpp
+     ${PROJECT_SOURCE_DIR}/include/mln/style/sources/custom_vector_source.hpp
+@@ -708,6 +710,7 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/layer.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/light.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/projection.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/terrain.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/position.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/property_value.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/hillshade_conversions.cpp
+@@ -829,6 +832,9 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/style/projection.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/projection_impl.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/projection_observer.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/terrain.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/terrain_impl.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/terrain_observer.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/observer.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/paint_property.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/parser.cpp
+diff --git a/include/mln/map/map.hpp b/include/mln/map/map.hpp
+index 2e369d72abc0..42a196d4fb08 100644
+--- a/include/mln/map/map.hpp
++++ b/include/mln/map/map.hpp
+@@ -121,6 +121,13 @@ public:
+     void setProjectionType(ProjectionType);
+     ProjectionType getProjectionType() const;
+ 
++    // Terrain. The elevation of a `raster-dem` source is draped over the map as a 3D surface.
++    void setTerrain(const std::string& sourceId, double exaggeration = 1.0);
++    void clearTerrain();
++    bool hasTerrain() const;
++    std::string getTerrainSource() const;
++    double getTerrainExaggeration() const;
++
+     // Projection
+     ScreenCoordinate pixelForLatLng(const LatLng&) const;
+     LatLng latLngForPixel(const ScreenCoordinate&) const;
+diff --git a/include/mln/style/conversion/terrain.hpp b/include/mln/style/conversion/terrain.hpp
+new file mode 100644
+index 000000000000..1d5effab5a0d
+--- /dev/null
++++ b/include/mln/style/conversion/terrain.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <mln/style/conversion.hpp>
++#include <mln/style/terrain.hpp>
++
++#include <optional>
++
++namespace mln {
++namespace style {
++namespace conversion {
++
++template <>
++struct Converter<Terrain> {
++public:
++    std::optional<Terrain> operator()(const Convertible& value, Error& error) const;
++};
++
++} // namespace conversion
++} // namespace style
++} // namespace mln
+diff --git a/include/mln/style/style.hpp b/include/mln/style/style.hpp
+index c104e3aa6ce6..08edf142387c 100644
+--- a/include/mln/style/style.hpp
++++ b/include/mln/style/style.hpp
+@@ -19,6 +19,7 @@ namespace style {
+ 
+ class Light;
+ class Projection;
++class Terrain;
+ class Source;
+ class Layer;
+ 
+@@ -53,6 +54,12 @@ public:
+ 
+     void setProjection(std::unique_ptr<Projection>);
+ 
++    // Terrain
++    Terrain* getTerrain();
++    const Terrain* getTerrain() const;
++
++    void setTerrain(std::unique_ptr<Terrain>);
++
+     // Images
+     std::optional<Image> getImage(const std::string&) const;
+     void addImage(std::unique_ptr<Image>);
+diff --git a/include/mln/style/terrain.hpp b/include/mln/style/terrain.hpp
+new file mode 100644
+index 000000000000..338826641366
+--- /dev/null
++++ b/include/mln/style/terrain.hpp
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <mln/style/conversion.hpp>
++#include <mln/style/style_property.hpp>
++#include <mln/util/immutable.hpp>
++
++#include <optional>
++#include <string>
++
++namespace mln {
++namespace style {
++
++class TerrainObserver;
++
++/// The style's root `terrain` object: a `raster-dem` source whose elevation is draped over the map as a 3D surface.
++class Terrain {
++public:
++    Terrain();
++    ~Terrain();
++
++    std::optional<conversion::Error> setProperty(const std::string& name, const conversion::Convertible& value);
++    StyleProperty getProperty(const std::string&) const;
++
++    static double getDefaultExaggeration();
++    double getExaggeration() const;
++    void setExaggeration(double);
++
++    const std::string& getSource() const;
++    void setSource(std::string);
++
++    /// Whether a source has been assigned; an unset terrain renders the map flat.
++    bool isEnabled() const;
++
++    class Impl;
++    Immutable<Impl> impl;
++    explicit Terrain(Immutable<Impl>);
++    Mutable<Impl> mutableImpl() const;
++
++    TerrainObserver* observer = nullptr;
++    void setObserver(TerrainObserver*);
++};
++
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/map/map.cpp b/src/mln/map/map.cpp
+index 08ca1e3c0786..6fe03ef5daed 100644
+--- a/src/mln/map/map.cpp
++++ b/src/mln/map/map.cpp
+@@ -7,6 +7,7 @@
+ #include <mln/math/angles.hpp>
+ #include <mln/style/projection.hpp>
+ #include <mln/style/projection_definition.hpp>
++#include <mln/style/terrain.hpp>
+ #include <mln/style/style_impl.hpp>
+ #include <mln/math/log2.hpp>
+ #include <mln/renderer/renderer_frontend.hpp>
+@@ -26,6 +27,7 @@
+ #include <mln/util/action_journal.hpp>
+ 
+ #include <utility>
++#include <stdexcept>
+ 
+ namespace mln {
+ 
+@@ -441,6 +443,51 @@ ProjectionType Map::getProjectionType() const {
+     return impl->transform.getProjectionType();
+ }
+ 
++// MARK: - Terrain
++
++void Map::setTerrain(const std::string& sourceId, double exaggeration) {
++    if (!impl->style) {
++        throw std::runtime_error("Terrain requires a style to be loaded");
++    }
++    auto* source = impl->style->getSource(sourceId);
++    if (!source) {
++        throw std::runtime_error("Terrain source '" + sourceId + "' not found in style");
++    }
++    if (source->getType() != style::SourceType::RasterDEM) {
++        throw std::runtime_error("Terrain source '" + sourceId + "' must be a raster-dem source");
++    }
++    auto terrain = std::make_unique<style::Terrain>();
++    terrain->setSource(sourceId);
++    terrain->setExaggeration(exaggeration);
++    impl->style->impl->setTerrain(std::move(terrain));
++    impl->onUpdate();
++}
++
++void Map::clearTerrain() {
++    if (impl->style) {
++        impl->style->impl->setTerrain(std::make_unique<style::Terrain>());
++    }
++    impl->onUpdate();
++}
++
++bool Map::hasTerrain() const {
++    return impl->style && impl->style->getTerrain() && impl->style->getTerrain()->isEnabled();
++}
++
++std::string Map::getTerrainSource() const {
++    if (auto* terrain = impl->style ? impl->style->getTerrain() : nullptr) {
++        return terrain->getSource();
++    }
++    return {};
++}
++
++double Map::getTerrainExaggeration() const {
++    if (auto* terrain = impl->style ? impl->style->getTerrain() : nullptr) {
++        return terrain->getExaggeration();
++    }
++    return style::Terrain::getDefaultExaggeration();
++}
++
+ // MARK: - Projection
+ 
+ ScreenCoordinate Map::pixelForLatLng(const LatLng& latLng) const {
+diff --git a/src/mln/style/conversion/terrain.cpp b/src/mln/style/conversion/terrain.cpp
+new file mode 100644
+index 000000000000..d872d300e4e2
+--- /dev/null
++++ b/src/mln/style/conversion/terrain.cpp
+@@ -0,0 +1,38 @@
++#include <mln/style/conversion/terrain.hpp>
++#include <mln/style/conversion_impl.hpp>
++#include <mln/style/conversion/constant.hpp>
++
++namespace mln {
++namespace style {
++namespace conversion {
++
++std::optional<Terrain> Converter<Terrain>::operator()(const Convertible& value, Error& error) const {
++    if (!isObject(value)) {
++        error.message = "terrain must be an object";
++        return std::nullopt;
++    }
++
++    Terrain terrain;
++
++    if (const auto source = objectMember(value, "source")) {
++        const auto converted = convert<std::string>(*source, error);
++        if (!converted) {
++            return std::nullopt;
++        }
++        terrain.setSource(*converted);
++    }
++
++    if (const auto exaggeration = objectMember(value, "exaggeration")) {
++        const auto converted = convert<float>(*exaggeration, error);
++        if (!converted) {
++            return std::nullopt;
++        }
++        terrain.setExaggeration(*converted);
++    }
++
++    return {std::move(terrain)};
++}
++
++} // namespace conversion
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/parser.cpp b/src/mln/style/parser.cpp
+index 70fedf0a281d..b73486899163 100644
+--- a/src/mln/style/parser.cpp
++++ b/src/mln/style/parser.cpp
+@@ -6,6 +6,7 @@
+ #include <mln/style/conversion/layer.hpp>
+ #include <mln/style/conversion/light.hpp>
+ #include <mln/style/conversion/projection.hpp>
++#include <mln/style/conversion/terrain.hpp>
+ #include <mln/style/conversion/sprite.hpp>
+ #include <mln/style/conversion/transition_options.hpp>
+ #include <mln/style/conversion_impl.hpp>
+@@ -117,6 +118,10 @@ StyleParseResult Parser::parse(const std::string& json) {
+         parseProjection(document["projection"]);
+     }
+ 
++    if (document.HasMember("terrain")) {
++        parseTerrain(document["terrain"]);
++    }
++
+     if (document.HasMember("sources")) {
+         parseSources(document["sources"]);
+     }
+@@ -251,6 +256,16 @@ void Parser::parseProjection(const JSValue& value) {
+     projection = *converted;
+ }
+ 
++void Parser::parseTerrain(const JSValue& value) {
++    conversion::Error error;
++    std::optional<Terrain> converted = conversion::convert<Terrain>(value, error);
++    if (!converted) {
++        Log::Warning(Event::ParseStyle, error.message);
++        return;
++    }
++    terrain = *converted;
++}
++
+ void Parser::parseSources(const JSValue& value) {
+     if (!value.IsObject()) {
+         Log::Warning(Event::ParseStyle, "sources must be an object");
+diff --git a/src/mln/style/parser.hpp b/src/mln/style/parser.hpp
+index 84d3f983dc96..45c8cbeef1a5 100644
+--- a/src/mln/style/parser.hpp
++++ b/src/mln/style/parser.hpp
+@@ -5,6 +5,7 @@
+ #include <mln/style/source.hpp>
+ #include <mln/style/light.hpp>
+ #include <mln/style/projection.hpp>
++#include <mln/style/terrain.hpp>
+ 
+ #include <mln/text/glyph.hpp>
+ 
+@@ -41,6 +42,7 @@ public:
+     TransitionOptions transition{{util::DEFAULT_TRANSITION_DURATION}};
+     Light light;
+     Projection projection;
++    Terrain terrain;
+ 
+     std::string name;
+     LatLng latLng;
+@@ -57,6 +59,7 @@ private:
+     void parseTransition(const JSValue&);
+     void parseLight(const JSValue&);
+     void parseProjection(const JSValue&);
++    void parseTerrain(const JSValue&);
+     void parseSources(const JSValue&);
+     void parseSprites(const JSValue&);
+     void parseLayers(const JSValue&);
+diff --git a/src/mln/style/style.cpp b/src/mln/style/style.cpp
+index 03a271a209cd..9230f241f332 100644
+--- a/src/mln/style/style.cpp
++++ b/src/mln/style/style.cpp
+@@ -3,6 +3,7 @@
+ #include <mln/style/layer.hpp>
+ #include <mln/style/light.hpp>
+ #include <mln/style/projection.hpp>
++#include <mln/style/terrain.hpp>
+ #include <mln/style/source.hpp>
+ #include <mln/style/style.hpp>
+ #include <mln/style/style_impl.hpp>
+@@ -88,6 +89,18 @@ const Projection* Style::getProjection() const {
+     return impl->getProjection();
+ }
+ 
++void Style::setTerrain(std::unique_ptr<Terrain> terrain) {
++    impl->setTerrain(std::move(terrain));
++}
++
++Terrain* Style::getTerrain() {
++    return impl->getTerrain();
++}
++
++const Terrain* Style::getTerrain() const {
++    return impl->getTerrain();
++}
++
+ std::optional<Image> Style::getImage(const std::string& name) const {
+     MLN_TRACE_FUNC();
+ 
+diff --git a/src/mln/style/style_impl.cpp b/src/mln/style/style_impl.cpp
+index cc080bd7be32..987141d04da8 100644
+--- a/src/mln/style/style_impl.cpp
++++ b/src/mln/style/style_impl.cpp
+@@ -5,6 +5,7 @@
+ #include <mln/storage/response.hpp>
+ #include <mln/style/image_impl.hpp>
+ #include <mln/style/projection.hpp>
++#include <mln/style/terrain.hpp>
+ #include <mln/style/layer_impl.hpp>
+ #include <mln/style/layers/background_layer.hpp>
+ #include <mln/style/layers/circle_layer.hpp>
+@@ -34,10 +35,12 @@ Style::Impl::Impl(std::shared_ptr<FileSource> fileSource_, float pixelRatio, con
+       spriteLoader(std::make_unique<SpriteLoader>(pixelRatio, threadPool_)),
+       light(std::make_unique<Light>()),
+       projection(std::make_unique<Projection>()),
++      terrain(std::make_unique<Terrain>()),
+       observer(&nullObserver) {
+     spriteLoader->setObserver(this);
+     light->setObserver(this);
+     projection->setObserver(this);
++    terrain->setObserver(this);
+ }
+ 
+ Style::Impl::~Impl() = default;
+@@ -126,6 +129,7 @@ void Style::Impl::parse(const std::string& json_) {
+ 
+     setLight(std::make_unique<Light>(parser.light));
+     setProjection(std::make_unique<Projection>(parser.projection));
++    setTerrain(std::make_unique<Terrain>(parser.terrain));
+ 
+     if (fileSource) {
+         if (parser.sprites.empty()) {
+@@ -264,6 +268,16 @@ Projection* Style::Impl::getProjection() const {
+     return projection.get();
+ }
+ 
++void Style::Impl::setTerrain(std::unique_ptr<Terrain> terrain_) {
++    terrain = std::move(terrain_);
++    terrain->setObserver(this);
++    onTerrainChanged(*terrain);
++}
++
++Terrain* Style::Impl::getTerrain() const {
++    return terrain.get();
++}
++
+ std::string Style::Impl::getName() const {
+     return name;
+ }
+@@ -441,6 +455,10 @@ void Style::Impl::onProjectionChanged(const Projection&) {
+     observer->onUpdate();
+ }
+ 
++void Style::Impl::onTerrainChanged(const Terrain&) {
++    observer->onUpdate();
++}
++
+ void Style::Impl::dumpDebugLogs() const {
+     Log::Info(Event::General, "styleURL: " + url);
+     for (const auto& source : sources) {
+diff --git a/src/mln/style/style_impl.hpp b/src/mln/style/style_impl.hpp
+index 0514a3b2bab6..4ea7db6464a8 100644
+--- a/src/mln/style/style_impl.hpp
++++ b/src/mln/style/style_impl.hpp
+@@ -8,6 +8,7 @@
+ #include <mln/style/layer_observer.hpp>
+ #include <mln/style/light_observer.hpp>
+ #include <mln/style/projection_observer.hpp>
++#include <mln/style/terrain_observer.hpp>
+ #include <mln/sprite/sprite_loader_observer.hpp>
+ #include <mln/style/image.hpp>
+ #include <mln/style/source.hpp>
+@@ -39,6 +40,7 @@ class Style::Impl : public SpriteLoaderObserver,
+                      public LayerObserver,
+                      public LightObserver,
+                      public ProjectionObserver,
++                     public TerrainObserver,
+                      public util::noncopyable {
+ public:
+     Impl(std::shared_ptr<FileSource>, float pixelRatio, const TaggedScheduler& threadPool_);
+@@ -90,6 +92,9 @@ public:
+     void setProjection(std::unique_ptr<Projection>);
+     Projection* getProjection() const;
+ 
++    void setTerrain(std::unique_ptr<Terrain>);
++    Terrain* getTerrain() const;
++
+     std::optional<Immutable<style::Image::Impl>> getImage(const std::string&) const;
+     void addImage(std::unique_ptr<style::Image>);
+     void removeImage(const std::string&);
+@@ -127,6 +132,7 @@ private:
+     TransitionOptions transitionOptions;
+     std::unique_ptr<Light> light;
+     std::unique_ptr<Projection> projection;
++    std::unique_ptr<Terrain> terrain;
+     std::unordered_map<std::string, bool> spritesLoadingStatus;
+ 
+     // Defaults
+@@ -153,6 +159,9 @@ private:
+     // ProjectionObserver implementation.
+     void onProjectionChanged(const Projection&) override;
+ 
++    // TerrainObserver implementation.
++    void onTerrainChanged(const Terrain&) override;
++
+     Observer nullObserver;
+     Observer* observer = &nullObserver;
+ 
+diff --git a/src/mln/style/terrain.cpp b/src/mln/style/terrain.cpp
+new file mode 100644
+index 000000000000..a03412be5546
+--- /dev/null
++++ b/src/mln/style/terrain.cpp
+@@ -0,0 +1,95 @@
++#include <mln/style/terrain.hpp>
++#include <mln/style/terrain_impl.hpp>
++#include <mln/style/terrain_observer.hpp>
++#include <mln/style/conversion_impl.hpp>
++#include <mln/style/conversion/constant.hpp>
++
++#include <utility>
++
++namespace mln {
++namespace style {
++
++namespace {
++TerrainObserver nullObserver;
++} // namespace
++
++Terrain::Terrain(Immutable<Terrain::Impl> impl_)
++    : impl(std::move(impl_)),
++      observer(&nullObserver) {}
++
++Terrain::Terrain()
++    : Terrain(makeMutable<Impl>()) {}
++
++Terrain::~Terrain() = default;
++
++void Terrain::setObserver(TerrainObserver* observer_) {
++    observer = observer_ ? observer_ : &nullObserver;
++}
++
++Mutable<Terrain::Impl> Terrain::mutableImpl() const {
++    return makeMutable<Impl>(*impl);
++}
++
++double Terrain::getDefaultExaggeration() {
++    return 1.0;
++}
++
++double Terrain::getExaggeration() const {
++    return impl->exaggeration;
++}
++
++void Terrain::setExaggeration(double exaggeration_) {
++    auto mutableImpl_ = mutableImpl();
++    mutableImpl_->exaggeration = exaggeration_;
++    impl = std::move(mutableImpl_);
++    observer->onTerrainChanged(*this);
++}
++
++const std::string& Terrain::getSource() const {
++    return impl->source;
++}
++
++void Terrain::setSource(std::string source_) {
++    auto mutableImpl_ = mutableImpl();
++    mutableImpl_->source = std::move(source_);
++    impl = std::move(mutableImpl_);
++    observer->onTerrainChanged(*this);
++}
++
++bool Terrain::isEnabled() const {
++    return !impl->source.empty();
++}
++
++std::optional<conversion::Error> Terrain::setProperty(const std::string& name, const conversion::Convertible& value) {
++    conversion::Error error;
++    if (name == "source") {
++        const auto converted = conversion::convert<std::string>(value, error);
++        if (!converted) {
++            return error;
++        }
++        setSource(*converted);
++        return std::nullopt;
++    }
++    if (name == "exaggeration") {
++        const auto converted = conversion::convert<float>(value, error);
++        if (!converted) {
++            return error;
++        }
++        setExaggeration(*converted);
++        return std::nullopt;
++    }
++    return conversion::Error{"terrain doesn't support this property"};
++}
++
++StyleProperty Terrain::getProperty(const std::string& name) const {
++    if (name == "source") {
++        return {conversion::makeValue(impl->source), StyleProperty::Kind::Constant};
++    }
++    if (name == "exaggeration") {
++        return {conversion::makeValue(impl->exaggeration), StyleProperty::Kind::Constant};
++    }
++    return {};
++}
++
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/terrain_impl.hpp b/src/mln/style/terrain_impl.hpp
+new file mode 100644
+index 000000000000..b7e3ce096a1e
+--- /dev/null
++++ b/src/mln/style/terrain_impl.hpp
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <mln/style/terrain.hpp>
++
++#include <string>
++
++namespace mln {
++namespace style {
++
++class Terrain::Impl {
++public:
++    std::string source;
++    double exaggeration = 1.0;
++};
++
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/terrain_observer.hpp b/src/mln/style/terrain_observer.hpp
+new file mode 100644
+index 000000000000..f192c5e31838
+--- /dev/null
++++ b/src/mln/style/terrain_observer.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++
++namespace mln {
++namespace style {
++
++class Terrain;
++
++class TerrainObserver {
++public:
++    virtual ~TerrainObserver() = default;
++
++    virtual void onTerrainChanged(const Terrain&) {}
++};
++
++} // namespace style
++} // namespace mln

@@ -29,6 +29,7 @@
 
 #include <memory>
 #include <type_traits>
+#include <exception>
 
 static_assert(std::is_same_v<std::underlying_type_t<QMapLibre::Map::ProjectionType>,
                              std::underlying_type_t<QMapLibre::MapQuickItem::ProjectionType>>,
@@ -149,6 +150,42 @@ void MapQuickItem::setBackgroundColor(const QColor &color) {
         d->m_map->setBackgroundColor(color);
     }
     emit backgroundColorChanged();
+}
+
+QString MapQuickItem::terrainSource() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_terrainSource;
+}
+
+void MapQuickItem::setTerrainSource(const QString &source) {
+    Q_D(MapQuickItem);
+
+    if (d->m_terrainSource == source) {
+        return;
+    }
+
+    d->m_terrainSource = source;
+    d->applyTerrain();
+    emit terrainChanged();
+}
+
+double MapQuickItem::terrainExaggeration() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_terrainExaggeration;
+}
+
+void MapQuickItem::setTerrainExaggeration(double exaggeration) {
+    Q_D(MapQuickItem);
+
+    if (qFuzzyCompare(d->m_terrainExaggeration, exaggeration)) {
+        return;
+    }
+
+    d->m_terrainExaggeration = exaggeration;
+    d->applyTerrain();
+    emit terrainChanged();
 }
 
 void MapQuickItem::setZoomLevel(double zoomLevel) {
@@ -476,6 +513,8 @@ void MapQuickItem::onMapChanged(Map::MapChange change) {
         // Loading a style resets the projection to the style's root property, so
         // re-apply the projection selected through this item.
         d->m_map->setProjectionType(projectionFromMapQuickItem(d->m_projectionType));
+        // Terrain also lives on the style, so re-apply it after a (re)load.
+        d->applyTerrain();
     } else if (change == Map::MapChangeWillStartLoadingMap) {
         if (d->m_styleLoaded) {
             d->m_styleLoaded = false;
@@ -513,6 +552,22 @@ void MapQuickItem::onStyleParameterUpdated(StyleParameter *parameter) {
 
 MapQuickItemPrivate::MapQuickItemPrivate(MapQuickItem *q)
     : q_ptr(q) {}
+
+void MapQuickItemPrivate::applyTerrain() {
+    if (m_map == nullptr || !m_styleLoaded) {
+        return;
+    }
+
+    try {
+        if (m_terrainSource.isEmpty()) {
+            m_map->clearTerrain();
+        } else {
+            m_map->setTerrain(m_terrainSource, m_terrainExaggeration);
+        }
+    } catch (const std::exception &error) {
+        qWarning("MapLibre terrain: %s", error.what());
+    }
+}
 
 void MapQuickItemPrivate::initialize() {
     Q_Q(MapQuickItem);

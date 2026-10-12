@@ -37,6 +37,10 @@ class MapQuickItem : public QQuickItem {
     Q_PROPERTY(ProjectionType projectionType READ projectionType WRITE setProjectionType NOTIFY projectionTypeChanged)
     // CFID addition: backdrop colour (space) drawn behind the map (visible around the globe).
     Q_PROPERTY(QColor backgroundColor READ backgroundColor WRITE setBackgroundColor NOTIFY backgroundColorChanged)
+    // CFID addition: terrain - the id of a raster-dem source draped over the map as a 3D
+    // surface. An empty source disables terrain (flat map).
+    Q_PROPERTY(QString terrainSource READ terrainSource WRITE setTerrainSource NOTIFY terrainChanged)
+    Q_PROPERTY(double terrainExaggeration READ terrainExaggeration WRITE setTerrainExaggeration NOTIFY terrainChanged)
 
 public:
     enum SyncState : int {
@@ -74,6 +78,12 @@ public:
     [[nodiscard]] QColor backgroundColor() const;
     void setBackgroundColor(const QColor &color);
 
+    [[nodiscard]] QString terrainSource() const;
+    void setTerrainSource(const QString &source);
+
+    [[nodiscard]] double terrainExaggeration() const;
+    void setTerrainExaggeration(double exaggeration);
+
     Q_INVOKABLE void pan(const QPointF &offset);
     Q_INVOKABLE void scale(double scale, const QPointF &center);
     Q_INVOKABLE void easeTo(const QVariantMap &camera, const QVariantMap &animation = QVariantMap());
@@ -89,6 +99,7 @@ signals:
     void styleLoadedChanged();
     void projectionTypeChanged();
     void backgroundColorChanged();
+    void terrainChanged();
 
 protected:
     void componentComplete() override;

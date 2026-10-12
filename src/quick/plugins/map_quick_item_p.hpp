@@ -32,6 +32,9 @@ public:
 
     void syncStyleChanges();
 
+    // Re-applies the terrain selected through this item to the map (once the style is loaded).
+    void applyTerrain();
+
     Settings m_settings;
     std::shared_ptr<Map> m_map;
 
@@ -42,6 +45,8 @@ public:
     bool m_styleLoaded{};
         MapQuickItem::ProjectionType m_projectionType = MapQuickItem::Mercator;
         QColor m_backgroundColor;
+        QString m_terrainSource;
+        double m_terrainExaggeration = 1.0;
 
     QString m_mapItemsBefore; // TODO: make this a property
     QList<StyleParameter *> m_mapParameters;
