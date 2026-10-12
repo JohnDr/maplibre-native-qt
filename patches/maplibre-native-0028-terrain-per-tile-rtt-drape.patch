@@ -1,0 +1,354 @@
+diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
+index 6180eddbb62a..04da523aceef 100644
+--- a/include/mln/shaders/vulkan/terrain.hpp
++++ b/include/mln/shaders/vulkan/terrain.hpp
+@@ -39,7 +39,8 @@ void main() {
+     gl_Position = projectTileFor3D(in_position.xy, in_position.z, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+     v_shade = in_position.w;
+-    v_uv = gl_Position.xy / gl_Position.w * 0.5 + 0.5;
++    // Tile-local texture coordinate (0..1) for this tile's own drape texture.
++    v_uv = in_position.xy / 8192.0;
+ }
+ )";
+ 
+@@ -53,8 +54,7 @@ layout(set = DRAWABLE_IMAGE_SET_INDEX, binding = 0) uniform sampler2D drapeSampl
+ layout(location = 0) out vec4 out_color;
+ 
+ void main() {
+-    // Screen-space drape: the map is rendered to an offscreen texture and sampled at this fragment's screen position,
+-    // then shaded by the precomputed hillshade.
++    // Per-tile drape: this tile's own texture, shaded by the precomputed hillshade.
+     const vec4 draped = texture(drapeSampler, vec2(v_uv.x, 1.0 - v_uv.y));
+     out_color = vec4(draped.rgb * clamp(v_shade, 0.0, 1.0), 1.0);
+ }
+diff --git a/src/mln/renderer/layer_tweaker.cpp b/src/mln/renderer/layer_tweaker.cpp
+index 4094cab6620f..f181afd86a50 100644
+--- a/src/mln/renderer/layer_tweaker.cpp
++++ b/src/mln/renderer/layer_tweaker.cpp
+@@ -113,9 +113,11 @@ void LayerTweaker::multiplyWithProjectionMatrix(/*in-out*/ mat4& matrix,
+                                                 bool nearClipped,
+                                                 bool aligned) {
+     // nearClippedMatrix has near plane moved further, to enhance depth buffer precision
+-    const auto& projMatrixRef = aligned ? parameters.transformParams.alignedProjMatrix
+-                                        : (nearClipped ? parameters.transformParams.nearClippedProjMatrix
+-                                                       : parameters.transformParams.projMatrix);
++    const auto& projMatrixRef = parameters.projMatrixOverride
++                                    ? *parameters.projMatrixOverride
++                                    : (aligned ? parameters.transformParams.alignedProjMatrix
++                                               : (nearClipped ? parameters.transformParams.nearClippedProjMatrix
++                                                              : parameters.transformParams.projMatrix));
+ #if !MLN_RENDER_BACKEND_OPENGL
+     // If this drawable is participating in depth testing, offset the
+     // projection matrix NDC depth range for the drawable's layer and sublayer.
+diff --git a/src/mln/renderer/paint_parameters.cpp b/src/mln/renderer/paint_parameters.cpp
+index f50294174553..eca4e395b868 100644
+--- a/src/mln/renderer/paint_parameters.cpp
++++ b/src/mln/renderer/paint_parameters.cpp
+@@ -116,6 +116,9 @@ mat4 PaintParameters::matrixForTile(const UnwrappedTileID& tileID, bool aligned)
+ }
+ 
+ ProjectionData PaintParameters::projectionDataForTile(const UnwrappedTileID& tileID, bool aligned) const {
++    if (projMatrixOverride) {
++        return state.getProjectionData(tileID, *projMatrixOverride);
++    }
+     return state.getProjectionData(tileID, aligned ? transformParams.alignedProjMatrix : transformParams.projMatrix);
+ }
+ 
+diff --git a/src/mln/renderer/paint_parameters.hpp b/src/mln/renderer/paint_parameters.hpp
+index 95345e38488b..48c5639801fe 100644
+--- a/src/mln/renderer/paint_parameters.hpp
++++ b/src/mln/renderer/paint_parameters.hpp
+@@ -3,6 +3,8 @@
+ #include <mln/renderer/render_pass.hpp>
+ #include <mln/renderer/render_light.hpp>
+ #include <mln/renderer/render_source.hpp>
++#include <mln/util/mat4.hpp>
++#include <optional>
+ #include <mln/map/mode.hpp>
+ #include <mln/map/transform_state.hpp>
+ #include <mln/gfx/depth_mode.hpp>
+@@ -76,6 +78,10 @@ public:
+     const TransformState& state;
+     const EvaluatedLight& evaluatedLight;
+ 
++    // When set, overrides the camera projection for this render pass. Used to render layer groups into a per-tile
++    // terrain drape target with a per-tile orthographic projection.
++    std::optional<mat4> projMatrixOverride;
++
+     RenderStaticData& staticData;
+     LineAtlas& lineAtlas;
+     PatternAtlas& patternAtlas;
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index b86dfcf4f94b..bdb980f6511a 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -5,6 +5,11 @@
+ #include <mln/renderer/change_request.hpp>
+ #include <mln/renderer/renderer_observer.hpp>
+ #include <mln/renderer/render_target.hpp>
++#include <mln/map/transform_state.hpp>
++#include <mln/gfx/upload_pass.hpp>
++#include <mln/util/projection.hpp>
++#include <mln/util/mat4.hpp>
++#include <set>
+ #include <mln/renderer/render_source.hpp>
+ #include <mln/renderer/render_layer.hpp>
+ #include <mln/renderer/render_static_data.hpp>
+@@ -1008,36 +1013,44 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+ 
+     globeDepthPass.update(shaders, context, state, *updateParameters, has3D);
+ 
+-    // Terrain drape: render the map layers into an offscreen texture that the terrain samples.
++    terrainPass.update(shaders, context, state, paintParameters, *updateParameters);
++
++    // Terrain drape: one tile-sized offscreen target per terrain tile, holding the draped map layers.
+     const bool terrainEnabled = updateParameters->terrainTileset.has_value() &&
+                                 !updateParameters->terrainTileset->tiles.empty();
+     if (terrainEnabled) {
+-        const Size drapeSize = paintParameters.renderableSize;
+-        if (!terrainDrapeTarget || terrainDrapeTargetSize != drapeSize) {
+-            if (terrainDrapeTarget) {
+-                removeRenderTarget(terrainDrapeTarget);
+-            }
+-            terrainDrapeTarget = context.createRenderTarget(drapeSize, gfx::TextureChannelDataType::UnsignedByte);
+-            terrainDrapeTargetSize = drapeSize;
+-            if (terrainDrapeTarget) {
+-                addRenderTarget(terrainDrapeTarget);
++        constexpr uint32_t drapeTileSize = 512;
++        const auto& cover = terrainPass.getCover();
++        std::map<std::tuple<uint8_t, uint32_t, uint32_t>, gfx::Texture2DPtr> drapeTextures;
++        std::set<std::tuple<uint8_t, uint32_t, uint32_t>> live;
++        for (const auto& tileID : cover) {
++            const auto c = tileID.canonical;
++            const auto key = std::make_tuple(c.z, c.x, c.y);
++            live.insert(key);
++            auto it = terrainDrapeTargets.find(key);
++            if (it == terrainDrapeTargets.end()) {
++                auto rt = context.createRenderTarget({drapeTileSize, drapeTileSize},
++                                                     gfx::TextureChannelDataType::UnsignedByte);
++                if (!rt) {
++                    continue;
++                }
++                it = terrainDrapeTargets.emplace(key, rt).first;
+             }
+-        }
+-        if (terrainDrapeTarget) {
+             for (auto& [index, layerGroup] : layerGroupsByLayerIndex) {
+                 if (layerGroup) {
+-                    terrainDrapeTarget->addLayerGroup(layerGroup, /*replace=*/true);
++                    it->second->addLayerGroup(layerGroup, /*replace=*/true);
+                 }
+             }
+-            terrainPass.setDrapeTexture(terrainDrapeTarget->getTexture());
++            drapeTextures[key] = it->second->getTexture();
+         }
+-    } else if (terrainDrapeTarget) {
+-        removeRenderTarget(terrainDrapeTarget);
+-        terrainDrapeTarget.reset();
+-        terrainPass.setDrapeTexture(nullptr);
++        for (auto it = terrainDrapeTargets.begin(); it != terrainDrapeTargets.end();) {
++            it = live.contains(it->first) ? std::next(it) : terrainDrapeTargets.erase(it);
++        }
++        terrainPass.applyDrapeTextures(drapeTextures);
++    } else if (!terrainDrapeTargets.empty()) {
++        terrainDrapeTargets.clear();
++        terrainPass.applyDrapeTextures({});
+     }
+-
+-    terrainPass.update(shaders, context, state, paintParameters, *updateParameters);
+ }
+ 
+ void RenderOrchestrator::processChanges() {
+@@ -1067,6 +1080,39 @@ bool RenderOrchestrator::removeRenderTarget(const RenderTargetPtr& renderTarget)
+     }
+ }
+ 
++void RenderOrchestrator::uploadTerrainDrapeTargets(gfx::UploadPass& uploadPass) {
++    for (auto& [key, renderTarget] : terrainDrapeTargets) {
++        if (renderTarget) {
++            renderTarget->upload(uploadPass);
++        }
++    }
++}
++
++void RenderOrchestrator::renderTerrainDrapeTargets(const RenderTree& renderTree, PaintParameters& parameters) {
++    if (terrainDrapeTargets.empty()) {
++        return;
++    }
++    const TransformState& state = parameters.transformParams.state;
++    const double worldSize = Projection::worldSize(state.getScale());
++
++    for (auto& [key, renderTarget] : terrainDrapeTargets) {
++        if (!renderTarget) {
++            continue;
++        }
++        const auto [z, x, y] = key;
++        const double tileScale = static_cast<double>(1ull << z);
++        const double s = worldSize / tileScale;
++        const double tx = static_cast<double>(x) * s;
++        const double ty = static_cast<double>(y) * s;
++        // Orthographic projection mapping this tile's world extent to the render target's [-1, 1] clip space.
++        mat4 ortho;
++        matrix::ortho(ortho, tx, tx + s, ty, ty + s, -1.0, 1.0);
++        parameters.projMatrixOverride = ortho;
++        renderTarget->render(*this, renderTree, parameters);
++    }
++    parameters.projMatrixOverride.reset();
++}
++
+ void RenderOrchestrator::updateDebugLayerGroups(const RenderTree& renderTree, PaintParameters& parameters) {
+     for (const RenderItem& item : renderTree.getSourceRenderItems()) {
+         item.updateDebugDrawables(debugLayerGroups, parameters);
+diff --git a/src/mln/renderer/render_orchestrator.hpp b/src/mln/renderer/render_orchestrator.hpp
+index 4e53e4da9b42..f174c1896b25 100644
+--- a/src/mln/renderer/render_orchestrator.hpp
++++ b/src/mln/renderer/render_orchestrator.hpp
+@@ -20,6 +20,7 @@
+ 
+ #include <map>
+ #include <memory>
++#include <tuple>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -42,6 +43,7 @@ class RenderTree;
+ namespace gfx {
+ class ShaderRegistry;
+ class Drawable;
++class UploadPass;
+ using DrawablePtr = std::shared_ptr<Drawable>;
+ class DynamicTextureAtlas;
+ using DynamicTextureAtlasPtr = std::shared_ptr<gfx::DynamicTextureAtlas>;
+@@ -161,6 +163,10 @@ public:
+ 
+     void updateDebugLayerGroups(const RenderTree& renderTree, PaintParameters& parameters);
+ 
++    // Terrain drape: per-tile render targets holding the draped map layers, rendered with a per-tile projection.
++    void uploadTerrainDrapeTargets(gfx::UploadPass&);
++    void renderTerrainDrapeTargets(const RenderTree&, PaintParameters&);
++
+     template <typename Func /* void(LayerGroupBase&) */>
+     void visitDebugLayerGroups(Func f) {
+         for (auto& pair : debugLayerGroups) {
+@@ -252,9 +258,9 @@ private:
+ 
+     std::vector<RenderTargetPtr> renderTargets;
+ 
+-    // Offscreen target holding the map layers draped over the terrain.
+-    RenderTargetPtr terrainDrapeTarget;
+-    Size terrainDrapeTargetSize;
++    // Per-tile offscreen targets holding the map layers draped over the terrain, keyed by tile (z, x, y).
++    std::map<std::tuple<uint8_t, uint32_t, uint32_t>, RenderTargetPtr> terrainDrapeTargets;
++    std::uint8_t terrainDrapeZoom = 0;
+     RenderItem::DebugLayerGroupMap debugLayerGroups;
+     GlobeDepthPass globeDepthPass;
+     TerrainPass terrainPass;
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+index c5fa79fd12f8..d10de4dc32b8 100644
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -296,6 +296,7 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+         if (auto* terrain = orchestrator.getTerrainLayerGroup()) {
+             terrain->upload(*uploadPass);
+         }
++        orchestrator.uploadTerrainDrapeTargets(*uploadPass);
+ 
+         // Give the render targets a chance to upload
+         orchestrator.visitRenderTargets([&](RenderTarget& renderTarget) { renderTarget.upload(*uploadPass); });
+@@ -361,6 +362,8 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+         // draw render targets
+         orchestrator.visitRenderTargets(
+             [&](RenderTarget& renderTarget) { renderTarget.render(orchestrator, renderTree, parameters); });
++        // draw the terrain drape targets (per-tile, with a per-tile projection)
++        orchestrator.renderTerrainDrapeTargets(renderTree, parameters);
+     };
+ 
+     const auto commonClearPass = [&] {
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index f9f43ceb3b33..940286cbc8d9 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -168,6 +168,8 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+     layerGroup->removeDrawablesIf(
+         [&](gfx::Drawable& drawable) { return drawable.getTileID() && !covered.contains(*drawable.getTileID()); });
+ 
++    cover = tileCover;
++
+     std::unique_ptr<gfx::DrawableBuilder> builder;
+     for (const auto& tileID : tileCover) {
+         if (layerGroup->getDrawableCount(RenderPass::Translucent, tileID) > 0) {
+@@ -190,9 +192,6 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+             builder->setDepthType(gfx::DepthMaskType::ReadWrite);
+             builder->setCullFaceMode(gfx::CullFaceMode::disabled());
+             builder->setVertexAttrId(shaders::idTerrainPosVertexAttribute);
+-            if (drapeTexture) {
+-                builder->setTexture(drapeTexture, shaders::idTerrainDrapeTexture);
+-            }
+         }
+ 
+         auto mesh = buildTerrainMesh(*data, updateParameters.terrainExaggeration, metersPerPixel);
+@@ -244,4 +243,21 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+     }
+ }
+ 
++void TerrainPass::applyDrapeTextures(
++    const std::map<std::tuple<uint8_t, uint32_t, uint32_t>, gfx::Texture2DPtr>& textures) {
++    if (!layerGroup) {
++        return;
++    }
++    visitLayerGroupDrawables(*layerGroup, [&](gfx::Drawable& drawable) {
++        if (!drawable.getTileID()) {
++            return;
++        }
++        const auto c = drawable.getTileID()->canonical;
++        const auto it = textures.find({c.z, c.x, c.y});
++        if (it != textures.end() && it->second) {
++            drawable.setTexture(it->second, shaders::idTerrainDrapeTexture);
++        }
++    });
++}
++
+ } // namespace mln
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index a4443fd2d35f..cbaf618301c4 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -4,12 +4,16 @@
+ #include <mln/gfx/uniform_buffer.hpp>
+ #include <mln/gfx/texture2d.hpp>
+ #include <mln/shaders/shader_program_base.hpp>
++#include <mln/tile/tile_id.hpp>
+ #include <mln/util/tileset.hpp>
+ 
+ #include <cstdint>
+ #include <functional>
++#include <map>
+ #include <memory>
+ #include <optional>
++#include <tuple>
++#include <vector>
+ 
+ namespace mln {
+ 
+@@ -38,14 +42,17 @@ public:
+     /// Called when a DEM tile loads, so the map can schedule another frame.
+     void setTileLoadedCallback(std::function<void()> callback) { onTileLoaded = std::move(callback); }
+ 
+-    /// The offscreen texture holding the draped map layers, sampled by the terrain shader.
+-    void setDrapeTexture(gfx::Texture2DPtr texture) { drapeTexture = std::move(texture); }
++    /// The terrain tiles currently covered, in the same order as their drape textures.
++    const std::vector<OverscaledTileID>& getCover() const { return cover; }
++
++    /// Bind each terrain drawable to the draped texture of its own tile (per-tile RTT).
++    void applyDrapeTextures(const std::map<std::tuple<uint8_t, uint32_t, uint32_t>, gfx::Texture2DPtr>& textures);
+ 
+ private:
+     TileLayerGroupPtr layerGroup;
+     gfx::ShaderProgramBasePtr shader;
+     gfx::UniformBufferPtr projectionUniformBuffer;
+-    gfx::Texture2DPtr drapeTexture;
++    std::vector<OverscaledTileID> cover;
+     std::unique_ptr<TerrainTileManager> terrain;
+     std::optional<Tileset> tileset;
+     std::function<void()> onTileLoaded;
