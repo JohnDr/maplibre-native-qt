@@ -1,0 +1,84 @@
+diff --git a/src/mln/geometry/dem_data.cpp b/src/mln/geometry/dem_data.cpp
+index 5389732abd32..7dcf390049e9 100644
+--- a/src/mln/geometry/dem_data.cpp
++++ b/src/mln/geometry/dem_data.cpp
+@@ -1,6 +1,9 @@
+ #include <mln/geometry/dem_data.hpp>
+ #include <mln/math/clamp.hpp>
+ 
++#include <algorithm>
++#include <cmath>
++
+ namespace mln {
+ 
+ DEMData::DEMData(const PremultipliedImage& _image, Tileset::RasterEncoding _encoding)
+@@ -93,6 +96,22 @@ int32_t DEMData::get(const int32_t x, const int32_t y) const {
+     return static_cast<int32_t>(value[0] * unpack[0] + value[1] * unpack[1] + value[2] * unpack[2] - unpack[3]);
+ }
+ 
++double DEMData::getElevation(double x, double y) const {
++    x = std::clamp(x, 0.0, static_cast<double>(dim));
++    y = std::clamp(y, 0.0, static_cast<double>(dim));
++    const auto x0 = static_cast<int32_t>(std::floor(x));
++    const auto y0 = static_cast<int32_t>(std::floor(y));
++    const auto x1 = std::min(x0 + 1, dim);
++    const auto y1 = std::min(y0 + 1, dim);
++    const double u = x - x0;
++    const double v = y - y0;
++    const double z00 = static_cast<double>(get(x0, y0));
++    const double z10 = static_cast<double>(get(x1, y0));
++    const double z01 = static_cast<double>(get(x0, y1));
++    const double z11 = static_cast<double>(get(x1, y1));
++    return z00 * (1.0 - u) * (1.0 - v) + z10 * u * (1.0 - v) + z01 * (1.0 - u) * v + z11 * u * v;
++}
++
+ const std::array<float, 4>& DEMData::getUnpackVector() const {
+     // https://www.mapbox.com/help/access-elevation-data/#mapbox-terrain-rgb
+     static const std::array<float, 4> unpackMapbox = {{6553.6f, 25.6f, 0.1f, 10000.0f}};
+diff --git a/src/mln/geometry/dem_data.hpp b/src/mln/geometry/dem_data.hpp
+index 1ee105f9529b..18d457ea2d68 100644
+--- a/src/mln/geometry/dem_data.hpp
++++ b/src/mln/geometry/dem_data.hpp
+@@ -19,6 +19,10 @@ public:
+     int32_t get(int32_t x, int32_t y) const;
+     const std::array<float, 4>& getUnpackVector() const;
+ 
++    /// Bilinearly interpolated elevation, in metres, at the continuous tile coordinate (`x`, `y`) within `[0, dim]`.
++    /// Mirrors GL JS `DEMData#getElevation`, adapted to this class's one-pixel border.
++    double getElevation(double x, double y) const;
++
+     const PremultipliedImage* getImage() const { return &*image; }
+     const std::shared_ptr<PremultipliedImage>& getImagePtr() const { return image; }
+ 
+diff --git a/test/geometry/dem_data.test.cpp b/test/geometry/dem_data.test.cpp
+index 35668dd60ae7..81b0228595b4 100644
+--- a/test/geometry/dem_data.test.cpp
++++ b/test/geometry/dem_data.test.cpp
+@@ -135,3 +135,27 @@ TEST(DEMData, BackfillNeighbor) {
+     // backfulls BottomLeft neighbor
+     EXPECT_TRUE(dem0.get(4, -1) == dem1.get(0, 3));
+ };
++
++TEST(DEMData, GetElevationMatchesGetAtIntegerCoordinates) {
++    PremultipliedImage image = fakeImage({16, 16});
++    DEMData demdata(image, Tileset::RasterEncoding::Mapbox);
++
++    for (int32_t x = 0; x < 16; x++) {
++        for (int32_t y = 0; y < 16; y++) {
++            EXPECT_DOUBLE_EQ(demdata.getElevation(x, y), demdata.get(x, y));
++        }
++    }
++};
++
++TEST(DEMData, GetElevationBilinearMidpoint) {
++    PremultipliedImage image = fakeImage({16, 16});
++    DEMData demdata(image, Tileset::RasterEncoding::Mapbox);
++
++    for (int32_t x = 0; x < 15; x++) {
++        for (int32_t y = 0; y < 15; y++) {
++            const double expected = 0.25 * (demdata.get(x, y) + demdata.get(x + 1, y) + demdata.get(x, y + 1) +
++                                            demdata.get(x + 1, y + 1));
++            EXPECT_DOUBLE_EQ(demdata.getElevation(x + 0.5, y + 0.5), expected);
++        }
++    }
++};
