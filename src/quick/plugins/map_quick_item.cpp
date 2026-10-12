@@ -476,6 +476,12 @@ void MapQuickItem::onMapChanged(Map::MapChange change) {
     } else if (change == Map::MapChangeDidFinishLoadingMap) {
         // TODO: make it more elegant
         QTimer::singleShot(intervalTime, this, &QQuickItem::update);
+    } else if (change == Map::MapChangeDidFinishRenderingFrame) {
+        // The map rendered a partial frame (e.g. tiles arriving after the initial load). Rendering is
+        // driven by Qt scene-graph repaints, so without scheduling another update the freshly rendered
+        // frame is never shown until some other input forces a repaint. Keep repainting until the map
+        // reports a fully rendered frame.
+        QTimer::singleShot(0, this, &QQuickItem::update);
     }
 }
 
