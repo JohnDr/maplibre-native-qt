@@ -1,0 +1,287 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5e964a6d0acb..10bc21aca042 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -180,6 +180,8 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/gfx/uniform_buffer.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/gfx/vertex_attribute.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_target.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/terrain_tile_manager.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/terrain_tile_manager.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/change_request.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/layer_group.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/tile_layer_group.cpp
+diff --git a/src/mln/renderer/terrain_tile_manager.cpp b/src/mln/renderer/terrain_tile_manager.cpp
+new file mode 100644
+index 000000000000..4380078b6335
+--- /dev/null
++++ b/src/mln/renderer/terrain_tile_manager.cpp
+@@ -0,0 +1,137 @@
++#include <mln/renderer/terrain_tile_manager.hpp>
++
++#include <mln/geometry/dem_data.hpp>
++#include <mln/math/clamp.hpp>
++#include <mln/storage/file_source.hpp>
++#include <mln/storage/resource.hpp>
++#include <mln/storage/response.hpp>
++#include <mln/util/async_request.hpp>
++#include <mln/util/constants.hpp>
++#include <mln/util/image.hpp>
++
++#include <cmath>
++#include <stdexcept>
++
++namespace mln {
++
++namespace {
++
++constexpr double pi = 3.14159265358979323846;
++
++std::tuple<uint8_t, uint32_t, uint32_t> keyFor(const CanonicalTileID& id) {
++    return {id.z, id.x, id.y};
++}
++
++/// The continuous tile coordinate of `latLng` at `zoom`, in the range [0, 2^zoom].
++void tileCoordinate(const LatLng& latLng, uint8_t zoom, double& x, double& y) {
++    const double n = std::ldexp(1.0, zoom); // 2^zoom
++    const double lat = util::clamp(latLng.latitude(), -util::LATITUDE_MAX, util::LATITUDE_MAX);
++    x = (latLng.longitude() + 180.0) / 360.0 * n;
++    const double sin = std::sin(lat * pi / 180.0);
++    y = (0.5 - std::log((1.0 + sin) / (1.0 - sin)) / (4.0 * pi)) * n;
++}
++
++} // namespace
++
++TerrainTileManager::TerrainTileManager(FileSource* fileSource_, Tileset tileset_)
++    : fileSource(fileSource_),
++      tileset(std::move(tileset_)) {}
++
++TerrainTileManager::~TerrainTileManager() = default;
++
++void TerrainTileManager::setTileset(Tileset tileset_) {
++    tileset = std::move(tileset_);
++}
++
++CanonicalTileID TerrainTileManager::tileFor(const LatLng& latLng, uint8_t zoom) {
++    double x;
++    double y;
++    tileCoordinate(latLng, zoom, x, y);
++    const auto dim = static_cast<double>(std::ldexp(1.0, zoom));
++    return {zoom,
++            static_cast<uint32_t>(util::clamp(std::floor(x), 0.0, dim - 1.0)),
++            static_cast<uint32_t>(util::clamp(std::floor(y), 0.0, dim - 1.0))};
++}
++
++double TerrainTileManager::getElevation(const LatLng& latLng, uint8_t zoom) {
++    const CanonicalTileID id = tileFor(latLng, zoom);
++    const auto data = getDEMData(id);
++    if (!data) {
++        return 0.0;
++    }
++    double x;
++    double y;
++    tileCoordinate(latLng, zoom, x, y);
++    const double dim = static_cast<double>(data->dim);
++    return data->getElevation((x - id.x) * dim, (y - id.y) * dim);
++}
++
++bool TerrainTileManager::hasData() const {
++    for (const auto& [key, entry] : tiles) {
++        if (entry.data) {
++            return true;
++        }
++    }
++    return false;
++}
++
++std::shared_ptr<DEMData> TerrainTileManager::getDEMData(const CanonicalTileID& id) {
++    auto it = tiles.find(keyFor(id));
++    if (it == tiles.end()) {
++        it = tiles.emplace(keyFor(id), Entry{}).first;
++    }
++    if (it->second.data) {
++        return it->second.data;
++    }
++    if (!it->second.request) {
++        startRequest(id);
++    }
++    return nullptr;
++}
++
++void TerrainTileManager::startRequest(const CanonicalTileID& id) {
++    if (fileSource == nullptr || tileset.tiles.empty()) {
++        return;
++    }
++
++    const auto encoding = tileset.rasterEncoding.value_or(Tileset::RasterEncoding::Mapbox);
++    Resource resource = Resource::tile(tileset.tiles.front(),
++                                       1.0f,
++                                       static_cast<int32_t>(id.x),
++                                       static_cast<int32_t>(id.y),
++                                       static_cast<int8_t>(id.z),
++                                       tileset.scheme,
++                                       Resource::LoadingMethod::NetworkOnly);
++
++    auto& entry = tiles[keyFor(id)];
++    entry.request = fileSource->request(resource, [this, id, encoding](const Response& res) {
++        onTileResponse(id, res, encoding);
++    });
++
++    if (!entry.request) {
++        tiles.erase(keyFor(id));
++    }
++}
++
++void TerrainTileManager::onTileResponse(const CanonicalTileID& id,
++                                        const Response& res,
++                                        Tileset::RasterEncoding encoding) {
++    const auto it = tiles.find(keyFor(id));
++    if (it == tiles.end()) {
++        return;
++    }
++    it->second.request.reset();
++
++    if (res.error || !res.data) {
++        return;
++    }
++
++    try {
++        PremultipliedImage image = decodeImage(*res.data);
++        it->second.data = std::make_shared<DEMData>(image, encoding);
++    } catch (const std::exception&) {
++        // A malformed DEM tile simply leaves the terrain flat there.
++    }
++}
++
++} // namespace mln
+diff --git a/src/mln/renderer/terrain_tile_manager.hpp b/src/mln/renderer/terrain_tile_manager.hpp
+new file mode 100644
+index 000000000000..2b1a255ddbba
+--- /dev/null
++++ b/src/mln/renderer/terrain_tile_manager.hpp
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include <mln/tile/tile_id.hpp>
++#include <mln/util/geo.hpp>
++#include <mln/util/tileset.hpp>
++
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <tuple>
++
++namespace mln {
++
++class AsyncRequest;
++class DEMData;
++class FileSource;
++struct Response;
++
++/// Fetches and caches `raster-dem` tiles for the terrain, independent of any layer, and samples their elevation.
++/// The terrain counterpart of GL JS's `TerrainTileManager`, with a terrain-owned tile set: a `raster-dem` source is
++/// only loaded when a *layer* uses it, and terrain has no layer, so it manages its own tiles.
++class TerrainTileManager {
++public:
++    TerrainTileManager(FileSource* fileSource, Tileset tileset);
++    ~TerrainTileManager();
++
++    void setTileset(Tileset);
++
++    /// The DEM tile (z, x, y) covering `latLng` at `zoom`.
++    static CanonicalTileID tileFor(const LatLng&, uint8_t zoom);
++
++    /// The elevation in metres at `latLng`, sampled from the DEM tile covering it at `zoom`. Requests the tile when it
++    /// is missing, and returns 0 until it has loaded.
++    double getElevation(const LatLng& latLng, uint8_t zoom);
++
++    /// Whether any DEM tile has been loaded.
++    bool hasData() const;
++
++protected:
++    /// The DEM data for a tile, requesting it when necessary. Overridable so tests can inject data.
++    virtual std::shared_ptr<DEMData> getDEMData(const CanonicalTileID&);
++
++private:
++    struct Entry {
++        std::shared_ptr<DEMData> data;
++        std::unique_ptr<AsyncRequest> request;
++    };
++
++    void startRequest(const CanonicalTileID&);
++    void onTileResponse(const CanonicalTileID&, const Response&, Tileset::RasterEncoding);
++
++    FileSource* fileSource;
++    Tileset tileset;
++    std::map<std::tuple<uint8_t, uint32_t, uint32_t>, Entry> tiles;
++};
++
++} // namespace mln
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 3381bd1b88d9..1f1e25a7079a 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -23,6 +23,7 @@ add_library(
+     ${PROJECT_SOURCE_DIR}/test/renderer/pattern_atlas.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/renderer/renderable.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/renderer/shader_registry.test.cpp
++    ${PROJECT_SOURCE_DIR}/test/renderer/terrain_tile_manager.test.cpp
+     $<$<BOOL:${MLN_WITH_WEBGPU}>:${PROJECT_SOURCE_DIR}/test/renderer/wgsl_preprocessor.test.cpp>
+     ${PROJECT_SOURCE_DIR}/test/sprite/sprite_loader.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/sprite/sprite_parser.test.cpp
+diff --git a/test/renderer/terrain_tile_manager.test.cpp b/test/renderer/terrain_tile_manager.test.cpp
+new file mode 100644
+index 000000000000..fef71ecdfcf9
+--- /dev/null
++++ b/test/renderer/terrain_tile_manager.test.cpp
+@@ -0,0 +1,50 @@
++#include <mln/test/util.hpp>
++
++#include <mln/geometry/dem_data.hpp>
++#include <mln/renderer/terrain_tile_manager.hpp>
++#include <mln/util/image.hpp>
++#include <mln/util/tileset.hpp>
++
++using namespace mln;
++
++namespace {
++
++PremultipliedImage zeroImage(Size s) {
++    PremultipliedImage image(s);
++    for (size_t i = 0; i < image.bytes(); i++) {
++        image.data[i] = 0;
++    }
++    return image;
++}
++
++/// Injects DEM data instead of fetching it, so the coordinate mapping and sampling can be tested alone.
++class TestTerrainTileManager final : public TerrainTileManager {
++public:
++    using TerrainTileManager::TerrainTileManager;
++
++    std::shared_ptr<DEMData> injected;
++
++protected:
++    std::shared_ptr<DEMData> getDEMData(const CanonicalTileID&) override { return injected; }
++};
++
++} // namespace
++
++TEST(TerrainTileManager, TileFor) {
++    // At lng 0, lat 0 the world centre is tile (2, 2) at z2.
++    EXPECT_TRUE(TerrainTileManager::tileFor({0.0, 0.0}, 2) == CanonicalTileID(2, 2, 2));
++    // Longitude -180 and 180 clamp to the first and last column.
++    EXPECT_EQ(TerrainTileManager::tileFor({0.0, -180.0}, 2).x, 0u);
++    EXPECT_EQ(TerrainTileManager::tileFor({0.0, 180.0}, 2).x, 3u);
++}
++
++TEST(TerrainTileManager, GetElevationUniform) {
++    // A uniform all-zero Mapbox DEM decodes to a constant elevation of -baseShift = -10000 m everywhere.
++    auto dem = std::make_shared<DEMData>(zeroImage({16, 16}), Tileset::RasterEncoding::Mapbox);
++
++    TestTerrainTileManager manager(nullptr, Tileset{});
++    manager.injected = dem;
++
++    EXPECT_DOUBLE_EQ(manager.getElevation({45.0, 10.0}, 12), -10000.0);
++    EXPECT_DOUBLE_EQ(manager.getElevation({-33.0, 151.0}, 10), -10000.0);
++}
