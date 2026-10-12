@@ -1,0 +1,56 @@
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index 72b2fc6e4c27..55c929129aac 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -132,8 +132,16 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         builtZoom = -1;
+     }
+ 
+-    if (!shader) {
+-        shader = context.getGenericShader(shaders, std::string(TerrainShaderName), gfx::ProjectionVariant::Mercator);
++    const bool globe = state.isGlobeRendering();
++    if (!shader || globe != globeShader) {
++        globeShader = globe;
++        shader = context.getGenericShader(shaders,
++                                          std::string(TerrainShaderName),
++                                          globe ? gfx::ProjectionVariant::Globe : gfx::ProjectionVariant::Mercator);
++        if (layerGroup) {
++            layerGroup->clearDrawables();
++        }
++        builtZoom = -1;
+     }
+     if (!shader) {
+         return;
+@@ -222,12 +230,14 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         drawable.setUBOIndex(uboIndex++);
+         const auto tileID = drawable.getTileID()->toUnwrapped();
+         auto pd = paintParameters.projectionDataForTile(tileID);
+-        mat4 tileMatrix;
+-        paintParameters.state.matrixFor(tileMatrix, tileID);
+-        mat4 composed;
+-        matrix::multiply(composed, paintParameters.transformParams.projMatrix, tileMatrix);
+-        pd.mainMatrix = composed;
+-        pd.fallbackMatrix = composed;
++        if (!globeShader) {
++            mat4 tileMatrix;
++            paintParameters.state.matrixFor(tileMatrix, tileID);
++            mat4 composed;
++            matrix::multiply(composed, paintParameters.transformParams.projMatrix, tileMatrix);
++            pd.mainMatrix = composed;
++            pd.fallbackMatrix = composed;
++        }
+         projectionUBOs.emplace_back(LayerTweaker::toProjectionUBO(pd));
+     });
+ 
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index a0990379aaf9..5e7b77129066 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -56,6 +56,7 @@ private:
+     gfx::ShaderProgramBasePtr shader;
+     gfx::UniformBufferPtr projectionUniformBuffer;
+     std::vector<OverscaledTileID> cover;
++    bool globeShader = false;
+     std::unique_ptr<TerrainTileManager> terrain;
+     std::optional<Tileset> tileset;
+     std::function<void()> onTileLoaded;
