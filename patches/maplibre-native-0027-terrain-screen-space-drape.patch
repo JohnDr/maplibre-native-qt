@@ -1,0 +1,184 @@
+diff --git a/include/mln/shaders/shader_defines.hpp b/include/mln/shaders/shader_defines.hpp
+index 5bb038214c80..c432e187975d 100644
+--- a/include/mln/shaders/shader_defines.hpp
++++ b/include/mln/shaders/shader_defines.hpp
+@@ -490,6 +490,11 @@ enum {
+     terrainVertexAttributeCount
+ };
+ 
++enum {
++    idTerrainDrapeTexture,
++    terrainTextureCount
++};
++
+ enum {
+     idHeatmapPosVertexAttribute,
+ 
+diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
+index 108ef5e98e68..6180eddbb62a 100644
+--- a/include/mln/shaders/vulkan/terrain.hpp
++++ b/include/mln/shaders/vulkan/terrain.hpp
+@@ -15,7 +15,7 @@ struct ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan> {
+ 
+     static const std::array<AttributeInfo, 1> attributes;
+     static constexpr std::array<AttributeInfo, 0> instanceAttributes{};
+-    static const std::array<TextureInfo, 0> textures;
++    static const std::array<TextureInfo, 1> textures;
+ 
+     static constexpr auto prelude = R"(
+ )";
+@@ -33,24 +33,30 @@ layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer
+ } projectionVector;
+ 
+ layout(location = 0) out float v_shade;
++layout(location = 1) out vec2 v_uv;
+ 
+ void main() {
+     gl_Position = projectTileFor3D(in_position.xy, in_position.z, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+     v_shade = in_position.w;
++    v_uv = gl_Position.xy / gl_Position.w * 0.5 + 0.5;
+ }
+ )";
+ 
+     static constexpr auto fragment = R"(
+ 
+ layout(location = 0) in float v_shade;
++layout(location = 1) in vec2 v_uv;
++
++layout(set = DRAWABLE_IMAGE_SET_INDEX, binding = 0) uniform sampler2D drapeSampler;
++
+ layout(location = 0) out vec4 out_color;
+ 
+ void main() {
+-    // A simple hypsometric-ish ramp: greener valleys, paler peaks, darkened by the precomputed shade.
+-    const vec3 low = vec3(0.24, 0.42, 0.24);
+-    const vec3 high = vec3(0.86, 0.83, 0.72);
+-    out_color = vec4(mix(low, high, clamp(v_shade, 0.0, 1.0)), 1.0);
++    // Screen-space drape: the map is rendered to an offscreen texture and sampled at this fragment's screen position,
++    // then shaded by the precomputed hillshade.
++    const vec4 draped = texture(drapeSampler, vec2(v_uv.x, 1.0 - v_uv.y));
++    out_color = vec4(draped.rgb * clamp(v_shade, 0.0, 1.0), 1.0);
+ }
+ )";
+ };
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index 1bb329d0c2fe..b86dfcf4f94b 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -4,6 +4,7 @@
+ #include <mln/layermanager/layer_manager.hpp>
+ #include <mln/renderer/change_request.hpp>
+ #include <mln/renderer/renderer_observer.hpp>
++#include <mln/renderer/render_target.hpp>
+ #include <mln/renderer/render_source.hpp>
+ #include <mln/renderer/render_layer.hpp>
+ #include <mln/renderer/render_static_data.hpp>
+@@ -1006,6 +1007,36 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+     addChanges(changes);
+ 
+     globeDepthPass.update(shaders, context, state, *updateParameters, has3D);
++
++    // Terrain drape: render the map layers into an offscreen texture that the terrain samples.
++    const bool terrainEnabled = updateParameters->terrainTileset.has_value() &&
++                                !updateParameters->terrainTileset->tiles.empty();
++    if (terrainEnabled) {
++        const Size drapeSize = paintParameters.renderableSize;
++        if (!terrainDrapeTarget || terrainDrapeTargetSize != drapeSize) {
++            if (terrainDrapeTarget) {
++                removeRenderTarget(terrainDrapeTarget);
++            }
++            terrainDrapeTarget = context.createRenderTarget(drapeSize, gfx::TextureChannelDataType::UnsignedByte);
++            terrainDrapeTargetSize = drapeSize;
++            if (terrainDrapeTarget) {
++                addRenderTarget(terrainDrapeTarget);
++            }
++        }
++        if (terrainDrapeTarget) {
++            for (auto& [index, layerGroup] : layerGroupsByLayerIndex) {
++                if (layerGroup) {
++                    terrainDrapeTarget->addLayerGroup(layerGroup, /*replace=*/true);
++                }
++            }
++            terrainPass.setDrapeTexture(terrainDrapeTarget->getTexture());
++        }
++    } else if (terrainDrapeTarget) {
++        removeRenderTarget(terrainDrapeTarget);
++        terrainDrapeTarget.reset();
++        terrainPass.setDrapeTexture(nullptr);
++    }
++
+     terrainPass.update(shaders, context, state, paintParameters, *updateParameters);
+ }
+ 
+diff --git a/src/mln/renderer/render_orchestrator.hpp b/src/mln/renderer/render_orchestrator.hpp
+index fd8279828f9a..4e53e4da9b42 100644
+--- a/src/mln/renderer/render_orchestrator.hpp
++++ b/src/mln/renderer/render_orchestrator.hpp
+@@ -251,6 +251,10 @@ private:
+     LayerGroupMap layerGroupsByLayerIndex;
+ 
+     std::vector<RenderTargetPtr> renderTargets;
++
++    // Offscreen target holding the map layers draped over the terrain.
++    RenderTargetPtr terrainDrapeTarget;
++    Size terrainDrapeTargetSize;
+     RenderItem::DebugLayerGroupMap debugLayerGroups;
+     GlobeDepthPass globeDepthPass;
+     TerrainPass terrainPass;
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index c33ed5d250a6..f9f43ceb3b33 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -190,6 +190,9 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+             builder->setDepthType(gfx::DepthMaskType::ReadWrite);
+             builder->setCullFaceMode(gfx::CullFaceMode::disabled());
+             builder->setVertexAttrId(shaders::idTerrainPosVertexAttribute);
++            if (drapeTexture) {
++                builder->setTexture(drapeTexture, shaders::idTerrainDrapeTexture);
++            }
+         }
+ 
+         auto mesh = buildTerrainMesh(*data, updateParameters.terrainExaggeration, metersPerPixel);
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index 7e398f9b3739..a4443fd2d35f 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <mln/renderer/layer_group.hpp>
+ #include <mln/gfx/uniform_buffer.hpp>
++#include <mln/gfx/texture2d.hpp>
+ #include <mln/shaders/shader_program_base.hpp>
+ #include <mln/util/tileset.hpp>
+ 
+@@ -37,10 +38,14 @@ public:
+     /// Called when a DEM tile loads, so the map can schedule another frame.
+     void setTileLoadedCallback(std::function<void()> callback) { onTileLoaded = std::move(callback); }
+ 
++    /// The offscreen texture holding the draped map layers, sampled by the terrain shader.
++    void setDrapeTexture(gfx::Texture2DPtr texture) { drapeTexture = std::move(texture); }
++
+ private:
+     TileLayerGroupPtr layerGroup;
+     gfx::ShaderProgramBasePtr shader;
+     gfx::UniformBufferPtr projectionUniformBuffer;
++    gfx::Texture2DPtr drapeTexture;
+     std::unique_ptr<TerrainTileManager> terrain;
+     std::optional<Tileset> tileset;
+     std::function<void()> onTileLoaded;
+diff --git a/src/mln/shaders/vulkan/terrain.cpp b/src/mln/shaders/vulkan/terrain.cpp
+index 7be9b678410c..762713de0e3f 100644
+--- a/src/mln/shaders/vulkan/terrain.cpp
++++ b/src/mln/shaders/vulkan/terrain.cpp
+@@ -9,7 +9,9 @@ using TerrainShaderSource = ShaderSource<BuiltIn::TerrainShader, gfx::Backend::T
+ const std::array<AttributeInfo, 1> TerrainShaderSource::attributes = {
+     AttributeInfo{0, gfx::AttributeDataType::Float4, idTerrainPosVertexAttribute},
+ };
+-const std::array<TextureInfo, 0> TerrainShaderSource::textures = {};
++const std::array<TextureInfo, 1> TerrainShaderSource::textures = {
++    TextureInfo{0, idTerrainDrapeTexture},
++};
+ 
+ } // namespace shaders
+ } // namespace mln
