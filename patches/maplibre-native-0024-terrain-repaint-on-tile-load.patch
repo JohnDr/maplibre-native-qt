@@ -1,0 +1,101 @@
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index ba0ec1bc7bd6..b84c1dad5637 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -128,6 +128,12 @@ RenderOrchestrator::RenderOrchestrator(bool backgroundLayerAsColor_,
+       threadPool(threadPool_) {
+     glyphManager->setObserver(this);
+     imageManager->setObserver(this);
++    // When a terrain DEM tile loads, schedule another frame so the terrain is rebuilt with the new data.
++    terrainPass.setTileLoadedCallback([this] {
++        if (observer != nullptr) {
++            observer->onInvalidate();
++        }
++    });
+ }
+ 
+ RenderOrchestrator::~RenderOrchestrator() {
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index 1bf74595bf41..ddf6111ee968 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -138,6 +138,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+     if (!tileset || *tileset != *updateParameters.terrainTileset) {
+         tileset = updateParameters.terrainTileset;
+         terrain = std::make_unique<TerrainTileManager>(updateParameters.fileSource.get(), *tileset);
++        terrain->setOnTileLoaded(onTileLoaded);
+         if (layerGroup) {
+             layerGroup->clearDrawables();
+         }
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index e42a26ee18c0..06bf9829c690 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -5,6 +5,7 @@
+ #include <mln/util/tileset.hpp>
+ 
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <optional>
+ 
+@@ -31,11 +32,15 @@ public:
+     /// The layer group holding the terrain drawables, or null before the first enable.
+     LayerGroupBase* getLayerGroup() const { return layerGroup.get(); }
+ 
++    /// Called when a DEM tile loads, so the map can schedule another frame.
++    void setTileLoadedCallback(std::function<void()> callback) { onTileLoaded = std::move(callback); }
++
+ private:
+     TileLayerGroupPtr layerGroup;
+     gfx::ShaderProgramBasePtr shader;
+     std::unique_ptr<TerrainTileManager> terrain;
+     std::optional<Tileset> tileset;
++    std::function<void()> onTileLoaded;
+     uint8_t demZoom = 0;
+     double builtZoom = -1;
+     double builtExaggeration = -1;
+diff --git a/src/mln/renderer/terrain_tile_manager.cpp b/src/mln/renderer/terrain_tile_manager.cpp
+index 4380078b6335..ad5721755d03 100644
+--- a/src/mln/renderer/terrain_tile_manager.cpp
++++ b/src/mln/renderer/terrain_tile_manager.cpp
+@@ -129,6 +129,9 @@ void TerrainTileManager::onTileResponse(const CanonicalTileID& id,
+     try {
+         PremultipliedImage image = decodeImage(*res.data);
+         it->second.data = std::make_shared<DEMData>(image, encoding);
++        if (onTileLoaded) {
++            onTileLoaded();
++        }
+     } catch (const std::exception&) {
+         // A malformed DEM tile simply leaves the terrain flat there.
+     }
+diff --git a/src/mln/renderer/terrain_tile_manager.hpp b/src/mln/renderer/terrain_tile_manager.hpp
+index 35bd91c254aa..85b7bf182089 100644
+--- a/src/mln/renderer/terrain_tile_manager.hpp
++++ b/src/mln/renderer/terrain_tile_manager.hpp
+@@ -5,6 +5,7 @@
+ #include <mln/util/tileset.hpp>
+ 
+ #include <cstdint>
++#include <functional>
+ #include <map>
+ #include <memory>
+ #include <tuple>
+@@ -39,6 +40,9 @@ public:
+     /// The DEM data for a tile, requesting it when necessary. Null until it has loaded.
+     std::shared_ptr<DEMData> getTileData(const CanonicalTileID& id) { return getDEMData(id); }
+ 
++    /// Called when a tile finishes loading, so the map can schedule a repaint.
++    void setOnTileLoaded(std::function<void()> callback) { onTileLoaded = std::move(callback); }
++
+ protected:
+     /// The DEM data for a tile, requesting it when necessary. Overridable so tests can inject data.
+     virtual std::shared_ptr<DEMData> getDEMData(const CanonicalTileID&);
+@@ -54,6 +58,7 @@ private:
+ 
+     FileSource* fileSource;
+     Tileset tileset;
++    std::function<void()> onTileLoaded;
+     std::map<std::tuple<uint8_t, uint32_t, uint32_t>, Entry> tiles;
+ };
+ 
