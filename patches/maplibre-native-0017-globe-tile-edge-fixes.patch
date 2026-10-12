@@ -42,7 +42,7 @@ index 413bc7e..f5626d1 100644
              }
              result.insert(result.end(), {indices[i], indices[i + 1]});
 diff --git a/src/mln/gfx/fill_generator.cpp b/src/mln/gfx/fill_generator.cpp
-index a0375ad..d0de44c 100644
+index a0375ad..31f77a9 100644
 --- a/src/mln/gfx/fill_generator.cpp
 +++ b/src/mln/gfx/fill_generator.cpp
 @@ -37,6 +37,47 @@ struct GeometryTooLongException : std::exception {};
@@ -93,7 +93,34 @@ index a0375ad..d0de44c 100644
  std::size_t addRingVertices(gfx::VertexVector<FillLayoutVertex>& vertices, const GeometryCoordinates& ring) {
      for (auto& point : ring) {
          vertices.emplace_back(FillBucket::layoutVertex(point));
-@@ -176,7 +217,7 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
+@@ -131,10 +172,24 @@ void addSubdividedPolygon(const util::SubdivisionResult& subdivided,
+         }
+         auto& lineSegment = lineSegments.back();
+         const auto base = static_cast<uint16_t>(lineSegment.vertexLength);
++        std::size_t emitted = 0;
+         for (std::size_t i = 0; i + 1 < line.size(); i += 2) {
+-            lineIndexes.emplace_back(static_cast<uint16_t>(base + line[i]), static_cast<uint16_t>(base + line[i + 1]));
++            const uint32_t i0 = line[i];
++            const uint32_t i1 = line[i + 1];
++            // Skip outline segments lying along the tile's vertical boundary (x == 0 / x == EXTENT).
++            // These are artifacts of clipping the fill to the tile, not real polygon edges. Both
++            // neighbouring tiles would otherwise stroke the shared meridian, doubling into a darker line.
++            const bool onLeftEdge =
++                subdivided.vertices[i0 * 2] == 0 && subdivided.vertices[i1 * 2] == 0;
++            const bool onRightEdge = subdivided.vertices[i0 * 2] == util::EXTENT &&
++                                     subdivided.vertices[i1 * 2] == util::EXTENT;
++            if (onLeftEdge || onRightEdge) {
++                continue;
++            }
++            lineIndexes.emplace_back(static_cast<uint16_t>(base + i0), static_cast<uint16_t>(base + i1));
++            ++emitted;
+         }
+-        lineSegment.indexLength += line.size();
++        lineSegment.indexLength += emitted * 2;
+     }
+     if (!lineSegments.empty()) {
+         lineSegments.back().vertexLength += totalVertices;
+@@ -176,7 +231,7 @@ void generateFillAndOutineBuffers(const GeometryCollection& geometry,
          limitHoles(polygon, 500);
  
          if (subdivisionGranularity >= 2) {
