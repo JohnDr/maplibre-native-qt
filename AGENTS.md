@@ -12,6 +12,20 @@
   line** into the canonical CMake trees below. Do **not** try to drive the library
   through the Qt Creator MCP (only the app is on the MCP path).
 
+## If you cannot follow an instruction — ask John
+
+If for any reason you cannot follow an instruction in this file (or in
+`MapLibreEarth/AGENTS.md`), **stop and come back to John for a decision**. Do not
+silently deviate, and do not substitute a workaround on your own initiative. State
+plainly what you could not do and why, and wait.
+
+This applies in particular to the build & run policy above — e.g. if a Qt Creator
+MCP tool blocks or fails (such as `qt-creator_run_project` never returning for a
+long-running GUI app), if a build tree / install prefix does not match, or if you
+find yourself wanting to build or run the app outside Qt Creator (ad-hoc
+command-line app builds, launching the app exe directly, hand-copying runtime
+DLLs). In all such cases: ask first.
+
 ## The handoff guarantee
 
 When you hand the app back, John may run **either** Debug **or** Release. Both must
