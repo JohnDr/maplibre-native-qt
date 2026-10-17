@@ -1,0 +1,1054 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 12b68d1cff5c..fa79d87d1094 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -640,6 +640,8 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_static_data.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/globe_depth_pass.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/globe_depth_pass.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/sky_pass.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/sky_pass.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/terrain_pass.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/terrain_pass.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_tile.cpp
+@@ -715,6 +717,7 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/light.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/projection.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/terrain.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/sky.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/position.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/property_value.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/hillshade_conversions.cpp
+diff --git a/cmake/vulkan.cmake b/cmake/vulkan.cmake
+index bab41bb543bd..d4ba7907db58 100644
+--- a/cmake/vulkan.cmake
++++ b/cmake/vulkan.cmake
+@@ -46,6 +46,7 @@ list(APPEND
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/fill.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/fill_extrusion.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/globe_depth.hpp
++        ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/sky.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/heatmap.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/heatmap_texture.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/hillshade.hpp
+@@ -94,6 +95,7 @@ list(APPEND
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/fill.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/fill_extrusion.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/globe_depth.cpp
++        ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/sky.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/heatmap.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/heatmap_texture.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/hillshade.cpp
+diff --git a/include/mln/shaders/shader_defines.hpp b/include/mln/shaders/shader_defines.hpp
+index c432e187975d..bcc1de56065c 100644
+--- a/include/mln/shaders/shader_defines.hpp
++++ b/include/mln/shaders/shader_defines.hpp
+@@ -98,6 +98,11 @@ enum {
+     backgroundLayerUBOCount
+ };
+ 
++enum {
++    idTerrainFogUBO = getEnumValue(drawableReservedUBOCount, layerUBOStartId),
++    terrainLayerUBOCount
++};
++
+ enum {
+     idCircleEvaluatedPropsUBO = getEnumValue(circleLayerSSBOCount, layerUBOStartId),
+     circleLayerUBOCount
+@@ -485,6 +490,11 @@ enum {
+     globeDepthVertexAttributeCount
+ };
+ 
++enum {
++    idSkyPosVertexAttribute,
++    skyVertexAttributeCount
++};
++
+ enum {
+     idTerrainPosVertexAttribute,
+     terrainVertexAttributeCount
+diff --git a/include/mln/shaders/shader_source.hpp b/include/mln/shaders/shader_source.hpp
+index 922ac654ebc4..aa2efdec8be9 100644
+--- a/include/mln/shaders/shader_source.hpp
++++ b/include/mln/shaders/shader_source.hpp
+@@ -29,6 +29,7 @@ enum class BuiltIn {
+     FillExtrusionPatternShader,
+     FillExtrusionPatternInstancedShader,
+     GlobeDepthShader,
++    SkyShader,
+     TerrainShader,
+     HeatmapShader,
+     HeatmapTextureShader,
+diff --git a/include/mln/shaders/vulkan/sky.hpp b/include/mln/shaders/vulkan/sky.hpp
+new file mode 100644
+index 000000000000..2bed1c7ab320
+--- /dev/null
++++ b/include/mln/shaders/vulkan/sky.hpp
+@@ -0,0 +1,71 @@
++#pragma once
++
++#include <mln/shaders/shader_source.hpp>
++#include <mln/shaders/vulkan/shader_program.hpp>
++
++namespace mln {
++namespace shaders {
++
++/// The sky: a screen-filling quad shaded by the distance above the horizon line (MapLibre GL JS `sky.fragment.glsl`,
++/// Mercator branch). Drawn first, under everything else; the area below the horizon is left transparent.
++template <>
++struct ShaderSource<BuiltIn::SkyShader, gfx::Backend::Type::Vulkan> {
++    static constexpr const char* name = "SkyShader";
++
++    static const std::array<AttributeInfo, 1> attributes;
++    static constexpr std::array<AttributeInfo, 0> instanceAttributes{};
++    static const std::array<TextureInfo, 0> textures;
++
++    static constexpr auto prelude = R"(
++
++#define idSkyUBO idDrawableReservedFragmentOnlyUBO
++
++)";
++    static constexpr auto vertex = R"(
++
++layout(location = 0) in ivec2 in_position;
++
++void main() {
++    gl_Position = vec4(vec2(in_position), 0.0, 1.0);
++}
++)";
++
++    static constexpr auto fragment = R"(
++
++layout(location = 0) out vec4 out_color;
++
++layout(push_constant) uniform Constants {
++    int ubo_index;
++} constant;
++
++struct SkyUBO {
++    vec4 sky_color;     // premultiplied
++    vec4 horizon_color; // premultiplied
++    vec4 horizon;       // xy: a point on the horizon line (framebuffer pixels, y down); z: sky-horizon blend (pixels)
++    vec4 normal;        // xy: horizon normal (pointing up the screen, y down)
++};
++
++layout(std140, set = LAYER_SET_INDEX, binding = idSkyUBO) readonly buffer SkyUBOVector {
++    SkyUBO sky_ubo[];
++} skyVector;
++
++void main() {
++    const SkyUBO sky = skyVector.sky_ubo[constant.ubo_index];
++
++    // Signed distance above the horizon, in pixels.
++    const float blend = (sky.horizon.y - gl_FragCoord.y) * sky.normal.y + (gl_FragCoord.x - sky.horizon.x) * sky.normal.x;
++
++    out_color = vec4(0.0);
++    if (blend > 0.0) {
++        if (blend < sky.horizon.z) {
++            out_color = mix(sky.sky_color, sky.horizon_color, pow(1.0 - blend / sky.horizon.z, 2.0));
++        } else {
++            out_color = sky.sky_color;
++        }
++    }
++}
++)";
++};
++
++} // namespace shaders
++} // namespace mln
+diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
+index 78bd13db6eec..52ed328f45b8 100644
+--- a/include/mln/shaders/vulkan/terrain.hpp
++++ b/include/mln/shaders/vulkan/terrain.hpp
+@@ -18,6 +18,9 @@ struct ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan> {
+     static const std::array<TextureInfo, 1> textures;
+ 
+     static constexpr auto prelude = R"(
++
++#define idTerrainFogUBO layerUBOStartId
++
+ )";
+     static constexpr auto vertex = R"(
+ 
+@@ -32,12 +35,25 @@ layout(std140, set = LAYER_SET_INDEX, binding = idProjectionUBO) readonly buffer
+     ProjectionUBO projection_ubo[];
+ } projectionVector;
+ 
++layout(set = LAYER_SET_INDEX, binding = idTerrainFogUBO) uniform TerrainFogUBO {
++    vec4 fog_color;      // premultiplied
++    vec4 horizon_color;  // premultiplied
++    vec4 params;         // x: fog-ground-blend, y: fog opacity (0 = off), z: horizon-fog-blend
++    vec4 depth_range;    // x: near, y: far (fog depth range, in the projection's eye-space units)
++} fog;
++
+ layout(location = 0) out float v_shade;
+ layout(location = 1) out vec2 v_uv;
++layout(location = 2) out float v_fog_depth;
+ 
+ void main() {
+     gl_Position = projectTileFor3D(in_position.xy, in_position.z, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
++    // GL JS `v_fog_depth`: the depth of this vertex in a projection whose near plane is the camera-to-sea-level
++    // distance (terrain.vertex.glsl), in [0, 1]. For a perspective projection that is f*(d - n) / ((f - n)*d), with
++    // d the eye-space depth, which is the clip w of the main projection.
++    const float eyeDepth = max(gl_Position.w, 1e-6);
++    v_fog_depth = fog.depth_range.y * (eyeDepth - fog.depth_range.x) / ((fog.depth_range.y - fog.depth_range.x) * eyeDepth);
+     v_shade = in_position.w;
+     // Tile-local texture coordinate (0..1) for this tile's own drape texture.
+     v_uv = in_position.xy / 8192.0;
+@@ -48,6 +64,22 @@ void main() {
+ 
+ layout(location = 0) in float v_shade;
+ layout(location = 1) in vec2 v_uv;
++layout(location = 2) in float v_fog_depth;
++
++layout(set = LAYER_SET_INDEX, binding = idTerrainFogUBO) uniform TerrainFogUBO {
++    vec4 fog_color;
++    vec4 horizon_color;
++    vec4 params;
++    vec4 depth_range;
++} fog;
++
++vec4 gammaToLinear(vec4 color) {
++    return pow(color, vec4(2.2));
++}
++
++vec4 linearToGamma(vec4 color) {
++    return pow(color, vec4(1.0 / 2.2));
++}
+ 
+ layout(set = DRAWABLE_IMAGE_SET_INDEX, binding = 0) uniform sampler2D drapeSampler;
+ 
+@@ -61,7 +93,19 @@ void main() {
+     const vec3 low = vec3(0.24, 0.42, 0.24);
+     const vec3 high = vec3(0.86, 0.83, 0.72);
+     const vec3 tint = mix(low, high, shade);
+-    out_color = vec4((draped.a < 0.5 ? tint : draped.rgb) * shade, 1.0);
++    vec4 surface = vec4((draped.a < 0.5 ? tint : draped.rgb) * shade, 1.0);
++
++    // GL JS terrain.fragment.glsl: blend the surface towards the fog / horizon colour with distance, in linear colour.
++    const float ground_blend = fog.params.x;
++    const float opacity = fog.params.y;
++    const float horizon_fog_blend = fog.params.z;
++    if (opacity > 0.0 && v_fog_depth > ground_blend) {
++        const float blend_color = smoothstep(0.0, 1.0, max((v_fog_depth - horizon_fog_blend) / (1.0 - horizon_fog_blend), 0.0));
++        const vec4 fog_horizon = mix(gammaToLinear(fog.fog_color), gammaToLinear(fog.horizon_color), blend_color);
++        const float factor_fog = max(v_fog_depth - ground_blend, 0.0) / (1.0 - ground_blend);
++        surface = linearToGamma(mix(gammaToLinear(surface), fog_horizon, pow(factor_fog, 2.0) * opacity));
++    }
++    out_color = surface;
+ }
+ )";
+ };
+diff --git a/include/mln/style/conversion/sky.hpp b/include/mln/style/conversion/sky.hpp
+new file mode 100644
+index 000000000000..5a0a2131dd68
+--- /dev/null
++++ b/include/mln/style/conversion/sky.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <mln/style/conversion.hpp>
++#include <mln/style/sky.hpp>
++
++#include <optional>
++
++namespace mln {
++namespace style {
++namespace conversion {
++
++template <>
++struct Converter<Sky> {
++public:
++    std::optional<Sky> operator()(const Convertible& value, Error& error) const;
++};
++
++} // namespace conversion
++} // namespace style
++} // namespace mln
+diff --git a/include/mln/style/sky.hpp b/include/mln/style/sky.hpp
+new file mode 100644
+index 000000000000..bd4243c36f4e
+--- /dev/null
++++ b/include/mln/style/sky.hpp
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <mln/util/color.hpp>
++
++namespace mln {
++namespace style {
++
++/// The style's root `sky` object (style-spec `sky`): the colours and blends of the sky gradient above the horizon and
++/// of the fog that fades the terrain into it. Defaults are the style-spec defaults. A style without a `sky` object has
++/// no sky; `sky: {}` has the default sky.
++///
++/// Values are constants for now (the spec also allows zoom expressions and transitions).
++class Sky {
++public:
++    Color skyColor = *Color::parse("#88C6FC");
++    Color horizonColor = *Color::parse("#ffffff");
++    Color fogColor = *Color::parse("#ffffff");
++    float fogGroundBlend = 0.5f;
++    float horizonFogBlend = 0.8f;
++    float skyHorizonBlend = 0.8f;
++    float atmosphereBlend = 0.8f;
++
++    bool operator==(const Sky&) const = default;
++};
++
++} // namespace style
++} // namespace mln
+diff --git a/include/mln/style/style.hpp b/include/mln/style/style.hpp
+index 08edf142387c..77879a3a3188 100644
+--- a/include/mln/style/style.hpp
++++ b/include/mln/style/style.hpp
+@@ -3,10 +3,12 @@
+ #include <mln/actor/scheduler.hpp>
+ #include <mln/map/camera.hpp>
+ #include <mln/style/image.hpp>
++#include <mln/style/sky.hpp>
+ #include <mln/style/transition_options.hpp>
+ #include <mln/util/geo.hpp>
+ #include <mln/util/immutable.hpp>
+ 
++#include <optional>
+ #include <string>
+ #include <vector>
+ #include <memory>
+@@ -60,6 +62,10 @@ public:
+ 
+     void setTerrain(std::unique_ptr<Terrain>);
+ 
++    // Sky (style-spec `sky`): none unless the style (or the application) sets one.
++    std::optional<Sky> getSky() const;
++    void setSky(std::optional<Sky>);
++
+     // Images
+     std::optional<Image> getImage(const std::string&) const;
+     void addImage(std::unique_ptr<Image>);
+diff --git a/src/mln/map/map_impl.cpp b/src/mln/map/map_impl.cpp
+index 442d73800678..294a0f4630c5 100644
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -176,6 +176,8 @@ void Map::Impl::onUpdate() {
+         }
+     }
+ 
++    params.sky = style->impl->getSky();
++
+     rendererFrontend.update(std::make_shared<UpdateParameters>(std::move(params)));
+ }
+ 
+diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
+index f32a11b6a2dc..8f011d6c29e1 100644
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -177,6 +177,27 @@ ProjectionData TransformState::getProjectionDataForMatrix(const UnwrappedTileID&
+     return projection->getProjectionData(*this, tileID, mercatorMatrix);
+ }
+ 
++bool TransformState::getFogDepthRange(double& nearDistance, double& farDistance) const {
++    if (size.isEmpty()) {
++        return false;
++    }
++    const double cameraToCenterDistance = getCameraToCenterDistance();
++    const ScreenCoordinate offset = getCenterOffset();
++    const double limitedPitch = util::clamp(getPitch(), 0.0, maxMercatorHorizonAngle);
++
++    // Far plane: as in getProjMatrix.
++    const double seaLevelDistance = cameraToCenterDistance + std::abs(z) / std::cos(limitedPitch);
++    const double tanFovAboveCenter = (0.5 + (offset.y - frustumOffset.top()) / size.height) * 2.0 *
++                                     std::tan(fov / 2.0) *
++                                     (std::abs(std::cos(roll)) + std::abs(std::sin(roll)) * size.width / size.height);
++    const double tanMultiple = util::clamp(tanFovAboveCenter * std::tan(limitedPitch), 0.0, 0.99);
++    farDistance = seaLevelDistance / (1 - tanMultiple) * 1.01;
++
++    // Near plane: GL JS `cameraToSeaLevelDistance` of the fog matrix (mercator_transform.ts `_calcMatrices`).
++    nearDistance = std::max(cameraToCenterDistance / 2.0, cameraToCenterDistance + z / std::cos(limitedPitch));
++    return true;
++}
++
+ void TransformState::getProjMatrix(mat4& projMatrix, uint16_t nearZ, bool aligned) const {
+     if (size.isEmpty()) {
+         return;
+diff --git a/src/mln/map/transform_state.hpp b/src/mln/map/transform_state.hpp
+index e796969983e3..1951af2531a1 100644
+--- a/src/mln/map/transform_state.hpp
++++ b/src/mln/map/transform_state.hpp
+@@ -161,6 +161,10 @@ public:
+     // Matrix
+     void matrixFor(mat4&, const UnwrappedTileID&) const;
+     void getProjMatrix(mat4& matrix, uint16_t nearZ = 1, bool aligned = false) const;
++
++    /// The eye-space depth range used for the fog (GL JS `_fogMatrix`): from the camera-to-sea-level distance (near)
++    /// to the far clipping plane. False when the viewport is empty.
++    bool getFogDepthRange(double& nearDistance, double& farDistance) const;
+     const ProjectionBase& getProjection() const { return *projection; }
+     ProjectionData getProjectionData(const UnwrappedTileID&, const mat4& projMatrix) const;
+     ProjectionData getProjectionData(const UnwrappedTileID&) const;
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index 2a8a962ba131..e470a8effbcb 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -1019,6 +1019,8 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+ 
+     globeDepthPass.update(shaders, context, state, *updateParameters, has3D);
+ 
++    skyPass.update(shaders, context, state, paintParameters, *updateParameters);
++
+     terrainPass.update(shaders, context, state, paintParameters, *updateParameters);
+ 
+     // Terrain drape: one tile-sized offscreen target per terrain tile, holding the draped map layers.
+diff --git a/src/mln/renderer/render_orchestrator.hpp b/src/mln/renderer/render_orchestrator.hpp
+index 9fc95e44e74f..e8bb79debd87 100644
+--- a/src/mln/renderer/render_orchestrator.hpp
++++ b/src/mln/renderer/render_orchestrator.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/renderer/globe_depth_pass.hpp>
++#include <mln/renderer/sky_pass.hpp>
+ #include <mln/renderer/terrain_pass.hpp>
+ #include <mln/renderer/layer_group.hpp>
+ #include <mln/actor/scheduler.hpp>
+@@ -119,6 +120,7 @@ public:
+     LayerGroupBase* getGlobeDepthLayerGroup() const { return globeDepthPass.getLayerGroup(); }
+ 
+     LayerGroupBase* getTerrainLayerGroup() const { return terrainPass.getLayerGroup(); }
++    LayerGroupBase* getSkyLayerGroup() const { return skyPass.getLayerGroup(); }
+ 
+     // Sampler of the terrain elevation (world pixels) at a tile centre, for symbol elevation.
+     std::function<float(const UnwrappedTileID&)> getTerrainElevationFunction(const TransformState& state,
+@@ -287,6 +289,7 @@ private:
+     std::set<int32_t> drapeLayerIndices;
+     RenderItem::DebugLayerGroupMap debugLayerGroups;
+     GlobeDepthPass globeDepthPass;
++    SkyPass skyPass;
+     TerrainPass terrainPass;
+ };
+ 
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+index ce481bd8387a..e2100c25de60 100644
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -294,6 +294,9 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+ 
+         // Give the layers a chance to upload
+         orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) { layerGroup.upload(*uploadPass); });
++        if (auto* sky = orchestrator.getSkyLayerGroup()) {
++            sky->upload(*uploadPass);
++        }
+         if (auto* globeDepth = orchestrator.getGlobeDepthLayerGroup()) {
+             globeDepth->upload(*uploadPass);
+         }
+@@ -438,6 +441,11 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+         parameters.depthRangeSize = 1 - (orchestrator.numLayerGroups() + 2) * PaintParameters::numSublayers *
+                                             PaintParameters::depthEpsilon;
+ 
++        // The sky goes first, under everything (GL JS draws it before the layers).
++        if (auto* sky = orchestrator.getSkyLayerGroup()) {
++            sky->render(orchestrator, parameters);
++        }
++
+         // The planet goes into the depth buffer first, so 3D geometry behind the horizon stays hidden.
+         if (auto* globeDepth = orchestrator.getGlobeDepthLayerGroup()) {
+             globeDepth->render(orchestrator, parameters);
+diff --git a/src/mln/renderer/sky_pass.cpp b/src/mln/renderer/sky_pass.cpp
+new file mode 100644
+index 000000000000..acec334fe774
+--- /dev/null
++++ b/src/mln/renderer/sky_pass.cpp
+@@ -0,0 +1,131 @@
++#include <mln/renderer/sky_pass.hpp>
++
++#include <mln/gfx/color_mode.hpp>
++#include <mln/gfx/context.hpp>
++#include <mln/gfx/cull_face_mode.hpp>
++#include <mln/gfx/drawable.hpp>
++#include <mln/gfx/drawable_builder.hpp>
++#include <mln/gfx/projection_variant.hpp>
++#include <mln/gfx/uniform_buffer.hpp>
++#include <mln/renderer/globe_tile_mesh.hpp> // SegmentVector
++#include <mln/gfx/shader_registry.hpp>
++#include <mln/map/transform_state.hpp>
++#include <mln/renderer/paint_parameters.hpp>
++#include <mln/renderer/render_pass.hpp>
++#include <mln/renderer/update_parameters.hpp>
++#include <mln/shaders/shader_defines.hpp>
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <numbers>
++
++namespace mln {
++
++namespace {
++
++constexpr std::string_view SkyShaderName = "SkyShader";
++
++// GL JS `maxMercatorHorizonAngle` (mercator_utils.ts).
++constexpr double maxMercatorHorizonAngle = 89.25;
++
++struct alignas(16) SkyUBO {
++    std::array<float, 4> skyColor;
++    std::array<float, 4> horizonColor;
++    std::array<float, 4> horizon; // x, y: point on the horizon (framebuffer px, y down); z: sky-horizon blend (px)
++    std::array<float, 4> normal;  // xy: up-the-screen normal (y down)
++};
++static_assert(sizeof(SkyUBO) == 4 * 16);
++
++constexpr double degToRad(double d) {
++    return d * std::numbers::pi / 180.0;
++}
++
++} // namespace
++
++SkyPass::SkyPass() = default;
++SkyPass::~SkyPass() = default;
++
++void SkyPass::update(gfx::ShaderRegistry& shaders,
++                     gfx::Context& context,
++                     const TransformState& state,
++                     const PaintParameters& paintParameters,
++                     const UpdateParameters& updateParameters) {
++    // The globe's sky (atmosphere) is not drawn yet; GL JS blends from this horizon sky to the atmosphere.
++    if (!updateParameters.sky || state.isGlobeRendering()) {
++        if (layerGroup) {
++            layerGroup->clearDrawables();
++        }
++        return;
++    }
++    const style::Sky& sky = *updateParameters.sky;
++
++    if (!shader) {
++        shader = context.getGenericShader(shaders, std::string(SkyShaderName), gfx::ProjectionVariant::Mercator);
++    }
++    if (!shader) {
++        return;
++    }
++    if (!layerGroup) {
++        layerGroup = context.createTileLayerGroup(0, 1, "sky");
++    }
++
++    if (layerGroup->getDrawableCount() == 0) {
++        auto builder = context.createDrawableBuilder("sky");
++        builder->setShader(shader);
++        builder->setRenderPass(RenderPass::Translucent);
++        builder->setColorMode(gfx::ColorMode::alphaBlended());
++        builder->setIs3D(false);
++        builder->setEnableColor(true);
++        builder->setEnableDepth(false);
++        builder->setCullFaceMode(gfx::CullFaceMode::disabled());
++        builder->setVertexAttrId(shaders::idSkyPosVertexAttribute);
++
++        const std::array<int16_t, 8> corners{-1, -1, 1, -1, 1, 1, -1, 1};
++        const auto* bytes = reinterpret_cast<const uint8_t*>(corners.data());
++        builder->setRawVertices(std::vector<uint8_t>(bytes, bytes + sizeof(corners)), 4, gfx::AttributeDataType::Short2);
++        const std::vector<uint16_t> indices{0, 1, 2, 0, 2, 3};
++        SegmentVector segments;
++        segments.emplace_back(0, 0, 4, indices.size());
++        builder->setSegments(gfx::Triangles(), indices, segments.data(), segments.size());
++        builder->flush(context);
++        for (auto& drawable : builder->clearDrawables()) {
++            drawable->setUBOIndex(0);
++            const OverscaledTileID tileID(0, 0, 0);
++            drawable->setTileID(tileID);
++            layerGroup->addDrawable(RenderPass::Translucent, tileID, std::move(drawable));
++        }
++    }
++
++    // GL JS `skyUniformValues`: the horizon line through (width/2 - h*sin(roll), height/2 + h*cos(roll)) with the
++    // normal (-sin(roll), cos(roll)), h = getMercatorHorizon(transform); the blend distance is in pixels.
++    const double pitchDeg = state.getPitch() * 180.0 / std::numbers::pi;
++    const double horizon = state.getCameraToCenterDistance() *
++                           std::min(std::tan(degToRad(90.0 - pitchDeg)) * 0.85,
++                                    std::tan(degToRad(maxMercatorHorizonAngle - pitchDeg)));
++    const double roll = state.getRoll();
++    const double cosRoll = std::cos(roll);
++    const double sinRoll = std::sin(roll);
++    const double pixelRatio = paintParameters.pixelRatio;
++    const double width = state.getSize().width;
++    const double height = state.getSize().height;
++
++    SkyUBO ubo{};
++    ubo.skyColor = {sky.skyColor.r, sky.skyColor.g, sky.skyColor.b, sky.skyColor.a};
++    ubo.horizonColor = {sky.horizonColor.r, sky.horizonColor.g, sky.horizonColor.b, sky.horizonColor.a};
++    // GL JS measures y up from the bottom; the framebuffer here is y down, so the signs of the y terms flip.
++    ubo.horizon = {static_cast<float>((width / 2.0 - horizon * sinRoll) * pixelRatio),
++                   static_cast<float>((height / 2.0 - horizon * cosRoll) * pixelRatio),
++                   static_cast<float>(sky.skyHorizonBlend * height / 2.0 * pixelRatio),
++                   0.0f};
++    ubo.normal = {static_cast<float>(-sinRoll), static_cast<float>(cosRoll), 0.0f, 0.0f};
++
++    if (!uniformBuffer) {
++        uniformBuffer = context.createUniformBuffer(&ubo, sizeof(ubo), false, true);
++    } else {
++        uniformBuffer->update(&ubo, sizeof(ubo));
++    }
++    layerGroup->mutableUniformBuffers().set(shaders::idDrawableReservedFragmentOnlyUBO, uniformBuffer);
++}
++
++} // namespace mln
+diff --git a/src/mln/renderer/sky_pass.hpp b/src/mln/renderer/sky_pass.hpp
+new file mode 100644
+index 000000000000..8144e9449c9b
+--- /dev/null
++++ b/src/mln/renderer/sky_pass.hpp
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <mln/renderer/layer_group.hpp>
++#include <mln/gfx/uniform_buffer.hpp>
++#include <mln/shaders/shader_program_base.hpp>
++
++namespace mln {
++
++namespace gfx {
++class Context;
++class ShaderRegistry;
++} // namespace gfx
++
++class TransformState;
++class UpdateParameters;
++class PaintParameters;
++
++/// Draws the style's `sky` (MapLibre GL JS `drawSky`): a screen quad, shaded by the distance above the horizon.
++class SkyPass {
++public:
++    SkyPass();
++    ~SkyPass();
++
++    void update(gfx::ShaderRegistry&,
++                gfx::Context&,
++                const TransformState&,
++                const PaintParameters&,
++                const UpdateParameters&);
++
++    /// The layer group holding the sky quad, or null before the first sky.
++    LayerGroupBase* getLayerGroup() const { return layerGroup.get(); }
++
++private:
++    TileLayerGroupPtr layerGroup;
++    gfx::ShaderProgramBasePtr shader;
++    gfx::UniformBufferPtr uniformBuffer;
++};
++
++} // namespace mln
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index d239f9eb51b5..114d503a37a1 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -22,6 +22,7 @@
+ #include <mln/util/projection.hpp>
+ #include <mln/util/tile_cover.hpp>
+ #include <algorithm>
++#include <array>
+ #include <cmath>
+ #include <numbers>
+ #include <unordered_set>
+@@ -307,6 +308,38 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         projectionUBOs.emplace_back(LayerTweaker::toProjectionUBO(pd));
+     });
+ 
++    // Fog (GL JS terrain fog): the sky's fog colours and the depth range it blends over. Off without a sky, in the
++    // globe projection, and below pitch 60 (GL JS `calculateFogBlendOpacity`: 0 below 60, ramping to 1 at 70).
++    {
++        struct alignas(16) TerrainFogUBO {
++            std::array<float, 4> fogColor;
++            std::array<float, 4> horizonColor;
++            std::array<float, 4> params;
++            std::array<float, 4> depthRange;
++        };
++        static_assert(sizeof(TerrainFogUBO) == 4 * 16);
++        TerrainFogUBO fogUBO{};
++        fogUBO.params = {1.0f, 0.0f, 1.0f, 0.0f};
++        fogUBO.depthRange = {1.0f, 2.0f, 0.0f, 0.0f};
++        double nearDistance = 1.0;
++        double farDistance = 2.0;
++        if (updateParameters.sky && !globeShader && state.getFogDepthRange(nearDistance, farDistance)) {
++            const auto& sky = *updateParameters.sky;
++            const double pitchDegrees = state.getPitch() * 180.0 / std::numbers::pi;
++            const double opacity = pitchDegrees < 60.0 ? 0.0 : (pitchDegrees < 70.0 ? (pitchDegrees - 60.0) / 10.0 : 1.0);
++            fogUBO.fogColor = {sky.fogColor.r, sky.fogColor.g, sky.fogColor.b, sky.fogColor.a};
++            fogUBO.horizonColor = {sky.horizonColor.r, sky.horizonColor.g, sky.horizonColor.b, sky.horizonColor.a};
++            fogUBO.params = {sky.fogGroundBlend, static_cast<float>(opacity), sky.horizonFogBlend, 0.0f};
++            fogUBO.depthRange = {static_cast<float>(nearDistance), static_cast<float>(farDistance), 0.0f, 0.0f};
++        }
++        if (!fogUniformBuffer) {
++            fogUniformBuffer = context.createUniformBuffer(&fogUBO, sizeof(fogUBO), false, false);
++        } else {
++            fogUniformBuffer->update(&fogUBO, sizeof(fogUBO));
++        }
++        layerGroup->mutableUniformBuffers().set(shaders::idTerrainFogUBO, fogUniformBuffer);
++    }
++
+     if (!projectionUBOs.empty()) {
+         const std::size_t size = sizeof(shaders::ProjectionUBO) * projectionUBOs.size();
+         if (!projectionUniformBuffer || projectionUniformBuffer->getSize() < size) {
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index 6f2c8587309b..a4acf86fc665 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -58,6 +58,7 @@ public:
+ private:
+     TileLayerGroupPtr layerGroup;
+     gfx::ShaderProgramBasePtr shader;
++    gfx::UniformBufferPtr fogUniformBuffer;
+     gfx::UniformBufferPtr projectionUniformBuffer;
+     std::vector<OverscaledTileID> cover;
+     bool globeShader = false;
+diff --git a/src/mln/renderer/update_parameters.hpp b/src/mln/renderer/update_parameters.hpp
+index b6a6ca0391fa..ef8df4558235 100644
+--- a/src/mln/renderer/update_parameters.hpp
++++ b/src/mln/renderer/update_parameters.hpp
+@@ -10,6 +10,7 @@
+ #include <mln/util/chrono.hpp>
+ #include <mln/util/color.hpp>
+ #include <mln/util/immutable.hpp>
++#include <mln/style/sky.hpp>
+ #include <mln/util/tileset.hpp>
+ 
+ #include <numbers>
+@@ -65,6 +66,9 @@ public:
+     // CFID: 3D terrain. When the tileset is set, the terrain pass fetches this raster-dem source and drapes it.
+     std::optional<Tileset> terrainTileset = std::nullopt;
+     double terrainExaggeration = 1.0;
++
++    // The style's `sky` (none when the style has no sky).
++    std::optional<style::Sky> sky = std::nullopt;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/shaders/vulkan/sky.cpp b/src/mln/shaders/vulkan/sky.cpp
+new file mode 100644
+index 000000000000..e2d1c228d740
+--- /dev/null
++++ b/src/mln/shaders/vulkan/sky.cpp
+@@ -0,0 +1,15 @@
++#include <mln/shaders/vulkan/sky.hpp>
++#include <mln/shaders/shader_defines.hpp>
++
++namespace mln {
++namespace shaders {
++
++using SkyShaderSource = ShaderSource<BuiltIn::SkyShader, gfx::Backend::Type::Vulkan>;
++
++const std::array<AttributeInfo, 1> SkyShaderSource::attributes = {
++    AttributeInfo{0, gfx::AttributeDataType::Short2, idSkyPosVertexAttribute},
++};
++const std::array<TextureInfo, 0> SkyShaderSource::textures = {};
++
++} // namespace shaders
++} // namespace mln
+diff --git a/src/mln/style/conversion/sky.cpp b/src/mln/style/conversion/sky.cpp
+new file mode 100644
+index 000000000000..745b171fb312
+--- /dev/null
++++ b/src/mln/style/conversion/sky.cpp
+@@ -0,0 +1,60 @@
++#include <mln/style/conversion/sky.hpp>
++#include <mln/style/conversion_impl.hpp>
++#include <mln/style/conversion/constant.hpp>
++
++namespace mln {
++namespace style {
++namespace conversion {
++
++namespace {
++
++bool convertBlend(const Convertible& value, const char* name, float& out, Error& error) {
++    const auto member = objectMember(value, name);
++    if (!member) {
++        return true;
++    }
++    const auto converted = convert<float>(*member, error);
++    if (!converted) {
++        return false;
++    }
++    out = std::clamp(*converted, 0.0f, 1.0f);
++    return true;
++}
++
++bool convertColor(const Convertible& value, const char* name, Color& out, Error& error) {
++    const auto member = objectMember(value, name);
++    if (!member) {
++        return true;
++    }
++    const auto converted = convert<Color>(*member, error);
++    if (!converted) {
++        return false;
++    }
++    out = *converted;
++    return true;
++}
++
++} // namespace
++
++std::optional<Sky> Converter<Sky>::operator()(const Convertible& value, Error& error) const {
++    if (!isObject(value)) {
++        error.message = "sky must be an object";
++        return std::nullopt;
++    }
++
++    Sky sky;
++    if (!convertColor(value, "sky-color", sky.skyColor, error) ||
++        !convertColor(value, "horizon-color", sky.horizonColor, error) ||
++        !convertColor(value, "fog-color", sky.fogColor, error) ||
++        !convertBlend(value, "fog-ground-blend", sky.fogGroundBlend, error) ||
++        !convertBlend(value, "horizon-fog-blend", sky.horizonFogBlend, error) ||
++        !convertBlend(value, "sky-horizon-blend", sky.skyHorizonBlend, error) ||
++        !convertBlend(value, "atmosphere-blend", sky.atmosphereBlend, error)) {
++        return std::nullopt;
++    }
++    return {std::move(sky)};
++}
++
++} // namespace conversion
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/parser.cpp b/src/mln/style/parser.cpp
+index b73486899163..21af9cabb986 100644
+--- a/src/mln/style/parser.cpp
++++ b/src/mln/style/parser.cpp
+@@ -7,6 +7,7 @@
+ #include <mln/style/conversion/light.hpp>
+ #include <mln/style/conversion/projection.hpp>
+ #include <mln/style/conversion/terrain.hpp>
++#include <mln/style/conversion/sky.hpp>
+ #include <mln/style/conversion/sprite.hpp>
+ #include <mln/style/conversion/transition_options.hpp>
+ #include <mln/style/conversion_impl.hpp>
+@@ -118,6 +119,10 @@ StyleParseResult Parser::parse(const std::string& json) {
+         parseProjection(document["projection"]);
+     }
+ 
++    if (document.HasMember("sky")) {
++        parseSky(document["sky"]);
++    }
++
+     if (document.HasMember("terrain")) {
+         parseTerrain(document["terrain"]);
+     }
+@@ -266,6 +271,16 @@ void Parser::parseTerrain(const JSValue& value) {
+     terrain = *converted;
+ }
+ 
++void Parser::parseSky(const JSValue& value) {
++    conversion::Error error;
++    std::optional<Sky> converted = conversion::convert<Sky>(value, error);
++    if (!converted) {
++        Log::Warning(Event::ParseStyle, error.message);
++        return;
++    }
++    sky = *converted;
++}
++
+ void Parser::parseSources(const JSValue& value) {
+     if (!value.IsObject()) {
+         Log::Warning(Event::ParseStyle, "sources must be an object");
+diff --git a/src/mln/style/parser.hpp b/src/mln/style/parser.hpp
+index 45c8cbeef1a5..bf5634d5a96a 100644
+--- a/src/mln/style/parser.hpp
++++ b/src/mln/style/parser.hpp
+@@ -6,6 +6,7 @@
+ #include <mln/style/light.hpp>
+ #include <mln/style/projection.hpp>
+ #include <mln/style/terrain.hpp>
++#include <mln/style/sky.hpp>
+ 
+ #include <mln/text/glyph.hpp>
+ 
+@@ -43,6 +44,7 @@ public:
+     Light light;
+     Projection projection;
+     Terrain terrain;
++    std::optional<Sky> sky;
+ 
+     std::string name;
+     LatLng latLng;
+@@ -60,6 +62,7 @@ private:
+     void parseLight(const JSValue&);
+     void parseProjection(const JSValue&);
+     void parseTerrain(const JSValue&);
++    void parseSky(const JSValue&);
+     void parseSources(const JSValue&);
+     void parseSprites(const JSValue&);
+     void parseLayers(const JSValue&);
+diff --git a/src/mln/style/style.cpp b/src/mln/style/style.cpp
+index 9230f241f332..b794bfb59af7 100644
+--- a/src/mln/style/style.cpp
++++ b/src/mln/style/style.cpp
+@@ -4,6 +4,7 @@
+ #include <mln/style/light.hpp>
+ #include <mln/style/projection.hpp>
+ #include <mln/style/terrain.hpp>
++#include <mln/style/sky.hpp>
+ #include <mln/style/source.hpp>
+ #include <mln/style/style.hpp>
+ #include <mln/style/style_impl.hpp>
+@@ -89,6 +90,14 @@ const Projection* Style::getProjection() const {
+     return impl->getProjection();
+ }
+ 
++std::optional<Sky> Style::getSky() const {
++    return impl->getSky();
++}
++
++void Style::setSky(std::optional<Sky> sky) {
++    impl->setSky(std::move(sky));
++}
++
+ void Style::setTerrain(std::unique_ptr<Terrain> terrain) {
+     impl->setTerrain(std::move(terrain));
+ }
+diff --git a/src/mln/style/style_impl.cpp b/src/mln/style/style_impl.cpp
+index 987141d04da8..3add18538eb4 100644
+--- a/src/mln/style/style_impl.cpp
++++ b/src/mln/style/style_impl.cpp
+@@ -6,6 +6,7 @@
+ #include <mln/style/image_impl.hpp>
+ #include <mln/style/projection.hpp>
+ #include <mln/style/terrain.hpp>
++#include <mln/style/sky.hpp>
+ #include <mln/style/layer_impl.hpp>
+ #include <mln/style/layers/background_layer.hpp>
+ #include <mln/style/layers/circle_layer.hpp>
+@@ -130,6 +131,7 @@ void Style::Impl::parse(const std::string& json_) {
+     setLight(std::make_unique<Light>(parser.light));
+     setProjection(std::make_unique<Projection>(parser.projection));
+     setTerrain(std::make_unique<Terrain>(parser.terrain));
++    setSky(parser.sky);
+ 
+     if (fileSource) {
+         if (parser.sprites.empty()) {
+@@ -274,6 +276,18 @@ void Style::Impl::setTerrain(std::unique_ptr<Terrain> terrain_) {
+     onTerrainChanged(*terrain);
+ }
+ 
++void Style::Impl::setSky(std::optional<Sky> sky_) {
++    if (sky == sky_) {
++        return;
++    }
++    sky = std::move(sky_);
++    observer->onUpdate();
++}
++
++const std::optional<Sky>& Style::Impl::getSky() const {
++    return sky;
++}
++
+ Terrain* Style::Impl::getTerrain() const {
+     return terrain.get();
+ }
+diff --git a/src/mln/style/style_impl.hpp b/src/mln/style/style_impl.hpp
+index 4ea7db6464a8..538003a29131 100644
+--- a/src/mln/style/style_impl.hpp
++++ b/src/mln/style/style_impl.hpp
+@@ -93,6 +93,8 @@ public:
+     Projection* getProjection() const;
+ 
+     void setTerrain(std::unique_ptr<Terrain>);
++    void setSky(std::optional<Sky>);
++    const std::optional<Sky>& getSky() const;
+     Terrain* getTerrain() const;
+ 
+     std::optional<Immutable<style::Image::Impl>> getImage(const std::string&) const;
+@@ -133,6 +135,7 @@ private:
+     std::unique_ptr<Light> light;
+     std::unique_ptr<Projection> projection;
+     std::unique_ptr<Terrain> terrain;
++    std::optional<Sky> sky;
+     std::unordered_map<std::string, bool> spritesLoadingStatus;
+ 
+     // Defaults
+diff --git a/src/mln/vulkan/renderer_backend.cpp b/src/mln/vulkan/renderer_backend.cpp
+index f039103d57db..d431da62560f 100644
+--- a/src/mln/vulkan/renderer_backend.cpp
++++ b/src/mln/vulkan/renderer_backend.cpp
+@@ -19,6 +19,7 @@
+ #include <mln/shaders/vulkan/fill.hpp>
+ #include <mln/shaders/vulkan/fill_extrusion.hpp>
+ #include <mln/shaders/vulkan/globe_depth.hpp>
++#include <mln/shaders/vulkan/sky.hpp>
+ #include <mln/shaders/vulkan/heatmap.hpp>
+ #include <mln/shaders/vulkan/heatmap_texture.hpp>
+ #include <mln/shaders/vulkan/hillshade.hpp>
+@@ -714,6 +715,7 @@ void RendererBackend::initShaders(gfx::ShaderRegistry& shaders, const ProgramPar
+                   shaders::BuiltIn::FillExtrusionPatternShader,
+                   shaders::BuiltIn::FillExtrusionPatternInstancedShader,
+                   shaders::BuiltIn::GlobeDepthShader,
++                  shaders::BuiltIn::SkyShader,
+                   shaders::BuiltIn::HeatmapShader,
+                   shaders::BuiltIn::HeatmapTextureShader,
+                   shaders::BuiltIn::HillshadeShader,
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 1f1e25a7079a..a0c7eefe4b1d 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -51,6 +51,7 @@ add_library(
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/function.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/geojson_options.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/layer.test.cpp
++    ${PROJECT_SOURCE_DIR}/test/style/conversion/sky.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/light.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/padding.test.cpp
+     ${PROJECT_SOURCE_DIR}/test/style/conversion/projection.test.cpp
+diff --git a/test/style/conversion/sky.test.cpp b/test/style/conversion/sky.test.cpp
+new file mode 100644
+index 000000000000..6835e927f74f
+--- /dev/null
++++ b/test/style/conversion/sky.test.cpp
+@@ -0,0 +1,51 @@
++#include <mln/test/util.hpp>
++
++#include <mln/style/conversion/json.hpp>
++#include <mln/style/conversion/constant.hpp>
++#include <mln/style/conversion/sky.hpp>
++#include <mln/style/conversion_impl.hpp>
++#include <mln/style/rapidjson_conversion.hpp>
++#include <mln/util/color.hpp>
++
++using namespace mln;
++using namespace mln::style;
++using namespace mln::style::conversion;
++
++TEST(StyleConversion, SkyDefaults) {
++    Error error;
++    const auto sky = convertJSON<Sky>("{}", error);
++    ASSERT_TRUE(sky.has_value()) << error.message;
++
++    // The style-spec defaults.
++    EXPECT_EQ(sky->skyColor, *Color::parse("#88C6FC"));
++    EXPECT_EQ(sky->horizonColor, *Color::parse("#ffffff"));
++    EXPECT_EQ(sky->fogColor, *Color::parse("#ffffff"));
++    EXPECT_FLOAT_EQ(sky->fogGroundBlend, 0.5f);
++    EXPECT_FLOAT_EQ(sky->horizonFogBlend, 0.8f);
++    EXPECT_FLOAT_EQ(sky->skyHorizonBlend, 0.8f);
++    EXPECT_FLOAT_EQ(sky->atmosphereBlend, 0.8f);
++}
++
++TEST(StyleConversion, SkyProperties) {
++    Error error;
++    const auto sky = convertJSON<Sky>(
++        R"({"sky-color": "#199EF3", "horizon-color": "#ff0000", "fog-color": "#0000ff", "fog-ground-blend": 0.25,
++            "horizon-fog-blend": 0.5, "sky-horizon-blend": 2.0, "atmosphere-blend": -1})",
++        error);
++    ASSERT_TRUE(sky.has_value()) << error.message;
++
++    EXPECT_EQ(sky->skyColor, *Color::parse("#199EF3"));
++    EXPECT_EQ(sky->horizonColor, *Color::parse("#ff0000"));
++    EXPECT_EQ(sky->fogColor, *Color::parse("#0000ff"));
++    EXPECT_FLOAT_EQ(sky->fogGroundBlend, 0.25f);
++    EXPECT_FLOAT_EQ(sky->horizonFogBlend, 0.5f);
++    // Blends are limited to [0, 1] (style-spec minimum / maximum).
++    EXPECT_FLOAT_EQ(sky->skyHorizonBlend, 1.0f);
++    EXPECT_FLOAT_EQ(sky->atmosphereBlend, 0.0f);
++}
++
++TEST(StyleConversion, SkyErrors) {
++    Error error;
++    EXPECT_FALSE(convertJSON<Sky>("[]", error).has_value());
++    EXPECT_FALSE(convertJSON<Sky>(R"({"sky-color": 3})", error).has_value());
++}
