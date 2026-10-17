@@ -1,5 +1,36 @@
+diff --git a/include/mln/renderer/render_target.hpp b/include/mln/renderer/render_target.hpp
+index 20eb234..0e64c65 100644
+--- a/include/mln/renderer/render_target.hpp
++++ b/include/mln/renderer/render_target.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <mln/gfx/types.hpp>
++#include <mln/util/color.hpp>
+ #include <mln/util/size.hpp>
+ 
+ #include <functional>
+@@ -31,6 +32,10 @@ public:
+     RenderTarget(gfx::Context& context, const Size size, const gfx::TextureChannelDataType type);
+     ~RenderTarget();
+ 
++    /// The colour the target is cleared to before rendering (opaque black by default). The terrain drape clears to
++    /// transparent so "nothing rendered here yet" is distinguishable from genuinely black imagery.
++    void setClearColor(const Color& color) { clearColor = color; }
++
+     /// Get the render target texture
+     const gfx::Texture2DPtr& getTexture();
+ 
+@@ -81,6 +86,7 @@ public:
+ protected:
+     gfx::Context& context;
+     std::unique_ptr<gfx::OffscreenTexture> offscreenTexture;
++    Color clearColor{0.0f, 0.0f, 0.0f, 1.0f};
+     using LayerGroupMap = std::map<int32_t, LayerGroupBasePtr>;
+     LayerGroupMap layerGroupsByLayerIndex;
+ };
 diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
-index b3d7f5c..4082d27 100644
+index b3d7f5c..78bd13d 100644
 --- a/include/mln/shaders/vulkan/terrain.hpp
 +++ b/include/mln/shaders/vulkan/terrain.hpp
 @@ -6,9 +6,9 @@
@@ -24,8 +55,25 @@ index b3d7f5c..4082d27 100644
  layout(location = 0) in vec4 in_position;
  
  layout(push_constant) uniform Constants {
+@@ -55,14 +55,13 @@ layout(location = 0) out vec4 out_color;
+ 
+ void main() {
+     // Per-tile drape: this tile's own texture, shaded by the precomputed hillshade. Where no draping layer was
+-    // rendered (black, e.g. before imagery loads) fall back to a hypsometric tint so the relief is still visible.
++    // rendered (exactly black, e.g. before imagery loads; near-black imagery such as deep water stays as drawn) fall back to a hypsometric tint so the relief is still visible.
+     const vec4 draped = texture(drapeSampler, v_uv);
+     const float shade = clamp(v_shade, 0.0, 1.0);
+-    const float lum = max(draped.r, max(draped.g, draped.b));
+     const vec3 low = vec3(0.24, 0.42, 0.24);
+     const vec3 high = vec3(0.86, 0.83, 0.72);
+     const vec3 tint = mix(low, high, shade);
+-    out_color = vec4((lum < 0.02 ? tint : draped.rgb) * shade, 1.0);
++    out_color = vec4((draped.a < 0.5 ? tint : draped.rgb) * shade, 1.0);
+ }
+ )";
+ };
 diff --git a/src/mln/geometry/dem_data.cpp b/src/mln/geometry/dem_data.cpp
-index 7dcf390..a3fc999 100644
+index 7dcf390..7b4fcbf 100644
 --- a/src/mln/geometry/dem_data.cpp
 +++ b/src/mln/geometry/dem_data.cpp
 @@ -44,6 +44,20 @@ DEMData::DEMData(const PremultipliedImage& _image, Tileset::RasterEncoding _enco
@@ -49,11 +97,33 @@ index 7dcf390..a3fc999 100644
  }
  
  // This function takes the DEMData from a neighboring tile and backfills the
+@@ -97,8 +111,9 @@ int32_t DEMData::get(const int32_t x, const int32_t y) const {
+ }
+ 
+ double DEMData::getElevation(double x, double y) const {
+-    x = std::clamp(x, 0.0, static_cast<double>(dim));
+-    y = std::clamp(y, 0.0, static_cast<double>(dim));
++    // The one-pixel border (backfilled from the neighbouring tiles) is addressable at -1 and `dim`.
++    x = std::clamp(x, -1.0, static_cast<double>(dim));
++    y = std::clamp(y, -1.0, static_cast<double>(dim));
+     const auto x0 = static_cast<int32_t>(std::floor(x));
+     const auto y0 = static_cast<int32_t>(std::floor(y));
+     const auto x1 = std::min(x0 + 1, dim);
 diff --git a/src/mln/geometry/dem_data.hpp b/src/mln/geometry/dem_data.hpp
-index 18d457e..b5684e1 100644
+index 18d457e..9d69737 100644
 --- a/src/mln/geometry/dem_data.hpp
 +++ b/src/mln/geometry/dem_data.hpp
-@@ -29,6 +29,9 @@ public:
+@@ -19,7 +19,8 @@ public:
+     int32_t get(int32_t x, int32_t y) const;
+     const std::array<float, 4>& getUnpackVector() const;
+ 
+-    /// Bilinearly interpolated elevation, in metres, at the continuous tile coordinate (`x`, `y`) within `[0, dim]`.
++    /// Bilinearly interpolated elevation, in metres, at the continuous tile coordinate (`x`, `y`) within `[0, dim]`
++    /// (coordinates down to -1 read the border pixel).
+     /// Mirrors GL JS `DEMData#getElevation`, adapted to this class's one-pixel border.
+     double getElevation(double x, double y) const;
+ 
+@@ -29,6 +30,9 @@ public:
      const int32_t dim;
      const int32_t stride;
      const Tileset::RasterEncoding encoding;
@@ -63,6 +133,62 @@ index 18d457e..b5684e1 100644
  
  private:
      std::shared_ptr<PremultipliedImage> image;
+diff --git a/src/mln/map/map_impl.cpp b/src/mln/map/map_impl.cpp
+index b80f422..442d738 100644
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -10,6 +10,7 @@
+ #include <mln/style/terrain.hpp>
+ #include <mln/style/source.hpp>
+ #include <mln/style/sources/tile_source.hpp>
++#include "../style/sources/tile_source_impl.hpp"
+ #include <mln/util/exception.hpp>
+ #include <mln/util/logging.hpp>
+ #include <mln/util/traits.hpp>
+@@ -19,6 +20,18 @@
+ 
+ namespace mln {
+ 
++namespace {
++// The DEM source's tileset: inline in the style, or the TileJSON resolved from its `url` once loaded (as GL JS does).
++const Tileset* resolvedTerrainTileset(const style::TileSource* source) {
++    const auto& urlOrTileset = source->getURLOrTileset();
++    if (urlOrTileset.is<Tileset>()) {
++        return &urlOrTileset.get<Tileset>();
++    }
++    const auto& loaded = source->impl().tileset;
++    return loaded ? &*loaded : nullptr;
++}
++} // namespace
++
+ #if !defined(NDEBUG)
+ namespace {
+ void logStyleDependencies(EventSeverity severity, Event event, const style::Style& style) {
+@@ -156,9 +169,8 @@ void Map::Impl::onUpdate() {
+     if (auto* terrain = style->impl->getTerrain(); terrain != nullptr && terrain->isEnabled()) {
+         if (auto* source = style->impl->getSource(terrain->getSource());
+             source != nullptr && source->getType() == style::SourceType::RasterDEM) {
+-            const auto& urlOrTileset = static_cast<style::TileSource*>(source)->getURLOrTileset();
+-            if (urlOrTileset.is<Tileset>()) {
+-                params.terrainTileset = urlOrTileset.get<Tileset>();
++            if (const Tileset* resolved = resolvedTerrainTileset(static_cast<style::TileSource*>(source))) {
++                params.terrainTileset = *resolved;
+                 params.terrainExaggeration = terrain->getExaggeration();
+             }
+         }
+@@ -183,9 +195,9 @@ void Map::Impl::updateTerrainCamera() {
+         if (auto* terrain = style->impl->getTerrain(); terrain != nullptr && terrain->isEnabled()) {
+             if (auto* source = style->impl->getSource(terrain->getSource());
+                 source != nullptr && source->getType() == style::SourceType::RasterDEM) {
+-                const auto& urlOrTileset = static_cast<style::TileSource*>(source)->getURLOrTileset();
+-                if (urlOrTileset.is<Tileset>()) {
+-                    tileset = &urlOrTileset.get<Tileset>();
++                const Tileset* resolved = resolvedTerrainTileset(static_cast<style::TileSource*>(source));
++                if (resolved != nullptr) {
++                    tileset = resolved;
+                     exaggeration = terrain->getExaggeration();
+                 }
+             }
 diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
 index bd8f93e..f32a11b 100644
 --- a/src/mln/map/transform_state.cpp
@@ -136,7 +262,7 @@ index 44f1780..e796969 100644
      double scale = 1;
      double fov = util::DEFAULT_FOV;
 diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
-index 4c4120b..62ba959 100644
+index 4c4120b..2a8a962 100644
 --- a/src/mln/renderer/render_orchestrator.cpp
 +++ b/src/mln/renderer/render_orchestrator.cpp
 @@ -186,6 +186,10 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
@@ -150,8 +276,29 @@ index 4c4120b..62ba959 100644
      const bool zoomChanged = zoomHistory.update(static_cast<float>(updateParameters->transformState.getZoom()),
                                                  updateParameters->timePoint);
  
+@@ -1066,6 +1070,7 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+                 if (!rt) {
+                     continue;
+                 }
++                rt->setClearColor(Color{0.0f, 0.0f, 0.0f, 0.0f}); // transparent: unrendered != black imagery
+                 it = terrainDrapeTargets.emplace(key, rt).first;
+             }
+             for (auto& [index, layerGroup] : layerGroupsByLayerIndex) {
+diff --git a/src/mln/renderer/render_target.cpp b/src/mln/renderer/render_target.cpp
+index a0c296d..1d0993d 100644
+--- a/src/mln/renderer/render_target.cpp
++++ b/src/mln/renderer/render_target.cpp
+@@ -67,7 +67,7 @@ void RenderTarget::upload(gfx::UploadPass& uploadPass) {
+ void RenderTarget::render(RenderOrchestrator& orchestrator, const RenderTree& renderTree, PaintParameters& parameters) {
+     parameters.renderPass = parameters.encoder->createRenderPass("render target",
+                                                                  {.renderable = *offscreenTexture,
+-                                                                  .clearColor = Color{0.0f, 0.0f, 0.0f, 1.0f},
++                                                                  .clearColor = clearColor,
+                                                                   .clearDepth = {},
+                                                                   .clearStencil = {}});
+ #if MLN_RENDER_BACKEND_OPENGL
 diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
-index 55c9291..ee81d32 100644
+index 55c9291..d239f9e 100644
 --- a/src/mln/renderer/terrain_pass.cpp
 +++ b/src/mln/renderer/terrain_pass.cpp
 @@ -23,16 +23,19 @@
@@ -176,7 +323,7 @@ index 55c9291..ee81d32 100644
  constexpr std::size_t TerrainGridPoints = TerrainGridSegments + 1;
  
  // A light pointing from the north-west, 45 degrees up.
-@@ -46,13 +49,16 @@ struct TerrainMesh {
+@@ -46,13 +49,17 @@ struct TerrainMesh {
      std::vector<uint16_t> indices;
  };
  
@@ -184,20 +331,54 @@ index 55c9291..ee81d32 100644
 -TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double metersPerPixel) {
 +/// Builds a grid over one DEM tile: xy in tile units (0..EXTENT), z the elevation in metres (the camera's
 +/// world-to-camera matrix scales z by pixels-per-metre, like every 3D layer), w a hillshade.
-+TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, const CanonicalTileID& tile) {
++TerrainMesh buildTerrainMesh(const DEMData* dem, double exaggeration, const CanonicalTileID& tile) {
++    // A null `dem` is a tile the source does not have (open sea): flat at sea level, as GL JS treats missing DEM.
      const std::size_t n = TerrainGridPoints;
-     const double dim = static_cast<double>(dem.dim);
+-    const double dim = static_cast<double>(dem.dim);
 -    const double metersPerTile = metersPerPixel * util::tileSize_D;
+-    const double cellMeters = metersPerTile / static_cast<double>(TerrainGridSegments);
+-    const double pixelsPerMeter = 1.0 / metersPerPixel;
++    const double dim = dem != nullptr ? static_cast<double>(dem->dim) : 256.0;
 +    // Ground width of this tile at its own latitude.
 +    const double tilesAcross = static_cast<double>(1ull << tile.z);
 +    const double tileLat = std::atan(std::sinh(std::numbers::pi * (1.0 - 2.0 * (tile.y + 0.5) / tilesAcross)));
 +    const double metersPerTile = util::M2PI * util::EARTH_RADIUS_M * std::cos(tileLat) / tilesAcross;
-     const double cellMeters = metersPerTile / static_cast<double>(TerrainGridSegments);
--    const double pixelsPerMeter = 1.0 / metersPerPixel;
++    const double pixelMeters = metersPerTile / dim;
      const double extent = static_cast<double>(util::EXTENT);
  
      std::vector<double> elevation(n * n);
-@@ -84,7 +90,7 @@ TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double met
+@@ -60,12 +67,14 @@ TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double met
+         for (std::size_t i = 0; i < n; i++) {
+             const double u = static_cast<double>(i) / static_cast<double>(TerrainGridSegments);
+             const double v = static_cast<double>(j) / static_cast<double>(TerrainGridSegments);
+-            elevation[j * n + i] = dem.getElevation(u * dim, v * dim);
++            elevation[j * n + i] = dem != nullptr ? dem->getElevation(u * dim, v * dim) : 0.0;
+         }
+     }
+ 
+-    const auto sample = [&](std::size_t i, std::size_t j) {
+-        return elevation[std::min(j, n - 1) * n + std::min(i, n - 1)];
++    // Slopes straight from the DEM one pixel either side, so the hillshade at a tile edge uses the neighbour's pixels
++    // (the backfilled border) and matches across the seam; grid neighbours would clamp at the edge.
++    const auto demElevation = [&](double x, double y) {
++        return dem != nullptr ? dem->getElevation(std::clamp(x, -1.0, dim), std::clamp(y, -1.0, dim)) : 0.0;
+     };
+ 
+     TerrainMesh mesh;
+@@ -74,8 +83,10 @@ TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double met
+     for (std::size_t j = 0; j < n; j++) {
+         for (std::size_t i = 0; i < n; i++) {
+             const double e = elevation[j * n + i];
+-            const double dzdx = (sample(i + 1, j) - sample(i == 0 ? 0 : i - 1, j)) / (2.0 * cellMeters);
+-            const double dzdy = (sample(i, j + 1) - sample(i, j == 0 ? 0 : j - 1)) / (2.0 * cellMeters);
++            const double px = static_cast<double>(i) / static_cast<double>(TerrainGridSegments) * dim;
++            const double py = static_cast<double>(j) / static_cast<double>(TerrainGridSegments) * dim;
++            const double dzdx = (demElevation(px + 1.0, py) - demElevation(px - 1.0, py)) / (2.0 * pixelMeters);
++            const double dzdy = (demElevation(px, py + 1.0) - demElevation(px, py - 1.0)) / (2.0 * pixelMeters);
+             const double length = std::sqrt(dzdx * dzdx + dzdy * dzdy + 1.0);
+             // normal . light, with normal = (-dzdx, -dzdy, 1) / length
+             const double diffuse = std::clamp((LightX * -dzdx + LightY * -dzdy + LightZ) / length, 0.0, 1.0);
+@@ -84,12 +95,39 @@ TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double met
              float* vertex = out + (j * n + i) * 4;
              vertex[0] = static_cast<float>(static_cast<double>(i) / static_cast<double>(TerrainGridSegments) * extent);
              vertex[1] = static_cast<float>(static_cast<double>(j) / static_cast<double>(TerrainGridSegments) * extent);
@@ -206,7 +387,55 @@ index 55c9291..ee81d32 100644
              vertex[3] = static_cast<float>(shade);
          }
      }
-@@ -124,7 +130,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+     mesh.vertexCount = n * n;
+ 
++    // Skirt (GL JS `_buildSkirts`): a frame hanging below each edge, so hairline gaps where tiles of different zoom
++    // meet (their edge vertices differ) are covered. GL JS uses a fifth of the tile width.
++    const double skirtMeters = metersPerTile / 5.0;
++    const std::size_t skirtVertexBase = mesh.vertexCount;
++    mesh.vertices.resize((n * n + 4 * n) * 4 * sizeof(float));
++    out = reinterpret_cast<float*>(mesh.vertices.data());
++    // Edge vertex indices, per side, in order along the edge.
++    const auto edgeIndex = [&](int side, std::size_t k) -> std::size_t {
++        switch (side) {
++            case 0: return k;                  // north (j = 0)
++            case 1: return (n - 1) * n + k;    // south (j = n-1)
++            case 2: return k * n;              // west  (i = 0)
++            default: return k * n + (n - 1);   // east  (i = n-1)
++        }
++    };
++    for (int side = 0; side < 4; ++side) {
++        for (std::size_t k = 0; k < n; ++k) {
++            const float* src = out + edgeIndex(side, k) * 4;
++            float* dst = out + (skirtVertexBase + static_cast<std::size_t>(side) * n + k) * 4;
++            dst[0] = src[0];
++            dst[1] = src[1];
++            dst[2] = src[2] - static_cast<float>(skirtMeters);
++            dst[3] = src[3];
++        }
++    }
++    mesh.vertexCount = n * n + 4 * n;
++
+     mesh.indices.reserve(TerrainGridSegments * TerrainGridSegments * 6);
+     for (std::size_t j = 0; j < TerrainGridSegments; j++) {
+         for (std::size_t i = 0; i < TerrainGridSegments; i++) {
+@@ -100,6 +138,15 @@ TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double met
+             mesh.indices.insert(mesh.indices.end(), {a, c, b, b, c, d});
+         }
+     }
++    for (int side = 0; side < 4; ++side) {
++        for (std::size_t k = 0; k + 1 < n; ++k) {
++            const auto top0 = static_cast<uint16_t>(edgeIndex(side, k));
++            const auto top1 = static_cast<uint16_t>(edgeIndex(side, k + 1));
++            const auto low0 = static_cast<uint16_t>(skirtVertexBase + static_cast<std::size_t>(side) * n + k);
++            const auto low1 = static_cast<uint16_t>(low0 + 1);
++            mesh.indices.insert(mesh.indices.end(), {top0, low0, top1, top1, low0, low1});
++        }
++    }
+     return mesh;
+ }
+ 
+@@ -124,7 +171,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
  
      if (!tileset || *tileset != *updateParameters.terrainTileset) {
          tileset = updateParameters.terrainTileset;
@@ -215,8 +444,17 @@ index 55c9291..ee81d32 100644
          terrain->setOnTileLoaded(onTileLoaded);
          if (layerGroup) {
              layerGroup->clearDrawables();
-@@ -153,7 +159,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+@@ -151,9 +198,16 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         layerGroup = context.createTileLayerGroup(0, initialCapacity, "terrain");
+     }
  
++    // A neighbour's DEM border changed these tiles' edges: rebuild their meshes so shared edges agree.
++    for (const auto& updated : terrain->takeUpdatedTiles()) {
++        layerGroup->removeDrawablesIf([&](gfx::Drawable& drawable) {
++            return drawable.getTileID() && drawable.getTileID()->canonical == updated;
++        });
++    }
++
      const double zoom = state.getZoom();
      const auto newDemZoom = static_cast<uint8_t>(std::clamp(std::floor(zoom) + 2.0, 0.0, 14.0));
 -    if (newDemZoom != demZoom || builtZoom < 0 || std::abs(builtZoom - zoom) > 0.25 ||
@@ -224,7 +462,7 @@ index 55c9291..ee81d32 100644
          builtExaggeration != updateParameters.terrainExaggeration) {
          demZoom = newDemZoom;
          builtZoom = zoom;
-@@ -161,15 +167,27 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+@@ -161,15 +215,27 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
          layerGroup->clearDrawables();
      }
  
@@ -261,16 +499,25 @@ index 55c9291..ee81d32 100644
  
      const std::unordered_set<OverscaledTileID> covered(tileCover.begin(), tileCover.end());
      layerGroup->removeDrawablesIf(
-@@ -201,7 +219,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+@@ -184,7 +250,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         }
+         const auto& canonical = tileID.canonical;
+         const auto data = terrain->getTileData(canonical);
+-        if (!data) {
++        if (!data && !terrain->isMissing(canonical)) {
+             continue; // still loading
+         }
+ 
+@@ -201,7 +267,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
              builder->setVertexAttrId(shaders::idTerrainPosVertexAttribute);
          }
  
 -        auto mesh = buildTerrainMesh(*data, updateParameters.terrainExaggeration, metersPerPixel);
-+        auto mesh = buildTerrainMesh(*data, updateParameters.terrainExaggeration, canonical);
++        auto mesh = buildTerrainMesh(data.get(), updateParameters.terrainExaggeration, canonical);
          const auto vertexCount = mesh.vertexCount;
          const auto indexCount = mesh.indices.size();
          builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float4);
-@@ -269,6 +287,29 @@ void TerrainPass::applyDrapeTextures(
+@@ -269,6 +335,29 @@ void TerrainPass::applyDrapeTextures(
      });
  }
  
@@ -300,7 +547,7 @@ index 55c9291..ee81d32 100644
  std::function<float(const UnwrappedTileID&)> TerrainPass::elevationFunction(const TransformState& state,
                                                                              double exaggeration) {
      if (!terrain) {
-@@ -278,17 +319,14 @@ std::function<float(const UnwrappedTileID&)> TerrainPass::elevationFunction(cons
+@@ -278,17 +367,14 @@ std::function<float(const UnwrappedTileID&)> TerrainPass::elevationFunction(cons
      const double scale = state.getScale();
      const double worldSize = Projection::worldSize(scale);
      const uint8_t zoom = demZoom;
@@ -353,10 +600,10 @@ index 5e7b771..6f2c858 100644
      std::function<void()> onTileLoaded;
      uint8_t demZoom = 0;
 diff --git a/src/mln/renderer/terrain_tile_manager.cpp b/src/mln/renderer/terrain_tile_manager.cpp
-index 214184b..3cefba5 100644
+index 214184b..dcccd24 100644
 --- a/src/mln/renderer/terrain_tile_manager.cpp
 +++ b/src/mln/renderer/terrain_tile_manager.cpp
-@@ -93,6 +93,25 @@ std::optional<double> TerrainTileManager::sampleElevation(const LatLng& latLng,
+@@ -93,6 +93,35 @@ std::optional<double> TerrainTileManager::sampleElevation(const LatLng& latLng,
      return stillLoading ? std::nullopt : std::optional<double>(0.0);
  }
  
@@ -379,14 +626,61 @@ index 214184b..3cefba5 100644
 +    getDEMData(CanonicalTileID(zoom, id.x >> shift, id.y >> shift));
 +}
 +
++std::vector<CanonicalTileID> TerrainTileManager::takeUpdatedTiles() {
++    std::vector<CanonicalTileID> result;
++    result.reserve(updatedTiles.size());
++    for (const auto& [z, x, y] : updatedTiles) {
++        result.emplace_back(z, x, y);
++    }
++    updatedTiles.clear();
++    return result;
++}
++
  bool TerrainTileManager::hasData() const {
      for (const auto& [key, entry] : tiles) {
          if (entry.data) {
+@@ -165,6 +194,26 @@ void TerrainTileManager::onTileResponse(const CanonicalTileID& id,
+     try {
+         PremultipliedImage image = decodeImage(*res.data);
+         it->second.data = std::make_shared<DEMData>(image, encoding);
++        updatedTiles.insert(it->first); // a tile first built flat (while missing/retrying) must be rebuilt
++        // Share edge and corner pixels with the loaded neighbours at the same zoom, so a tile's mesh edge matches the
++        // neighbour's (a 1-pixel border around each DEM, as the hillshade pipeline does).
++        const auto tilesAcross = static_cast<int64_t>(1) << id.z;
++        for (int dy = -1; dy <= 1; ++dy) {
++            for (int dx = -1; dx <= 1; ++dx) {
++                const int64_t ny = static_cast<int64_t>(id.y) + dy;
++                if ((dx == 0 && dy == 0) || ny < 0 || ny >= tilesAcross) {
++                    continue;
++                }
++                const auto nx = static_cast<uint32_t>((static_cast<int64_t>(id.x) + dx + tilesAcross) % tilesAcross);
++                const auto neighbour = tiles.find(keyFor(CanonicalTileID(id.z, nx, static_cast<uint32_t>(ny))));
++                if (neighbour == tiles.end() || !neighbour->second.data) {
++                    continue;
++                }
++                it->second.data->backfillBorder(*neighbour->second.data, static_cast<int8_t>(dx), static_cast<int8_t>(dy));
++                neighbour->second.data->backfillBorder(*it->second.data, static_cast<int8_t>(-dx), static_cast<int8_t>(-dy));
++                updatedTiles.insert(neighbour->first);
++            }
++        }
+         if (onTileLoaded) {
+             onTileLoaded();
+         }
 diff --git a/src/mln/renderer/terrain_tile_manager.hpp b/src/mln/renderer/terrain_tile_manager.hpp
-index 992d81d..710b2d9 100644
+index 992d81d..c37bcce 100644
 --- a/src/mln/renderer/terrain_tile_manager.hpp
 +++ b/src/mln/renderer/terrain_tile_manager.hpp
-@@ -43,6 +43,14 @@ public:
+@@ -10,7 +10,9 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <tuple>
++#include <vector>
+ 
+ namespace mln {
+ 
+@@ -43,6 +45,22 @@ public:
      /// flat and the result is 0 metres.
      std::optional<double> sampleElevation(const LatLng& latLng, uint8_t zoom, uint8_t fallbackZoom);
  
@@ -398,9 +692,25 @@ index 992d81d..710b2d9 100644
 +    /// range exists for the tile cover to use while the fine tiles are still unknown.
 +    void requestAncestor(const CanonicalTileID& id, uint8_t zoom);
 +
++    /// The tile's request failed or returned no data recently (a source without tiles over open sea): the terrain there
++    /// is flat. False while it is loading and once it has loaded.
++    bool isMissing(const CanonicalTileID& id) const { return isFailed(id); }
++
++    /// Tiles whose DEM border was changed by a neighbour's data since the last call (their meshes must be rebuilt so
++    /// shared edges agree; GL JS `DEMData#backfillBorder`).
++    std::vector<CanonicalTileID> takeUpdatedTiles();
++
      /// Whether any DEM tile has been loaded.
      bool hasData() const;
  
+@@ -79,6 +97,7 @@ private:
+     Tileset tileset;
+     std::function<void()> onTileLoaded;
+     std::map<std::tuple<uint8_t, uint32_t, uint32_t>, Entry> tiles;
++    std::set<std::tuple<uint8_t, uint32_t, uint32_t>> updatedTiles;
+ };
+ 
+ } // namespace mln
 diff --git a/src/mln/renderer/tile_pyramid.cpp b/src/mln/renderer/tile_pyramid.cpp
 index 7b8e82e..613b7a4 100644
 --- a/src/mln/renderer/tile_pyramid.cpp
@@ -552,7 +862,7 @@ index 19b6912..4d432fb 100644
  
  } // namespace util
 diff --git a/src/mln/util/tile_cover.cpp b/src/mln/util/tile_cover.cpp
-index 14fa81e..db6d0d2 100644
+index 14fa81e..f7ce1ef 100644
 --- a/src/mln/util/tile_cover.cpp
 +++ b/src/mln/util/tile_cover.cpp
 @@ -644,9 +644,12 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
@@ -599,7 +909,7 @@ index 14fa81e..db6d0d2 100644
      const auto newRootTile = [&](int16_t wrap) -> Node {
          return {.aabb = AABB({{wrap * numTiles, 0.0, 0.0}}, {{(wrap + 1) * numTiles, numTiles, 0.0}}),
                  .zoom = uint8_t(0),
-@@ -682,6 +707,15 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+@@ -682,6 +707,18 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
                  .fullyVisible = false};
      };
  
@@ -609,13 +919,16 @@ index 14fa81e..db6d0d2 100644
 +    const double terrainFovDegrees = transform.getFieldOfView() * 180.0 / std::numbers::pi;
 +    const double terrainCenterZoom = transform.getZoom() + (z - std::floor(transform.getZoom()));
 +    const double terrainDistanceZ = std::max(std::abs(cameraCoord[2] - centerElevation * metersToTileUnits), 1e-9);
++    // The centre is the map's lat/lng at the centre elevation (GL JS `worldFromLngLat(center, elevation)`), not the
++    // screen-centre ray hit on sea level, which lies kilometres away at high pitch when the centre is elevated.
++    const auto terrainCenterTile = TileCoordinate::fromLatLng(z, transform.getLatLng()).p;
 +    const double terrainDistanceToCenter3d = std::hypot(
-+        std::hypot(centerCoord[0] - cameraCoord[0], centerCoord[1] - cameraCoord[1]), terrainDistanceZ);
++        std::hypot(terrainCenterTile.x - cameraCoord[0], terrainCenterTile.y - cameraCoord[1]), terrainDistanceZ);
 +
      // Perform depth-first traversal on tile tree to find visible tiles
      std::vector<Node> stack;
      std::vector<ResultTile> result;
-@@ -698,6 +732,7 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+@@ -698,6 +735,7 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
      while (!stack.empty()) {
          Node node = stack.back();
          stack.pop_back();
@@ -623,7 +936,7 @@ index 14fa81e..db6d0d2 100644
  
          // Use cached visibility information of ancestor nodes
          if (!node.fullyVisible) {
-@@ -709,8 +744,24 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+@@ -709,8 +747,24 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
          }
  
          bool shouldSplitTile;
@@ -650,7 +963,7 @@ index 14fa81e..db6d0d2 100644
              const double distanceToTileMercator = vec3Length(camToTileMercator);
              const double cosPitchToTile = std::max(0.0, camToTileMercator[2] / distanceToTileMercator);
              const double pitchExponent =
-@@ -720,7 +771,10 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+@@ -720,7 +774,10 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
                                                                         cameraToCenterDistanceMercator /
                                                                         state.tileLodScale * nominalScale;
          } else {
@@ -677,3 +990,31 @@ index 8827457..5361031 100644
  };
  
  int32_t coveringZoomLevel(double z, style::SourceType type, uint16_t tileSize) noexcept;
+diff --git a/test/geometry/dem_data.test.cpp b/test/geometry/dem_data.test.cpp
+index 81b0228..d8dab41 100644
+--- a/test/geometry/dem_data.test.cpp
++++ b/test/geometry/dem_data.test.cpp
+@@ -159,3 +159,23 @@ TEST(DEMData, GetElevationBilinearMidpoint) {
+         }
+     }
+ };
++
++// Terrain meshes sample their edge row at x == dim: after the neighbours backfill each other's border, both tiles read
++// the same elevations along the shared edge, so a mesh edge has no crack.
++TEST(DEMData, SharedEdgeIsContinuousAfterBackfill) {
++    PremultipliedImage left = fakeImage({8, 8});
++    PremultipliedImage right = fakeImage({8, 8});
++    DEMData demLeft(left, Tileset::RasterEncoding::Terrarium);
++    DEMData demRight(right, Tileset::RasterEncoding::Terrarium);
++
++    demLeft.backfillBorder(demRight, 1, 0);
++    demRight.backfillBorder(demLeft, -1, 0);
++
++    // Rows 0..7 only: the corner pixel below the edge belongs to the diagonal and south neighbours (not loaded here;
++    // the terrain mesh skirt covers that last cell until they arrive).
++    for (double y = 0.0; y <= 7.0; y += 0.5) {
++        EXPECT_DOUBLE_EQ(demLeft.getElevation(8.0, y), demRight.getElevation(0.0, y)) << "y=" << y;
++    }
++    // The border pixel is addressable below zero as well (used for edge slopes).
++    EXPECT_DOUBLE_EQ(demRight.getElevation(-1.0, 3.0), static_cast<double>(demRight.get(-1, 3)));
++}

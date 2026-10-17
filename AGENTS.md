@@ -111,3 +111,19 @@ Benchmarks: `mbgl-benchmark-runner --benchmark_filter=TileCover`.
 ## Remotes (2026-10-17)
 
 `origin` = `johndr/maplibre-native-qt`. The vendored core is `vendor/maplibre-native` (pinned at upstream `c7506d6`, working tree = patches applied, never commit it). The patched core is also published as branch `maplibreearth-patches` of `johndr/maplibre-native` (one commit per `patches/*.patch`); keep it in sync when adding a patch (see the MapLibreEarth wiki runbook `linux-terrain-test-and-debug`).
+
+## GL JS alignment rule (agreed with John, 2026-10-17)
+
+MapLibre GL JS is the reference implementation. Where this fork does the same job as GL JS
+(terrain, tile covers, camera, projection, drape, shaders), follow GL JS's algorithm, units
+and constants, and read its source (github.com/maplibre/maplibre-gl-js) before designing.
+
+Any deviation must be justified and agreed with John BEFORE it is implemented:
+- State what GL JS does (file/function), what you propose instead, and why GL JS's approach
+  cannot be used here.
+- Wait for a decision. Do not ship a stop-gap, heuristic or fork-only feature unprompted.
+- Temporary stop-gaps agreed with John must be recorded in the alignment audit with the
+  intended GL JS-aligned replacement.
+
+Deviations already in the code are listed in `wiki/references/gljs-alignment.md` (MapLibreEarth
+repo); new work must not add to that list without agreement.
