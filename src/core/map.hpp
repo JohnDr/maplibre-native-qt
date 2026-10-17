@@ -139,6 +139,9 @@ public:
     // is missing or is not a raster-dem source.
     void setTerrain(const QString &source, double exaggeration = 1.0);
     void clearTerrain();
+    [[nodiscard]] QVariant terrainElevation(const Coordinate &coordinate) const;
+    [[nodiscard]] double elevation() const;
+    [[nodiscard]] double cameraAltitude() const;
 
     // Backdrop colour (space) drawn behind the map - relevant when rendering the globe.
     void setBackgroundColor(const QColor &color);

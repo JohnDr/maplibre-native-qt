@@ -84,3 +84,30 @@ Android trees listed in the wiki.
 Read the MapLibreEarth wiki runbooks:
 `wiki/runbooks/qt-creator-debug-release.md`, `wiki/runbooks/build-windows.md`,
 and `wiki/architecture/environment.md`.
+
+## Vendored core unit tests (mbgl-test-runner) — Linux
+
+Canonical test tree (configure once; command line only, never the app path):
+
+```bash
+export PATH=$HOME/Qt/Tools/Ninja:$PATH
+cmake -G Ninja -S vendor/maplibre-native -B ~/dev/tmp/build-maplibre-native-core-tests \
+  -DCMAKE_BUILD_TYPE=Release -DMLN_WITH_VULKAN=ON -DMLN_WITH_OPENGL=OFF -DMLN_WITH_GLFW=OFF \
+  -DMLN_WITH_WERROR=OFF -DMLN_TEXT_SHAPING_HARFBUZZ=OFF
+ninja -C ~/dev/tmp/build-maplibre-native-core-tests mbgl-test-runner
+cd vendor/maplibre-native && ~/dev/tmp/build-maplibre-native-core-tests/mbgl-test-runner   # run from the source dir
+```
+
+Qt-level test: `ctest` in each library tree (`QT_QPA_PLATFORM=xcb QSG_RENDER_LOOP=basic`).
+Known failures not caused by terrain work (2026-10-16): `StyleConversion.Projection`, `CustomDrawableLayer.Line/Fill`.
+
+Render tests (per group, because one process over all groups exhausts thread-local keys and aborts):
+`ninja -C ~/dev/tmp/build-maplibre-native-core-tests mbgl-render-test-runner`, then for each dir in
+`metrics/integration/render-tests` run `mbgl-render-test-runner -p metrics/linux-vulkan.json -f render-tests/<group>/`
+from `vendor/maplibre-native`. Result 2026-10-16: 1200 pass; `fill-extrusion-pattern/tile-buffer` fails and
+`text-font/{burmese,khmer,devanagari}` error — identical without patch 0040's cover/frustum code.
+Benchmarks: `mbgl-benchmark-runner --benchmark_filter=TileCover`.
+
+## Remotes (2026-10-17)
+
+`origin` = `johndr/maplibre-native-qt`. The vendored core is `vendor/maplibre-native` (pinned at upstream `c7506d6`, working tree = patches applied, never commit it). The patched core is also published as branch `maplibreearth-patches` of `johndr/maplibre-native` (one commit per `patches/*.patch`); keep it in sync when adding a patch (see the MapLibreEarth wiki runbook `linux-terrain-test-and-debug`).

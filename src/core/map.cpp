@@ -705,6 +705,9 @@ void Map::jumpTo(const CameraOptions &camera) {
     if (camera.pitch.isValid()) {
         mbglCamera.pitch = camera.pitch.value<double>();
     }
+    if (camera.centerAltitude.isValid()) {
+        mbglCamera.centerAltitude = camera.centerAltitude.value<double>();
+    }
 
     mbglCamera.padding = d_ptr->margins;
 
@@ -734,6 +737,9 @@ void Map::easeTo(const CameraOptions &camera, const AnimationOptions &animation)
     }
     if (camera.pitch.isValid()) {
         mbglCamera.pitch = camera.pitch.value<double>();
+    }
+    if (camera.centerAltitude.isValid()) {
+        mbglCamera.centerAltitude = camera.centerAltitude.value<double>();
     }
     mbglCamera.padding = d_ptr->margins;
 
@@ -774,6 +780,9 @@ void Map::flyTo(const CameraOptions &camera, const AnimationOptions &animation) 
     }
     if (camera.pitch.isValid()) {
         mbglCamera.pitch = camera.pitch.value<double>();
+    }
+    if (camera.centerAltitude.isValid()) {
+        mbglCamera.centerAltitude = camera.centerAltitude.value<double>();
     }
     mbglCamera.padding = d_ptr->margins;
 
@@ -951,6 +960,32 @@ void Map::setTerrain(const QString &source, double exaggeration) {
 */
 void Map::clearTerrain() {
     d_ptr->mapObj->clearTerrain();
+}
+
+/*!
+    \brief Returns the terrain height in metres at \a coordinate, without the exaggeration.
+
+    The result is invalid while the elevation tile covering it has not loaded, and when there is no terrain.
+*/
+QVariant Map::terrainElevation(const Coordinate &coordinate) const {
+    const auto elevation = d_ptr->mapObj->queryTerrainElevation(mln::LatLng{coordinate.first, coordinate.second});
+    return elevation ? QVariant(*elevation) : QVariant();
+}
+
+/*!
+    \brief Returns the altitude of the camera centre in metres above sea level.
+
+    With terrain this is the terrain height under the centre, exaggeration included.
+*/
+double Map::elevation() const {
+    return d_ptr->mapObj->getElevation();
+}
+
+/*!
+    \brief Returns the altitude of the camera itself in metres above sea level.
+*/
+double Map::cameraAltitude() const {
+    return d_ptr->mapObj->getCameraAltitude();
 }
 
 /*!

@@ -162,6 +162,7 @@ struct Q_MAPLIBRE_CORE_EXPORT CameraOptions {
     QVariant zoom;    // double
     QVariant bearing; // double
     QVariant pitch;   // double
+    QVariant centerAltitude; // double, metres above sea level (the terrain height under the centre)
 };
 
 struct Q_MAPLIBRE_CORE_EXPORT AnimationOptions {

@@ -2,6 +2,7 @@
 
 // SPDX-License-Identifier: BSD-2-Clause
 
+#include <limits>
 #include "map_quick_item.hpp"
 #include "map_quick_item_p.hpp"
 
@@ -275,6 +276,28 @@ void MapQuickItem::scale(double scale, const QPointF &center) {
     emit zoomLevelChanged();
 }
 
+double MapQuickItem::terrainElevation(double latitude, double longitude) const {
+    Q_D(const MapQuickItem);
+
+    if (d->m_map == nullptr) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const QVariant elevation = d->m_map->terrainElevation({latitude, longitude});
+    return elevation.isValid() ? elevation.toDouble() : std::numeric_limits<double>::quiet_NaN();
+}
+
+double MapQuickItem::elevation() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_map != nullptr ? d->m_map->elevation() : 0.0;
+}
+
+double MapQuickItem::cameraAltitude() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_map != nullptr ? d->m_map->cameraAltitude() : 0.0;
+}
+
 void MapQuickItem::easeTo(const QVariantMap &camera, const QVariantMap &animation) {
     Q_D(MapQuickItem);
 
@@ -297,6 +320,9 @@ void MapQuickItem::easeTo(const QVariantMap &camera, const QVariantMap &animatio
     }
     if (camera.contains("pitch")) {
         cameraOptions.pitch = camera["pitch"].toDouble();
+    }
+    if (camera.contains("centerAltitude")) {
+        cameraOptions.centerAltitude = camera["centerAltitude"].toDouble();
     }
 
     AnimationOptions animationOptions;
@@ -342,6 +368,9 @@ void MapQuickItem::flyTo(const QVariantMap &camera, const QVariantMap &animation
     }
     if (camera.contains("pitch")) {
         cameraOptions.pitch = camera["pitch"].toDouble();
+    }
+    if (camera.contains("centerAltitude")) {
+        cameraOptions.centerAltitude = camera["centerAltitude"].toDouble();
     }
 
     AnimationOptions animationOptions;

@@ -458,7 +458,12 @@ VulkanRendererBackend::VulkanRendererBackend(QWindow *window,
     initializeWithQtInstance(qtInstance);
 }
 
-VulkanRendererBackend::~VulkanRendererBackend() = default;
+VulkanRendererBackend::~VulkanRendererBackend() {
+    // The renderable's resource owns an offscreen texture whose destructor needs the context (and so a backend scope).
+    // Members are destroyed after this body, outside any scope, so release it here.
+    const mln::gfx::BackendScope scope(*this, mln::gfx::BackendScope::ScopeType::Implicit);
+    setResource(nullptr);
+}
 
 void VulkanRendererBackend::initializeWithQtInstance(QVulkanInstance *qtInstance) {
     m_qtInstance = qtInstance;

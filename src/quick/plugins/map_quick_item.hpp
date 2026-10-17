@@ -88,6 +88,11 @@ public:
     Q_INVOKABLE void scale(double scale, const QPointF &center);
     Q_INVOKABLE void easeTo(const QVariantMap &camera, const QVariantMap &animation = QVariantMap());
     Q_INVOKABLE void flyTo(const QVariantMap &camera, const QVariantMap &animation = QVariantMap());
+    // Terrain height in metres at a position, without exaggeration; NaN while its elevation tile is loading.
+    Q_INVOKABLE double terrainElevation(double latitude, double longitude) const;
+    // Camera centre and camera altitude in metres above sea level.
+    Q_INVOKABLE double elevation() const;
+    Q_INVOKABLE double cameraAltitude() const;
 
     Q_INVOKABLE void addStyleParameter(StyleParameter *parameter);
     Q_INVOKABLE void removeStyleParameter(StyleParameter *parameter);

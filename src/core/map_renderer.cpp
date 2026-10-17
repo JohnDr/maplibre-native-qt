@@ -136,6 +136,9 @@ void MapRenderer::updateRenderer(const mln::Size &size, qreal pixelRatio, quint3
     const mln::Size actualSize{static_cast<uint32_t>(size.width * pixelRatio),
                                 static_cast<uint32_t>(size.height * pixelRatio)};
 
+    // Resizing recreates GPU resources (the Vulkan offscreen texture), which needs the backend context.
+    const mln::gfx::BackendScope scope(m_backend, mln::gfx::BackendScope::ScopeType::Implicit);
+
     m_backend.updateRenderer(actualSize, fbo);
 }
 

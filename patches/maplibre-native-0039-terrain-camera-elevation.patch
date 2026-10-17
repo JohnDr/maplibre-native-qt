@@ -1,0 +1,443 @@
+--- a/include/mln/map/map.hpp
++++ b/include/mln/map/map.hpp
+@@ -127,6 +127,13 @@
+     bool hasTerrain() const;
+     std::string getTerrainSource() const;
+     double getTerrainExaggeration() const;
++    /// The terrain height in metres at `latLng`, without the exaggeration; nullopt while its DEM tile has not loaded or
++    /// when there is no terrain.
++    std::optional<double> queryTerrainElevation(const LatLng&) const;
++    /// The camera centre's altitude in metres above sea level (the terrain height under it, exaggeration included).
++    double getElevation() const;
++    /// The camera's own altitude in metres above sea level.
++    double getCameraAltitude() const;
+ 
+     // Projection
+     ScreenCoordinate pixelForLatLng(const LatLng&) const;
+--- a/src/mln/map/map.cpp
++++ b/src/mln/map/map.cpp
+@@ -481,6 +481,18 @@
+     return {};
+ }
+ 
++std::optional<double> Map::queryTerrainElevation(const LatLng& latLng) const {
++    return impl->terrainElevationAt(latLng);
++}
++
++double Map::getElevation() const {
++    return impl->transform.getElevation();
++}
++
++double Map::getCameraAltitude() const {
++    return impl->transform.getCameraAltitude();
++}
++
+ double Map::getTerrainExaggeration() const {
+     if (auto* terrain = impl->style ? impl->style->getTerrain() : nullptr) {
+         return terrain->getExaggeration();
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -4,6 +4,9 @@
+ #include <mln/storage/file_source.hpp>
+ #include <mln/style/style_impl.hpp>
+ #include <mln/style/projection_impl.hpp>
++#include <algorithm>
++
++#include <mln/renderer/terrain_tile_manager.hpp>
+ #include <mln/style/terrain.hpp>
+ #include <mln/style/source.hpp>
+ #include <mln/style/sources/tile_source.hpp>
+@@ -118,6 +121,7 @@
+     TimePoint timePoint = mode == MapMode::Continuous ? Clock::now() : Clock::time_point::max();
+ 
+     transform.updateTransitions(timePoint);
++    updateTerrainCamera();
+     transform.setProjectionDefinition(
+         style->impl->getProjection()->impl->evaluate(static_cast<float>(transform.getZoom())));
+ 
+@@ -163,6 +167,68 @@
+     rendererFrontend.update(std::make_shared<UpdateParameters>(std::move(params)));
+ }
+ 
++std::optional<double> Map::Impl::terrainElevationAt(const LatLng& latLng) {
++    if (!terrainElevation) {
++        return std::nullopt;
++    }
++    constexpr uint8_t coarseZoom = 9; // answers quickly while the fine tile is still loading
++    return terrainElevation->sampleElevation(latLng.wrapped(), terrainDemZoom, std::min(coarseZoom, terrainDemZoom));
++}
++
++void Map::Impl::updateTerrainCamera() {
++    // The enabled terrain's DEM tileset, if any (same lookup as the renderer's UpdateParameters below).
++    const Tileset* tileset = nullptr;
++    double exaggeration = 1.0;
++    if (style) {
++        if (auto* terrain = style->impl->getTerrain(); terrain != nullptr && terrain->isEnabled()) {
++            if (auto* source = style->impl->getSource(terrain->getSource());
++                source != nullptr && source->getType() == style::SourceType::RasterDEM) {
++                const auto& urlOrTileset = static_cast<style::TileSource*>(source)->getURLOrTileset();
++                if (urlOrTileset.is<Tileset>()) {
++                    tileset = &urlOrTileset.get<Tileset>();
++                    exaggeration = terrain->getExaggeration();
++                }
++            }
++        }
++    }
++
++    if (tileset == nullptr || tileset->tiles.empty()) {
++        terrainElevation.reset();
++        if (terrainElevationApplied) {
++            // Terrain was switched off: put the centre back on the flat map.
++            transform.setElevation(0.0);
++            terrainElevationApplied = false;
++        }
++        return;
++    }
++
++    if (!terrainElevation) {
++        terrainElevation = std::make_unique<TerrainTileManager>(fileSource.get(), *tileset);
++        terrainElevation->setOnTileLoaded([this]() { onUpdate(); });
++    } else {
++        terrainElevation->setTileset(*tileset);
++    }
++    terrainElevationExaggeration = exaggeration;
++    terrainDemZoom = std::min<uint8_t>(tileset->zoomRange.max, 14);
++
++    // While the DEM under the centre is still loading, leave the camera alone rather than snap it to sea level.
++    const auto centreElevation = terrainElevationAt(transform.getLatLng());
++    if (!centreElevation) {
++        return;
++    }
++    transform.setElevation(*centreElevation * exaggeration);
++    terrainElevationApplied = true;
++
++    // Never let the camera sink into the terrain. The margin keeps the near plane clear of the surface.
++    constexpr double marginMeters = 2.0;
++    transform.raiseCameraAboveTerrain(
++        [this, exaggeration](const LatLng& latLng) -> std::optional<double> {
++            const auto elevation = terrainElevationAt(latLng);
++            return elevation ? std::optional<double>(*elevation * exaggeration) : std::nullopt;
++        },
++        marginMeters);
++}
++
+ void Map::Impl::onStyleLoading() {
+     loading = true;
+     rendererFullyLoaded = false;
+--- a/src/mln/map/map_impl.hpp
++++ b/src/mln/map/map_impl.hpp
+@@ -19,6 +19,7 @@
+ namespace mln {
+ 
+ class FileSource;
++class TerrainTileManager;
+ class ResourceTransform;
+ 
+ namespace gfx {
+@@ -86,6 +87,12 @@
+     // Map
+     void jumpTo(const CameraOptions&);
+ 
++    /// 3D terrain: the drawn terrain height at `latLng` in metres, without the exaggeration, or nullopt where it is
++    /// not loaded (or there is no terrain). Fetches the DEM tiles it needs.
++    std::optional<double> terrainElevationAt(const LatLng&);
++    /// 3D terrain: sets the camera centre's altitude from the terrain under it and keeps the camera out of the terrain.
++    void updateTerrainCamera();
++
+     bool isRenderingStatsViewEnabled() const;
+     void enableRenderingStatsView(bool value);
+ 
+@@ -124,6 +131,12 @@
+ 
+     // CFID: custom backdrop colour applied to the render-tree background.
+     std::optional<Color> backgroundColor;
++
++    // 3D terrain camera: a DEM sampler on this (map) thread, since the renderer's own one is not reachable from here.
++    std::unique_ptr<TerrainTileManager> terrainElevation;
++    double terrainElevationExaggeration = 1.0;
++    uint8_t terrainDemZoom = 14;
++    bool terrainElevationApplied = false;
+ };
+ 
+ // Forward declaration of this method is required for the MapProjection class
+--- a/src/mln/map/transform.cpp
++++ b/src/mln/map/transform.cpp
+@@ -13,7 +13,8 @@
+ #include <mln/util/logging.hpp>
+ #include <mln/util/platform.hpp>
+ 
+-#include <cstdio>
++#include <algorithm>
++#include <limits>
+ #include <utility>
+ #include <numbers>
+ 
+@@ -543,6 +544,74 @@
+     return state.getCameraAltitude();
+ }
+ 
++bool Transform::raiseCameraAboveTerrain(const std::function<std::optional<double>(const LatLng&)>& elevationAt,
++                                        double marginMeters) {
++    if (state.isGlobeRendering()) {
++        return false;
++    }
++
++    const LatLng centre = state.getLatLng(LatLng::Unwrapped);
++    const double zoom = state.getZoom();
++    const double pitch = state.getPitch();
++    const double compass = -state.getBearing(); // the state stores the bearing negated
++    const double metersPerPixel = Projection::getMetersPerPixelAtLatitude(centre.latitude(), zoom);
++    const double toCenterPx = state.getCameraToCenterDistance();
++    const double distance = toCenterPx * metersPerPixel; // camera to centre, metres
++    const double centreAlt = state.getCenterAltitude();
++    const double horizontal = distance * std::sin(pitch);
++    const double cameraAlt = centreAlt + distance * std::cos(pitch);
++
++    // Terrain tops out below ~9 km (times the exaggeration); a camera far above that cannot be inside it.
++    constexpr double farAboveTerrain = 30000.0;
++    if (cameraAlt > farAboveTerrain) {
++        return false;
++    }
++
++    // The camera's position: behind the centre, against the view direction.
++    const double metersPerDegreeLat = util::deg2rad(util::EARTH_RADIUS_M);
++    const double metersPerDegreeLon = metersPerDegreeLat * std::cos(util::deg2rad(centre.latitude()));
++    if (metersPerDegreeLon < 1.0) {
++        return false;
++    }
++    const double east = -horizontal * std::sin(compass);
++    const double north = -horizontal * std::cos(compass);
++    const LatLng camera{centre.latitude() + north / metersPerDegreeLat, centre.longitude() + east / metersPerDegreeLon};
++
++    // Terrain at the camera and on a ring around it (the near frustum), whichever is highest.
++    const double ring = std::max(0.15 * distance, 10.0);
++    double overlap = -std::numeric_limits<double>::infinity();
++    const auto probe = [&](double dEast, double dNorth) {
++        const LatLng at{camera.latitude() + dNorth / metersPerDegreeLat, camera.longitude() + dEast / metersPerDegreeLon};
++        if (const auto elevation = elevationAt(at.wrapped())) {
++            overlap = std::max(overlap, *elevation + marginMeters - cameraAlt);
++        }
++    };
++    probe(0.0, 0.0);
++    for (int i = 0; i < 8; ++i) {
++        const double angle = i * std::numbers::pi / 4.0;
++        probe(ring * std::sin(angle), ring * std::cos(angle));
++    }
++    if (!(overlap > 0.0)) {
++        return false;
++    }
++
++    // Raise the camera by the overlap; the centre stays put. The new camera-to-centre vector gives pitch and zoom.
++    const double newHeight = cameraAlt + overlap - centreAlt;
++    const double newPitch = std::max(std::atan2(horizontal, newHeight), state.getMinPitch());
++    const double newDistance = std::hypot(horizontal, newHeight);
++    const double newMetersPerPixel = newDistance / toCenterPx;
++    const double equatorMetersPerPixelAtZoom0 = std::cos(util::deg2rad(centre.latitude())) * util::M2PI *
++                                                util::EARTH_RADIUS_M / util::tileSize_D;
++    const double newZoom = util::clamp(std::log2(equatorMetersPerPixelAtZoom0 / newMetersPerPixel),
++                                       state.getMinZoomAtLatitude(centre.latitude()),
++                                       state.getMaxZoom());
++
++    state.setLatLngZoom(centre, newZoom);
++    state.setPitch(newPitch);
++    state.setCenterAltitude(centreAlt); // the stored altitude is in pixels, which changed with the zoom
++    return true;
++}
++
+ // MARK: - North Orientation
+ 
+ void Transform::setProjectionDefinition(const ProjectionDefinition& definition) {
+--- a/src/mln/map/transform.hpp
++++ b/src/mln/map/transform.hpp
+@@ -101,6 +101,15 @@
+     void setElevation(double);
+     /** The camera's altitude above sea level, in metres. */
+     double getCameraAltitude() const;
++    /**
++     * Keeps the camera out of the terrain (GL JS's `_raiseCameraByPitchAndZoom`). `elevationAt` returns the drawn
++     * terrain height in metres (exaggeration included) at a position, or nullopt where it is not loaded. When terrain
++     * at or around the camera is above it, the camera is raised by the overlap plus `marginMeters` with its position
++     * and the map centre fixed, and pitch and zoom are re-solved from the new camera-to-centre vector. Returns whether
++     * the camera changed.
++     */
++    bool raiseCameraAboveTerrain(const std::function<std::optional<double>(const LatLng&)>& elevationAt,
++                                 double marginMeters);
+ 
+     // North Orientation
+     void setProjectionDefinition(const ProjectionDefinition&);
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -899,12 +899,14 @@
+     }
+ 
+     Point<double> pt = projection->project(latLng, scale) / util::tileSize_D;
+-    vec4 c = {{pt.x, pt.y, 0, 1}};
++    vec4 c = {{pt.x, pt.y, z / util::tileSize_D, 1}}; // on the plane through the centre (see screenCoordinateToTileCoordinate)
+     matrix::transformMat4(p, c, getCoordMatrix());
+     return {p[0] / p[3], size.height - p[1] / p[3]};
+ }
+ 
+-TileCoordinate TransformState::screenCoordinateToTileCoordinate(const ScreenCoordinate& point, uint8_t atZoom) const {
++TileCoordinate TransformState::screenCoordinateToTileCoordinate(const ScreenCoordinate& point,
++                                                                uint8_t atZoom,
++                                                                bool onCenterPlane) const {
+     if (size.isEmpty()) {
+         return {.p = {}, .z = 0};
+     }
+@@ -917,7 +919,8 @@
+         return {.p = {p.x, p.y}, .z = static_cast<double>(atZoom)};
+     }
+ 
+-    float targetZ = 0;
++    // z is the centre altitude in pixels; the matrices take tile units (pixels / tile size).
++    const float targetZ = onCenterPlane ? static_cast<float>(z / util::tileSize_D) : 0.0f;
+ 
+     double flippedY = size.height - point.y;
+ 
+@@ -950,7 +953,7 @@
+     if (isGlobeRendering()) {
+         return VerticalPerspectiveProjection::screenCoordinateToLatLng(*this, point, wrapMode);
+     }
+-    auto coord = screenCoordinateToTileCoordinate(point, 0);
++    auto coord = screenCoordinateToTileCoordinate(point, 0, true);
+     return projection->unproject(coord.p, 1. / util::tileSize_D, wrapMode);
+ }
+ 
+--- a/src/mln/map/transform_state.hpp
++++ b/src/mln/map/transform_state.hpp
+@@ -272,7 +272,11 @@
+     ScreenCoordinate latLngToScreenCoordinate(const LatLng&, vec4&) const;
+     LatLng screenCoordinateToLatLng(const ScreenCoordinate&, LatLng::WrapMode = LatLng::Unwrapped) const;
+     // Implements mapbox-gl-js pointCoordinate() : MercatorCoordinate.
+-    TileCoordinate screenCoordinateToTileCoordinate(const ScreenCoordinate&, uint8_t atZoom) const;
++    /// With `onCenterPlane`, the point is unprojected onto the horizontal plane through the map centre (at its altitude,
++    /// i.e. the terrain height under it) instead of onto sea level, so the centre pixel maps back to the centre.
++    TileCoordinate screenCoordinateToTileCoordinate(const ScreenCoordinate&,
++                                                    uint8_t atZoom,
++                                                    bool onCenterPlane = false) const;
+ 
+     double zoomScale(double zoom) const;
+     double scaleZoom(double scale) const;
+--- a/src/mln/renderer/terrain_tile_manager.cpp
++++ b/src/mln/renderer/terrain_tile_manager.cpp
+@@ -40,6 +40,10 @@
+ TerrainTileManager::~TerrainTileManager() = default;
+ 
+ void TerrainTileManager::setTileset(Tileset tileset_) {
++    // Tiles of a different tile source are not interchangeable; keep them only while the source stays the same.
++    if (tileset.tiles != tileset_.tiles) {
++        tiles.clear();
++    }
+     tileset = std::move(tileset_);
+ }
+ 
+@@ -66,6 +70,29 @@
+     return data->getElevation((x - id.x) * dim, (y - id.y) * dim);
+ }
+ 
++std::optional<double> TerrainTileManager::sampleElevation(const LatLng& latLng, uint8_t zoom, uint8_t fallbackZoom) {
++    bool stillLoading = false;
++    const uint8_t zooms[2] = {zoom, fallbackZoom};
++    for (int i = 0; i < 2; ++i) {
++        const uint8_t z = zooms[i];
++        if (i == 1 && z >= zoom) {
++            break; // no coarser fallback
++        }
++        const CanonicalTileID id = tileFor(latLng, z);
++        if (const auto data = getDEMData(id)) {
++            double x;
++            double y;
++            tileCoordinate(latLng, z, x, y);
++            const double dim = static_cast<double>(data->dim);
++            return data->getElevation((x - id.x) * dim, (y - id.y) * dim);
++        }
++        if (!isFailed(id)) {
++            stillLoading = true;
++        }
++    }
++    return stillLoading ? std::nullopt : std::optional<double>(0.0);
++}
++
+ bool TerrainTileManager::hasData() const {
+     for (const auto& [key, entry] : tiles) {
+         if (entry.data) {
+@@ -83,12 +110,18 @@
+     if (it->second.data) {
+         return it->second.data;
+     }
+-    if (!it->second.request) {
++    if (!it->second.request && !isFailed(id)) {
+         startRequest(id);
+     }
+     return nullptr;
+ }
+ 
++bool TerrainTileManager::isFailed(const CanonicalTileID& id) const {
++    const auto it = tiles.find(keyFor(id));
++    return it != tiles.end() && it->second.failed &&
++           std::chrono::steady_clock::now() - it->second.failedAt < kRetryDelay;
++}
++
+ void TerrainTileManager::startRequest(const CanonicalTileID& id) {
+     if (fileSource == nullptr || tileset.tiles.empty()) {
+         return;
+@@ -123,8 +156,11 @@
+     it->second.request.reset();
+ 
+     if (res.error || !res.data) {
++        it->second.failed = true;
++        it->second.failedAt = std::chrono::steady_clock::now();
+         return;
+     }
++    it->second.failed = false;
+ 
+     try {
+         PremultipliedImage image = decodeImage(*res.data);
+--- a/src/mln/renderer/terrain_tile_manager.hpp
++++ b/src/mln/renderer/terrain_tile_manager.hpp
+@@ -4,10 +4,12 @@
+ #include <mln/util/geo.hpp>
+ #include <mln/util/tileset.hpp>
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <functional>
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <tuple>
+ 
+ namespace mln {
+@@ -34,6 +36,13 @@
+     /// is missing, and returns 0 until it has loaded.
+     double getElevation(const LatLng& latLng, uint8_t zoom);
+ 
++    /// The elevation in metres at `latLng`, or nullopt while the DEM covering it is still loading. Unlike
++    /// `getElevation` this tells "not loaded yet" apart from sea level. Samples the tile at `zoom`; until that has
++    /// loaded it falls back to the tile at `fallbackZoom` (requested too, so a coarse answer arrives quickly), when
++    /// that is coarser. When every tile it tried definitively has no data (a failed request), the terrain there is
++    /// flat and the result is 0 metres.
++    std::optional<double> sampleElevation(const LatLng& latLng, uint8_t zoom, uint8_t fallbackZoom);
++
+     /// Whether any DEM tile has been loaded.
+     bool hasData() const;
+ 
+@@ -51,8 +60,18 @@
+     struct Entry {
+         std::shared_ptr<DEMData> data;
+         std::unique_ptr<AsyncRequest> request;
++        /// The last request failed or returned no data (for example a DEM tile that does not exist over open ocean).
++        /// The tile is not requested again before `kRetryDelay` has passed, so a missing tile cannot cause a request
++        /// storm.
++        bool failed = false;
++        std::chrono::steady_clock::time_point failedAt;
+     };
+ 
++    static constexpr std::chrono::seconds kRetryDelay{20};
++
++    /// Whether the tile's last request failed recently enough that it will not be retried yet.
++    bool isFailed(const CanonicalTileID&) const;
++
+     void startRequest(const CanonicalTileID&);
+     void onTileResponse(const CanonicalTileID&, const Response&, Tileset::RasterEncoding);
+ 

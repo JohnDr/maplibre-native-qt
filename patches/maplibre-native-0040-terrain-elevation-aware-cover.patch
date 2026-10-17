@@ -1,0 +1,679 @@
+diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
+index b3d7f5c..4082d27 100644
+--- a/include/mln/shaders/vulkan/terrain.hpp
++++ b/include/mln/shaders/vulkan/terrain.hpp
+@@ -6,9 +6,9 @@
+ namespace mln {
+ namespace shaders {
+ 
+-/// Renders the terrain surface: a 3D mesh whose vertices carry a world-pixel elevation and a precomputed shade.
+-/// The third vertex component is already in world pixels (metres converted with `pixelsPerMeter` on the CPU), so the
+-/// vertex shader is the same projection the other 3D layers use.
++/// Renders the terrain surface: a 3D mesh whose vertices carry an elevation in metres and a precomputed shade.
++/// The projection matrix scales z by pixels-per-metre (as for every 3D layer), so the vertex shader is the same
++/// projection the other 3D layers use.
+ template <>
+ struct ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan> {
+     static constexpr const char* name = "TerrainShader";
+@@ -21,7 +21,7 @@ struct ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan> {
+ )";
+     static constexpr auto vertex = R"(
+ 
+-// xy: tile units (0..EXTENT); z: world-pixel elevation; w: shade in [0, 1].
++// xy: tile units (0..EXTENT); z: elevation in metres; w: shade in [0, 1].
+ layout(location = 0) in vec4 in_position;
+ 
+ layout(push_constant) uniform Constants {
+diff --git a/src/mln/geometry/dem_data.cpp b/src/mln/geometry/dem_data.cpp
+index 7dcf390..a3fc999 100644
+--- a/src/mln/geometry/dem_data.cpp
++++ b/src/mln/geometry/dem_data.cpp
+@@ -44,6 +44,20 @@ DEMData::DEMData(const PremultipliedImage& _image, Tileset::RasterEncoding _enco
+     memcpy(data, data + stride, stride * 4);
+     // bottom horizontal border with corners
+     memcpy(data + (dim + 1) * stride, data + dim * stride, stride * 4);
++
++    if (dim > 0) {
++        int32_t lo = get(0, 0);
++        int32_t hi = lo;
++        for (int32_t y = 0; y < dim; y++) {
++            for (int32_t x = 0; x < dim; x++) {
++                const int32_t value = get(x, y);
++                lo = std::min(lo, value);
++                hi = std::max(hi, value);
++            }
++        }
++        minElevation = lo;
++        maxElevation = hi;
++    }
+ }
+ 
+ // This function takes the DEMData from a neighboring tile and backfills the
+diff --git a/src/mln/geometry/dem_data.hpp b/src/mln/geometry/dem_data.hpp
+index 18d457e..b5684e1 100644
+--- a/src/mln/geometry/dem_data.hpp
++++ b/src/mln/geometry/dem_data.hpp
+@@ -29,6 +29,9 @@ public:
+     const int32_t dim;
+     const int32_t stride;
+     const Tileset::RasterEncoding encoding;
++    /// The lowest and highest elevation in the tile, in metres (GL JS `DEMData#min`/`#max`).
++    double minElevation = 0.0;
++    double maxElevation = 0.0;
+ 
+ private:
+     std::shared_ptr<PremultipliedImage> image;
+diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
+index bd8f93e..f32a11b 100644
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -899,7 +899,7 @@ ScreenCoordinate TransformState::latLngToScreenCoordinate(const LatLng& latLng,
+     }
+ 
+     Point<double> pt = projection->project(latLng, scale) / util::tileSize_D;
+-    vec4 c = {{pt.x, pt.y, z / util::tileSize_D, 1}}; // on the plane through the centre (see screenCoordinateToTileCoordinate)
++    vec4 c = {{pt.x, pt.y, getCenterAltitude(), 1}}; // on the plane through the centre (see screenCoordinateToTileCoordinate)
+     matrix::transformMat4(p, c, getCoordMatrix());
+     return {p[0] / p[3], size.height - p[1] / p[3]};
+ }
+@@ -919,8 +919,9 @@ TileCoordinate TransformState::screenCoordinateToTileCoordinate(const ScreenCoor
+         return {.p = {p.x, p.y}, .z = static_cast<double>(atZoom)};
+     }
+ 
+-    // z is the centre altitude in pixels; the matrices take tile units (pixels / tile size).
+-    const float targetZ = onCenterPlane ? static_cast<float>(z / util::tileSize_D) : 0.0f;
++    // The matrices take z in metres (the camera matrix scales z by pixels-per-metre), so the plane through the centre
++    // is at the centre altitude in metres.
++    const float targetZ = onCenterPlane ? static_cast<float>(getCenterAltitude()) : 0.0f;
+ 
+     double flippedY = size.height - point.y;
+ 
+diff --git a/src/mln/map/transform_state.hpp b/src/mln/map/transform_state.hpp
+index 44f1780..e796969 100644
+--- a/src/mln/map/transform_state.hpp
++++ b/src/mln/map/transform_state.hpp
+@@ -12,8 +12,12 @@
+ #include <mln/util/projection.hpp>
+ #include <mln/util/size.hpp>
+ 
++#include <mln/tile/tile_id.hpp>
++
+ #include <cstdint>
+ #include <array>
++#include <functional>
++#include <utility>
+ #include <limits>
+ #include <memory>
+ #include <optional>
+@@ -132,6 +136,9 @@ struct TransformStateProperties {
+     std::optional<EdgeInsets> frustumOffset;
+ };
+ 
++/// The elevation range in metres (exaggeration included) of a tile's terrain, or nullopt when unknown.
++using TileElevationRangeFn = std::function<std::optional<std::pair<double, double>>(const CanonicalTileID&)>;
++
+ class TransformState {
+ public:
+     TransformState(ConstrainMode = ConstrainMode::HeightOnly, ViewportMode = ViewportMode::Default);
+@@ -294,6 +301,10 @@ public:
+     /// Sets the centre's altitude to the ground elevation under it (metres above sea level). The camera is lifted with
+     /// it, so the map keeps its height above the terrain. Mirrors GL JS `transform.setElevation()`.
+     void setElevation(double elevation);
++    /// With terrain, tile covers give each tile a bounding box spanning its own elevation range (GL JS
++    /// `Terrain#getMinMaxElevation` in `getTileBoundingVolume`), so tiles whose terrain rises into view are not culled.
++    void setTileElevationRange(std::shared_ptr<const TileElevationRangeFn> fn) { tileElevationRange = std::move(fn); }
++    const TileElevationRangeFn* getTileElevationRange() const { return tileElevationRange.get(); }
+ 
+     void constrain(double& scale, double& x, double& y) const;
+     bool constrainScreen(double& scale_, double& x_, double& y_) const;
+@@ -361,6 +372,8 @@ private:
+ 
+     // map position
+     double x = 0, y = 0, z = 0;
++    // Terrain elevation range of a tile (see setTileElevationRange).
++    std::shared_ptr<const TileElevationRangeFn> tileElevationRange;
+     double bearing = 0;
+     double scale = 1;
+     double fov = util::DEFAULT_FOV;
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index 4c4120b..62ba959 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -186,6 +186,10 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
+         }
+     }
+ 
++    // Terrain: tile covers (every source's, and the terrain's own) bound each tile by its DEM elevation range.
++    updateParameters->transformState.setTileElevationRange(
++        terrainPass.elevationRangeFunction(updateParameters->terrainExaggeration));
++
+     const bool zoomChanged = zoomHistory.update(static_cast<float>(updateParameters->transformState.getZoom()),
+                                                 updateParameters->timePoint);
+ 
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index 55c9291..ee81d32 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -23,16 +23,19 @@
+ #include <mln/util/tile_cover.hpp>
+ #include <algorithm>
+ #include <cmath>
++#include <numbers>
+ #include <unordered_set>
+ 
+ namespace mln {
+ 
+ namespace {
+ 
++
+ constexpr std::string_view TerrainShaderName = "TerrainShader";
+ 
+-// Grid resolution per DEM tile (segments, so the vertex grid is one larger).
+-constexpr std::size_t TerrainGridSegments = 16;
++// Grid resolution per DEM tile (segments, so the vertex grid is one larger): GL JS's terrain mesh is 128x128 for every
++// tile, so coarse far-field tiles keep their relief too. 129^2 vertices still fit 16-bit indices.
++constexpr std::size_t TerrainGridSegments = 128;
+ constexpr std::size_t TerrainGridPoints = TerrainGridSegments + 1;
+ 
+ // A light pointing from the north-west, 45 degrees up.
+@@ -46,13 +49,16 @@ struct TerrainMesh {
+     std::vector<uint16_t> indices;
+ };
+ 
+-/// Builds a grid over one DEM tile: xy in tile units (0..EXTENT), z the elevation in world pixels, w a hillshade.
+-TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double metersPerPixel) {
++/// Builds a grid over one DEM tile: xy in tile units (0..EXTENT), z the elevation in metres (the camera's
++/// world-to-camera matrix scales z by pixels-per-metre, like every 3D layer), w a hillshade.
++TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, const CanonicalTileID& tile) {
+     const std::size_t n = TerrainGridPoints;
+     const double dim = static_cast<double>(dem.dim);
+-    const double metersPerTile = metersPerPixel * util::tileSize_D;
++    // Ground width of this tile at its own latitude.
++    const double tilesAcross = static_cast<double>(1ull << tile.z);
++    const double tileLat = std::atan(std::sinh(std::numbers::pi * (1.0 - 2.0 * (tile.y + 0.5) / tilesAcross)));
++    const double metersPerTile = util::M2PI * util::EARTH_RADIUS_M * std::cos(tileLat) / tilesAcross;
+     const double cellMeters = metersPerTile / static_cast<double>(TerrainGridSegments);
+-    const double pixelsPerMeter = 1.0 / metersPerPixel;
+     const double extent = static_cast<double>(util::EXTENT);
+ 
+     std::vector<double> elevation(n * n);
+@@ -84,7 +90,7 @@ TerrainMesh buildTerrainMesh(const DEMData& dem, double exaggeration, double met
+             float* vertex = out + (j * n + i) * 4;
+             vertex[0] = static_cast<float>(static_cast<double>(i) / static_cast<double>(TerrainGridSegments) * extent);
+             vertex[1] = static_cast<float>(static_cast<double>(j) / static_cast<double>(TerrainGridSegments) * extent);
+-            vertex[2] = static_cast<float>(e * exaggeration * pixelsPerMeter);
++            vertex[2] = static_cast<float>(e * exaggeration);
+             vertex[3] = static_cast<float>(shade);
+         }
+     }
+@@ -124,7 +130,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+ 
+     if (!tileset || *tileset != *updateParameters.terrainTileset) {
+         tileset = updateParameters.terrainTileset;
+-        terrain = std::make_unique<TerrainTileManager>(updateParameters.fileSource.get(), *tileset);
++        terrain = std::make_shared<TerrainTileManager>(updateParameters.fileSource.get(), *tileset);
+         terrain->setOnTileLoaded(onTileLoaded);
+         if (layerGroup) {
+             layerGroup->clearDrawables();
+@@ -153,7 +159,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+ 
+     const double zoom = state.getZoom();
+     const auto newDemZoom = static_cast<uint8_t>(std::clamp(std::floor(zoom) + 2.0, 0.0, 14.0));
+-    if (newDemZoom != demZoom || builtZoom < 0 || std::abs(builtZoom - zoom) > 0.25 ||
++    if (newDemZoom != demZoom || builtZoom < 0 ||
+         builtExaggeration != updateParameters.terrainExaggeration) {
+         demZoom = newDemZoom;
+         builtZoom = zoom;
+@@ -161,15 +167,27 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         layerGroup->clearDrawables();
+     }
+ 
+-    const double metersPerPixel = Projection::getMetersPerPixelAtLatitude(state.getLatLng().latitude(), zoom);
+-
+-    const auto tileCover = util::tileCover({.transformState = state,
+-                                            .tileLodMinRadius = updateParameters.tileLodMinRadius,
+-                                            .tileLodScale = updateParameters.tileLodScale,
+-                                            .tileLodPitchThreshold = updateParameters.tileLodPitchThreshold,
+-                                            .tileLodMode = updateParameters.tileLodMode},
+-                                           demZoom,
+-                                           Range<uint8_t>(demZoom, demZoom));
++    // Tile bounding boxes span each tile's own DEM elevation range (see TransformState::setTileElevationRange), so
++    // tiles whose terrain rises into view are covered.
++    TransformState coverState = state;
++    coverState.setTileElevationRange(elevationRangeFunction(updateParameters.terrainExaggeration));
++    // GL JS lets terrain tiles vary in zoom with their distance from the camera (`allowVariableZoom` is true with
++    // terrain; `calculateTileZoom`): the near field keeps the DEM's zoom and the far field is coarser. A single zoom
++    // reaches the horizon with thousands of tiles when pitched, each with a mesh, a drape render target and a DEM
++    // request (that exhausted GPU memory and took the machine down).
++    auto tileCover = util::tileCover({.transformState = coverState,
++                                      .tileLodMinRadius = updateParameters.tileLodMinRadius,
++                                      .tileLodScale = updateParameters.tileLodScale,
++                                      .tileLodPitchThreshold = updateParameters.tileLodPitchThreshold,
++                                      .tileLodMode = updateParameters.tileLodMode,
++                                      .terrainVariableZoom = true},
++                                     demZoom,
++                                     Range<uint8_t>(0, demZoom));
++    // Backstop only: the LOD cover is a few dozen tiles. It is sorted nearest the centre first.
++    constexpr std::size_t maxTerrainTiles = 192;
++    if (tileCover.size() > maxTerrainTiles) {
++        tileCover.erase(tileCover.begin() + static_cast<std::ptrdiff_t>(maxTerrainTiles), tileCover.end());
++    }
+ 
+     const std::unordered_set<OverscaledTileID> covered(tileCover.begin(), tileCover.end());
+     layerGroup->removeDrawablesIf(
+@@ -201,7 +219,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+             builder->setVertexAttrId(shaders::idTerrainPosVertexAttribute);
+         }
+ 
+-        auto mesh = buildTerrainMesh(*data, updateParameters.terrainExaggeration, metersPerPixel);
++        auto mesh = buildTerrainMesh(*data, updateParameters.terrainExaggeration, canonical);
+         const auto vertexCount = mesh.vertexCount;
+         const auto indexCount = mesh.indices.size();
+         builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float4);
+@@ -269,6 +287,29 @@ void TerrainPass::applyDrapeTextures(
+     });
+ }
+ 
++std::shared_ptr<const TileElevationRangeFn> TerrainPass::elevationRangeFunction(double exaggeration) const {
++    if (!terrain) {
++        return nullptr;
++    }
++    // A coarse DEM tile is requested for every tile the cover visits, so a tile whose own DEM is unknown still gets a
++    // (conservative) elevation range from its ancestor instead of a flat sea-level box.
++    constexpr uint8_t coarseZoom = 9;
++    const uint8_t coarse = std::min(demZoom, coarseZoom);
++    return std::make_shared<const TileElevationRangeFn>(
++        [manager = std::weak_ptr<TerrainTileManager>(terrain), exaggeration, coarse](
++            const CanonicalTileID& id) -> std::optional<std::pair<double, double>> {
++            const auto locked = manager.lock();
++            if (!locked) {
++                return std::nullopt;
++            }
++            locked->requestAncestor(id, coarse);
++            if (const auto range = locked->getMinMaxElevation(id)) {
++                return std::make_pair(range->first * exaggeration, range->second * exaggeration);
++            }
++            return std::nullopt;
++        });
++}
++
+ std::function<float(const UnwrappedTileID&)> TerrainPass::elevationFunction(const TransformState& state,
+                                                                             double exaggeration) {
+     if (!terrain) {
+@@ -278,17 +319,14 @@ std::function<float(const UnwrappedTileID&)> TerrainPass::elevationFunction(cons
+     const double scale = state.getScale();
+     const double worldSize = Projection::worldSize(scale);
+     const uint8_t zoom = demZoom;
+-    const double metersPerPixel = Projection::getMetersPerPixelAtLatitude(state.getLatLng().latitude(), state.getZoom());
+-    if (metersPerPixel <= 0.0) {
+-        return {};
+-    }
+-    return [manager, scale, worldSize, zoom, metersPerPixel, exaggeration](const UnwrappedTileID& tileID) -> float {
++    // Metres, like the terrain mesh: the camera matrix scales z by pixels-per-metre.
++    return [manager, scale, worldSize, zoom, exaggeration](const UnwrappedTileID& tileID) -> float {
+         const double n = std::ldexp(1.0, tileID.canonical.z);
+         const double wx = (tileID.canonical.x + 0.5) / n * worldSize;
+         const double wy = (tileID.canonical.y + 0.5) / n * worldSize;
+         const LatLng latLng = Projection::unproject({wx, wy}, scale);
+         const double meters = manager->getElevation(latLng, zoom);
+-        return static_cast<float>(meters * exaggeration / metersPerPixel);
++        return static_cast<float>(meters * exaggeration);
+     };
+ }
+ 
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index 5e7b771..6f2c858 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -4,6 +4,7 @@
+ #include <mln/gfx/uniform_buffer.hpp>
+ #include <mln/gfx/texture2d.hpp>
+ #include <mln/shaders/shader_program_base.hpp>
++#include <mln/map/transform_state.hpp>
+ #include <mln/tile/tile_id.hpp>
+ #include <mln/util/tileset.hpp>
+ 
+@@ -45,6 +46,9 @@ public:
+     /// The terrain tiles currently covered, in the same order as their drape textures.
+     const std::vector<OverscaledTileID>& getCover() const { return cover; }
+ 
++    /// Per-tile DEM elevation range for the tile covers (GL JS `Terrain#getMinMaxElevation`), or null without terrain.
++    std::shared_ptr<const TileElevationRangeFn> elevationRangeFunction(double exaggeration) const;
++
+     /// Bind each terrain drawable to the draped texture of its own tile (per-tile RTT).
+     void applyDrapeTextures(const std::map<std::tuple<uint8_t, uint32_t, uint32_t>, gfx::Texture2DPtr>& textures);
+ 
+@@ -57,7 +61,7 @@ private:
+     gfx::UniformBufferPtr projectionUniformBuffer;
+     std::vector<OverscaledTileID> cover;
+     bool globeShader = false;
+-    std::unique_ptr<TerrainTileManager> terrain;
++    std::shared_ptr<TerrainTileManager> terrain;
+     std::optional<Tileset> tileset;
+     std::function<void()> onTileLoaded;
+     uint8_t demZoom = 0;
+diff --git a/src/mln/renderer/terrain_tile_manager.cpp b/src/mln/renderer/terrain_tile_manager.cpp
+index 214184b..3cefba5 100644
+--- a/src/mln/renderer/terrain_tile_manager.cpp
++++ b/src/mln/renderer/terrain_tile_manager.cpp
+@@ -93,6 +93,25 @@ std::optional<double> TerrainTileManager::sampleElevation(const LatLng& latLng,
+     return stillLoading ? std::nullopt : std::optional<double>(0.0);
+ }
+ 
++std::optional<std::pair<double, double>> TerrainTileManager::getMinMaxElevation(const CanonicalTileID& id) const {
++    for (int z = id.z; z >= 0; --z) {
++        const int shift = id.z - z;
++        const auto it = tiles.find(keyFor(CanonicalTileID(static_cast<uint8_t>(z), id.x >> shift, id.y >> shift)));
++        if (it != tiles.end() && it->second.data) {
++            return std::make_pair(it->second.data->minElevation, it->second.data->maxElevation);
++        }
++    }
++    return std::nullopt;
++}
++
++void TerrainTileManager::requestAncestor(const CanonicalTileID& id, uint8_t zoom) {
++    if (id.z < zoom) {
++        return;
++    }
++    const int shift = id.z - zoom;
++    getDEMData(CanonicalTileID(zoom, id.x >> shift, id.y >> shift));
++}
++
+ bool TerrainTileManager::hasData() const {
+     for (const auto& [key, entry] : tiles) {
+         if (entry.data) {
+diff --git a/src/mln/renderer/terrain_tile_manager.hpp b/src/mln/renderer/terrain_tile_manager.hpp
+index 992d81d..710b2d9 100644
+--- a/src/mln/renderer/terrain_tile_manager.hpp
++++ b/src/mln/renderer/terrain_tile_manager.hpp
+@@ -43,6 +43,14 @@ public:
+     /// flat and the result is 0 metres.
+     std::optional<double> sampleElevation(const LatLng& latLng, uint8_t zoom, uint8_t fallbackZoom);
+ 
++    /// The elevation range (metres) of the terrain in tile `id`: GL JS `Terrain#getMinMaxElevation`. Uses the loaded DEM
++    /// tile at `id`'s zoom, else the nearest loaded ancestor; nullopt when none has loaded. Never requests a tile.
++    std::optional<std::pair<double, double>> getMinMaxElevation(const CanonicalTileID& id) const;
++
++    /// Requests the DEM tile at `zoom` that contains `id` (a no-op when `id` is coarser), so that a coarse elevation
++    /// range exists for the tile cover to use while the fine tiles are still unknown.
++    void requestAncestor(const CanonicalTileID& id, uint8_t zoom);
++
+     /// Whether any DEM tile has been loaded.
+     bool hasData() const;
+ 
+diff --git a/src/mln/renderer/tile_pyramid.cpp b/src/mln/renderer/tile_pyramid.cpp
+index 7b8e82e..613b7a4 100644
+--- a/src/mln/renderer/tile_pyramid.cpp
++++ b/src/mln/renderer/tile_pyramid.cpp
+@@ -120,7 +120,8 @@ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& l
+                                                      .tileLodMinRadius = parameters.tileLodMinRadius,
+                                                      .tileLodScale = parameters.tileLodScale,
+                                                      .tileLodPitchThreshold = parameters.tileLodPitchThreshold,
+-                                                     .tileLodMode = parameters.tileLodMode};
++                                                     .tileLodMode = parameters.tileLodMode,
++                                                     .terrainVariableZoom = true}; // with terrain, as GL JS does
+ 
+     if (std::cmp_greater_equal(overscaledZoom, zoomRange.min)) {
+         int32_t idealZoom = std::min<int32_t>(zoomRange.max, overscaledZoom);
+diff --git a/src/mln/renderer/update_parameters.hpp b/src/mln/renderer/update_parameters.hpp
+index d4c1e05..b6a6ca0 100644
+--- a/src/mln/renderer/update_parameters.hpp
++++ b/src/mln/renderer/update_parameters.hpp
+@@ -30,7 +30,7 @@ public:
+     const float pixelRatio;
+     const MapDebugOptions debugOptions;
+     const TimePoint timePoint;
+-    const TransformState transformState;
++    TransformState transformState; // not const: the orchestrator adds the terrain elevation range
+ 
+     const std::string glyphURL;
+     std::shared_ptr<FontFaces> fontFaces;
+@@ -60,10 +60,10 @@ public:
+     TileLodMode tileLodMode = TileLodMode::Default;
+ 
+     // CFID: custom backdrop colour (space) applied to the render-tree background.
+-    std::optional<Color> backgroundColor;
++    std::optional<Color> backgroundColor = std::nullopt;
+ 
+     // CFID: 3D terrain. When the tileset is set, the terrain pass fetches this raster-dem source and drapes it.
+-    std::optional<Tileset> terrainTileset;
++    std::optional<Tileset> terrainTileset = std::nullopt;
+     double terrainExaggeration = 1.0;
+ };
+ 
+diff --git a/src/mln/util/bounding_volumes.cpp b/src/mln/util/bounding_volumes.cpp
+index bc5c5db..fe89b2d 100644
+--- a/src/mln/util/bounding_volumes.cpp
++++ b/src/mln/util/bounding_volumes.cpp
+@@ -195,11 +195,15 @@ Frustum::Frustum(const std::array<vec3, 8>& points_, const std::array<vec4, 6>&
+     for (size_t i = 0; i < frustumEdges.size(); i++) {
+         // Cross product [1, 0, 0] x [a, b, c] == [0, -c, b]
+         // Cross product [0, 1, 0] x [a, b, c] == [c, 0, -a]
++        // Cross product [0, 0, 1] x [a, b, c] == [-b, a, 0]
+         const vec3 axis0 = {{0.0, -frustumEdges[i][2], frustumEdges[i][1]}};
+         const vec3 axis1 = {{frustumEdges[i][2], 0.0, -frustumEdges[i][0]}};
+ 
+-        projections[i * 2] = {.axis = axis0, .projection = ProjectPointsToAxis(points, points[0], axis0)};
+-        projections[i * 2 + 1] = {.axis = axis1, .projection = ProjectPointsToAxis(points, points[0], axis1)};
++        const vec3 axis2 = {{-frustumEdges[i][1], frustumEdges[i][0], 0.0}};
++
++        projections[i * 3] = {.axis = axis0, .projection = ProjectPointsToAxis(points, points[0], axis0)};
++        projections[i * 3 + 1] = {.axis = axis1, .projection = ProjectPointsToAxis(points, points[0], axis1)};
++        projections[i * 3 + 2] = {.axis = axis2, .projection = ProjectPointsToAxis(points, points[0], axis2)};
+     }
+ }
+ 
+@@ -217,10 +221,15 @@ Frustum Frustum::fromInvProjMatrix(
+ 
+     const double scale = std::pow(2.0, zoom);
+ 
+-    // Transform points to tile space
++    // Transform points to tile space; z stays in metres (the camera matrix scales z by pixels-per-metre), so the
++    // tile bounding volumes' elevations are in metres too (GL JS `unprojectClipSpacePoint`).
+     for (auto& coord : cornerCoords) {
+         matrix::transformMat4(coord, coord, invProj);
+-        for (auto& component : coord) component *= 1.0 / coord[3] / worldSize * scale;
++        const double s = 1.0 / coord[3] / worldSize * scale;
++        coord[0] *= s;
++        coord[1] *= s;
++        coord[2] *= 1.0 / coord[3];
++        coord[3] *= s;
+     }
+ 
+     std::array<vec3i, 6> frustumPlanePointIndices = {{
+@@ -260,16 +269,18 @@ IntersectionResult Frustum::intersects(const AABB& aabb) const {
+     // Each frustum plane together with 3 major axes define the separating axes
+     // This implementation is conservative as it's not checking all possible axes.
+     // False positive rate is ~0.5% of all cases (see intersectsPrecise).
+-    // Note: test only 4 points as both min and max points have zero elevation
+-    assert(aabb.min[2] == 0.0 && aabb.max[2] == 0.0);
+-
++    // The box spans its elevation range (z, in metres like the frustum's z), so all eight corners are tested.
+     if (!bounds.intersects(aabb)) return IntersectionResult::Separate;
+ 
+-    const std::array<vec4, 4> aabbPoints = {{
+-        vec4{{aabb.min[0], aabb.min[1], 0.0, 1.0}},
+-        vec4{{aabb.max[0], aabb.min[1], 0.0, 1.0}},
+-        vec4{{aabb.max[0], aabb.max[1], 0.0, 1.0}},
+-        vec4{{aabb.min[0], aabb.max[1], 0.0, 1.0}},
++    const std::array<vec4, 8> aabbPoints = {{
++        vec4{{aabb.min[0], aabb.min[1], aabb.min[2], 1.0}},
++        vec4{{aabb.max[0], aabb.min[1], aabb.min[2], 1.0}},
++        vec4{{aabb.max[0], aabb.max[1], aabb.min[2], 1.0}},
++        vec4{{aabb.min[0], aabb.max[1], aabb.min[2], 1.0}},
++        vec4{{aabb.min[0], aabb.min[1], aabb.max[2], 1.0}},
++        vec4{{aabb.max[0], aabb.min[1], aabb.max[2], 1.0}},
++        vec4{{aabb.max[0], aabb.max[1], aabb.max[2], 1.0}},
++        vec4{{aabb.min[0], aabb.max[1], aabb.max[2], 1.0}},
+     }};
+ 
+     bool fullyInside = true;
+@@ -283,6 +294,10 @@ IntersectionResult Frustum::intersects(const AABB& aabb) const {
+         pointsInside += vec4Dot(plane, aabbPoints[1]) >= -epsilon;
+         pointsInside += vec4Dot(plane, aabbPoints[2]) >= -epsilon;
+         pointsInside += vec4Dot(plane, aabbPoints[3]) >= -epsilon;
++        pointsInside += vec4Dot(plane, aabbPoints[4]) >= -epsilon;
++        pointsInside += vec4Dot(plane, aabbPoints[5]) >= -epsilon;
++        pointsInside += vec4Dot(plane, aabbPoints[6]) >= -epsilon;
++        pointsInside += vec4Dot(plane, aabbPoints[7]) >= -epsilon;
+ 
+         if (!pointsInside) {
+             // Separating axis found, no intersection
+@@ -302,10 +317,14 @@ IntersectionResult Frustum::intersectsPrecise(const AABB& aabb, bool edgeCasesOn
+         if (result == IntersectionResult::Separate) return result;
+     }
+ 
+-    const std::array<vec3, 4> aabbPoints = {{vec3{{aabb.min[0], aabb.min[1], 0.0}},
+-                                             vec3{{aabb.max[0], aabb.min[1], 0.0}},
+-                                             vec3{{aabb.max[0], aabb.max[1], 0.0}},
+-                                             vec3{{aabb.min[0], aabb.max[1], 0.0}}}};
++    const std::array<vec3, 8> aabbPoints = {{vec3{{aabb.min[0], aabb.min[1], aabb.min[2]}},
++                                             vec3{{aabb.max[0], aabb.min[1], aabb.min[2]}},
++                                             vec3{{aabb.max[0], aabb.max[1], aabb.min[2]}},
++                                             vec3{{aabb.min[0], aabb.max[1], aabb.min[2]}},
++                                             vec3{{aabb.min[0], aabb.min[1], aabb.max[2]}},
++                                             vec3{{aabb.max[0], aabb.min[1], aabb.max[2]}},
++                                             vec3{{aabb.max[0], aabb.max[1], aabb.max[2]}},
++                                             vec3{{aabb.min[0], aabb.max[1], aabb.max[2]}}}};
+ 
+     // For a precise SAT-test all edge cases needs to be covered
+     // Projections of the frustum on separating axis candidates have been precomputed already
+diff --git a/src/mln/util/bounding_volumes.hpp b/src/mln/util/bounding_volumes.hpp
+index 19b6912..4d432fb 100644
+--- a/src/mln/util/bounding_volumes.hpp
++++ b/src/mln/util/bounding_volumes.hpp
+@@ -68,7 +68,7 @@ private:
+     AABB bounds;
+     std::array<vec3, 8> points;
+     std::array<vec4, 6> planes;
+-    std::array<Projection, 12> projections;
++    std::array<Projection, 18> projections;
+ };
+ 
+ } // namespace util
+diff --git a/src/mln/util/tile_cover.cpp b/src/mln/util/tile_cover.cpp
+index 14fa81e..db6d0d2 100644
+--- a/src/mln/util/tile_cover.cpp
++++ b/src/mln/util/tile_cover.cpp
+@@ -644,9 +644,12 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+     const auto& transform = state.transformState;
+     const double numTiles = std::pow(2.0, z);
+     const double worldSize = Projection::worldSize(transform.getScale());
+-    const bool allowVariableZoom = transform.getPitch() > state.tileLodPitchThreshold;
++    const bool terrainLod = state.terrainVariableZoom && transform.getTileElevationRange() != nullptr;
++    const bool allowVariableZoom = terrainLod || transform.getPitch() > state.tileLodPitchThreshold;
+     const uint8_t minZoom = allowVariableZoom ? zoomRange.min : z;
+-    const uint8_t maxZoom = ((state.tileLodMode == TileLodMode::Distance) && allowVariableZoom) ? zoomRange.max : z;
++    const uint8_t maxZoom = ((state.tileLodMode == TileLodMode::Distance || terrainLod) && allowVariableZoom)
++                                ? zoomRange.max
++                                : z;
+     const uint8_t overscaledZoom = std::max(overscaledZ.value_or(z), maxZoom);
+     const bool flippedY = transform.getViewportMode() == ViewportMode::FlippedY;
+ 
+@@ -673,6 +676,28 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+     assert(state.tileLodMinRadius >= 1);
+     const double radiusOfMaxLvlLodInTiles = std::max(1.0, state.tileLodMinRadius);
+ 
++    // Terrain: each tile's volume spans its own elevation range in metres, the unit of the frustum's z (GL JS
++    // `getTileBoundingVolume`). Where the range is unknown the volume spans sea level to the centre's elevation.
++    const TileElevationRangeFn* elevationRange = transform.getTileElevationRange();
++    const double centerElevation = elevationRange != nullptr ? transform.getElevation() : 0.0;
++    // Metres to tile units at the cover's zoom (for distances; the frustum test works in metres).
++    const double metersPerPixelHere = Projection::getMetersPerPixelAtLatitude(transform.getLatLng().latitude(),
++                                                                              transform.getZoom());
++    const double metersToTileUnits = metersPerPixelHere > 0.0 ? numTiles / worldSize / metersPerPixelHere : 0.0;
++    const auto setElevationRange = [&](Node& node) {
++        if (elevationRange == nullptr) {
++            return;
++        }
++        double lo = std::min(0.0, centerElevation);
++        double hi = std::max(0.0, centerElevation);
++        if (const auto range = (*elevationRange)(CanonicalTileID(node.zoom, node.x, node.y))) {
++            lo = range->first;
++            hi = range->second;
++        }
++        node.aabb.min[2] = lo;
++        node.aabb.max[2] = hi;
++    };
++
+     const auto newRootTile = [&](int16_t wrap) -> Node {
+         return {.aabb = AABB({{wrap * numTiles, 0.0, 0.0}}, {{(wrap + 1) * numTiles, numTiles, 0.0}}),
+                 .zoom = uint8_t(0),
+@@ -682,6 +707,15 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+                 .fullyVisible = false};
+     };
+ 
++    // GL JS `calculateTileZoom` inputs, in tile units at this cover's zoom: the camera's height above the centre and
++    // the camera-to-centre distance (the centre sits on the terrain, at the centre elevation).
++    const globe::TileZoomConstants terrainZoomConstants(transform.getFieldOfView() * 180.0 / std::numbers::pi);
++    const double terrainFovDegrees = transform.getFieldOfView() * 180.0 / std::numbers::pi;
++    const double terrainCenterZoom = transform.getZoom() + (z - std::floor(transform.getZoom()));
++    const double terrainDistanceZ = std::max(std::abs(cameraCoord[2] - centerElevation * metersToTileUnits), 1e-9);
++    const double terrainDistanceToCenter3d = std::hypot(
++        std::hypot(centerCoord[0] - cameraCoord[0], centerCoord[1] - cameraCoord[1]), terrainDistanceZ);
++
+     // Perform depth-first traversal on tile tree to find visible tiles
+     std::vector<Node> stack;
+     std::vector<ResultTile> result;
+@@ -698,6 +732,7 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+     while (!stack.empty()) {
+         Node node = stack.back();
+         stack.pop_back();
++        setElevationRange(node);
+ 
+         // Use cached visibility information of ancestor nodes
+         if (!node.fullyVisible) {
+@@ -709,8 +744,24 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+         }
+ 
+         bool shouldSplitTile;
+-        if (state.tileLodMode == TileLodMode::Distance) {
+-            const vec3 camToTileMercator = vec3Scale(node.aabb.distanceXYZ(cameraCoord), 1.0 / worldSize);
++        if (terrainLod) {
++            const vec3 toTile = node.aabb.distanceXYZ(cameraCoord);
++            const double desired = std::floor(globe::calculateTileZoom(terrainZoomConstants,
++                                                                       terrainCenterZoom,
++                                                                       std::hypot(toTile[0], toTile[1]),
++                                                                       terrainDistanceZ,
++                                                                       terrainDistanceToCenter3d,
++                                                                       terrainFovDegrees));
++            const auto targetZoom = static_cast<uint8_t>(std::clamp(desired, 0.0, static_cast<double>(maxZoom)));
++            shouldSplitTile = node.zoom < targetZoom;
++        } else if (state.tileLodMode == TileLodMode::Distance) {
++            // The box's z is in metres (for the frustum test); the camera coordinate is in tile units.
++            AABB distanceBox = node.aabb;
++            if (elevationRange != nullptr) {
++                distanceBox.min[2] *= metersToTileUnits;
++                distanceBox.max[2] *= metersToTileUnits;
++            }
++            const vec3 camToTileMercator = vec3Scale(distanceBox.distanceXYZ(cameraCoord), 1.0 / worldSize);
+             const double distanceToTileMercator = vec3Length(camToTileMercator);
+             const double cosPitchToTile = std::max(0.0, camToTileMercator[2] / distanceToTileMercator);
+             const double pitchExponent =
+@@ -720,7 +771,10 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+                                                                        cameraToCenterDistanceMercator /
+                                                                        state.tileLodScale * nominalScale;
+         } else {
+-            const vec3 distanceXyz = node.aabb.distanceXYZ(centerCoord);
++            vec3 distanceXyz = node.aabb.distanceXYZ(centerCoord);
++            if (elevationRange != nullptr) {
++                distanceXyz[2] = 0.0; // the elevation range must not change the level-of-detail ring
++            }
+             const double* longestDim = std::max_element(distanceXyz.data(), distanceXyz.data() + distanceXyz.size());
+             assert(longestDim);
+ 
+diff --git a/src/mln/util/tile_cover.hpp b/src/mln/util/tile_cover.hpp
+index 8827457..5361031 100644
+--- a/src/mln/util/tile_cover.hpp
++++ b/src/mln/util/tile_cover.hpp
+@@ -40,6 +40,10 @@ struct TileCoverParameters {
+     double tileLodScale = 1;
+     double tileLodPitchThreshold = (60.0 / 180.0) * std::numbers::pi;
+     TileLodMode tileLodMode = TileLodMode::Default;
++    /// With terrain (the transform state carries a tile elevation range), choose each tile's zoom by its distance from
++    /// the camera, as GL JS does (`allowVariableZoom` is true with terrain), so a pitched view does not need thousands
++    /// of tiles of one zoom out to the horizon. Needs a zoom range wider than a single level.
++    bool terrainVariableZoom = false;
+ };
+ 
+ int32_t coveringZoomLevel(double z, style::SourceType type, uint16_t tileSize) noexcept;
