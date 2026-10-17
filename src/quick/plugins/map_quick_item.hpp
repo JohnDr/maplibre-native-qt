@@ -41,6 +41,12 @@ class MapQuickItem : public QQuickItem {
     // surface. An empty source disables terrain (flat map).
     Q_PROPERTY(QString terrainSource READ terrainSource WRITE setTerrainSource NOTIFY terrainChanged)
     Q_PROPERTY(double terrainExaggeration READ terrainExaggeration WRITE setTerrainExaggeration NOTIFY terrainChanged)
+    // The sky (GL JS `map.setSky`). While \c skyEnabled, \c sky (style-spec `sky` properties, e.g.
+    // `{"sky-color": "#199EF3", "fog-ground-blend": 0.5}`; empty = the style's own sky if it has one, else the
+    // default sky) is applied. Once \c skyEnabled has been set to false there is no sky, even if the style defines
+    // one. Never set: the style's own sky (if any) is left alone.
+    Q_PROPERTY(bool skyEnabled READ skyEnabled WRITE setSkyEnabled NOTIFY skyChanged)
+    Q_PROPERTY(QVariantMap sky READ sky WRITE setSky NOTIFY skyChanged)
 
 public:
     enum SyncState : int {
@@ -84,6 +90,12 @@ public:
     [[nodiscard]] double terrainExaggeration() const;
     void setTerrainExaggeration(double exaggeration);
 
+    [[nodiscard]] bool skyEnabled() const;
+    void setSkyEnabled(bool enabled);
+
+    [[nodiscard]] QVariantMap sky() const;
+    void setSky(const QVariantMap &sky);
+
     Q_INVOKABLE void pan(const QPointF &offset);
     Q_INVOKABLE void scale(double scale, const QPointF &center);
     Q_INVOKABLE void easeTo(const QVariantMap &camera, const QVariantMap &animation = QVariantMap());
@@ -105,6 +117,7 @@ signals:
     void projectionTypeChanged();
     void backgroundColorChanged();
     void terrainChanged();
+    void skyChanged();
 
 protected:
     void componentComplete() override;

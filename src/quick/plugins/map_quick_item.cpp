@@ -189,6 +189,43 @@ void MapQuickItem::setTerrainExaggeration(double exaggeration) {
     emit terrainChanged();
 }
 
+bool MapQuickItem::skyEnabled() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_skyEnabled;
+}
+
+void MapQuickItem::setSkyEnabled(bool enabled) {
+    Q_D(MapQuickItem);
+
+    d->m_skyExplicit = true; // once set, false means no sky (not "leave the style's sky alone")
+    if (d->m_skyEnabled == enabled) {
+        return;
+    }
+
+    d->m_skyEnabled = enabled;
+    d->applySky();
+    emit skyChanged();
+}
+
+QVariantMap MapQuickItem::sky() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_sky;
+}
+
+void MapQuickItem::setSky(const QVariantMap &sky) {
+    Q_D(MapQuickItem);
+
+    if (d->m_sky == sky) {
+        return;
+    }
+
+    d->m_sky = sky;
+    d->applySky();
+    emit skyChanged();
+}
+
 void MapQuickItem::setZoomLevel(double zoomLevel) {
     Q_D(MapQuickItem);
 
@@ -544,6 +581,8 @@ void MapQuickItem::onMapChanged(Map::MapChange change) {
         d->m_map->setProjectionType(projectionFromMapQuickItem(d->m_projectionType));
         // Terrain also lives on the style, so re-apply it after a (re)load.
         d->applyTerrain();
+        // The style's own sky replaced any sky this item added.
+        d->applySky();
     } else if (change == Map::MapChangeWillStartLoadingMap) {
         if (d->m_styleLoaded) {
             d->m_styleLoaded = false;
@@ -581,6 +620,22 @@ void MapQuickItem::onStyleParameterUpdated(StyleParameter *parameter) {
 
 MapQuickItemPrivate::MapQuickItemPrivate(MapQuickItem *q)
     : q_ptr(q) {}
+
+void MapQuickItemPrivate::applySky() {
+    if (m_map == nullptr || !m_styleLoaded) {
+        return;
+    }
+
+    if (m_skyEnabled) {
+        if (m_sky.isEmpty() && m_map->hasSky()) {
+            return; // enabled with no properties of our own: the style's own sky already is the sky
+        }
+        m_map->setSky(m_sky);
+    } else if (m_skyExplicit && m_map->hasSky()) {
+        // Explicitly switched off: no sky at all, even if the style defines one.
+        m_map->clearSky();
+    }
+}
 
 void MapQuickItemPrivate::applyTerrain() {
     if (m_map == nullptr || !m_styleLoaded) {

@@ -1,0 +1,1719 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fa79d87d1094..899ffb698511 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -640,6 +640,8 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_static_data.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/globe_depth_pass.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/globe_depth_pass.hpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_sky.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/renderer/render_sky.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/sky_pass.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/sky_pass.hpp
+     ${PROJECT_SOURCE_DIR}/src/mln/renderer/terrain_pass.cpp
+@@ -718,6 +720,7 @@ list(APPEND SRC_FILES
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/projection.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/terrain.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/sky.cpp
++    ${PROJECT_SOURCE_DIR}/src/mln/style/sky.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/position.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/property_value.cpp
+     ${PROJECT_SOURCE_DIR}/src/mln/style/conversion/hillshade_conversions.cpp
+diff --git a/cmake/vulkan.cmake b/cmake/vulkan.cmake
+index d4ba7907db58..ced1ae66c1b0 100644
+--- a/cmake/vulkan.cmake
++++ b/cmake/vulkan.cmake
+@@ -47,6 +47,7 @@ list(APPEND
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/fill_extrusion.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/globe_depth.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/sky.hpp
++        ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/atmosphere.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/heatmap.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/heatmap_texture.hpp
+         ${PROJECT_SOURCE_DIR}/include/mln/shaders/vulkan/hillshade.hpp
+@@ -96,6 +97,7 @@ list(APPEND
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/fill_extrusion.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/globe_depth.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/sky.cpp
++        ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/atmosphere.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/heatmap.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/heatmap_texture.cpp
+         ${PROJECT_SOURCE_DIR}/src/mln/shaders/vulkan/hillshade.cpp
+diff --git a/include/mln/shaders/shader_defines.hpp b/include/mln/shaders/shader_defines.hpp
+index bcc1de56065c..9b4f0f60125e 100644
+--- a/include/mln/shaders/shader_defines.hpp
++++ b/include/mln/shaders/shader_defines.hpp
+@@ -495,6 +495,11 @@ enum {
+     skyVertexAttributeCount
+ };
+ 
++enum {
++    idAtmospherePosVertexAttribute,
++    atmosphereVertexAttributeCount
++};
++
+ enum {
+     idTerrainPosVertexAttribute,
+     terrainVertexAttributeCount
+diff --git a/include/mln/shaders/shader_source.hpp b/include/mln/shaders/shader_source.hpp
+index aa2efdec8be9..6d6698ea4296 100644
+--- a/include/mln/shaders/shader_source.hpp
++++ b/include/mln/shaders/shader_source.hpp
+@@ -30,6 +30,7 @@ enum class BuiltIn {
+     FillExtrusionPatternInstancedShader,
+     GlobeDepthShader,
+     SkyShader,
++    AtmosphereShader,
+     TerrainShader,
+     HeatmapShader,
+     HeatmapTextureShader,
+diff --git a/include/mln/shaders/vulkan/atmosphere.hpp b/include/mln/shaders/vulkan/atmosphere.hpp
+new file mode 100644
+index 000000000000..991c51ef4963
+--- /dev/null
++++ b/include/mln/shaders/vulkan/atmosphere.hpp
+@@ -0,0 +1,170 @@
++#pragma once
++
++#include <mln/shaders/shader_source.hpp>
++#include <mln/shaders/vulkan/shader_program.hpp>
++
++namespace mln {
++namespace shaders {
++
++/// The globe's atmosphere: single-scattering Rayleigh + Mie along each view ray (MapLibre GL JS
++/// `atmosphere.fragment.glsl`, from https://github.com/wwwtyro/glsl-atmosphere). Drawn over the scene.
++template <>
++struct ShaderSource<BuiltIn::AtmosphereShader, gfx::Backend::Type::Vulkan> {
++    static constexpr const char* name = "AtmosphereShader";
++
++    static const std::array<AttributeInfo, 1> attributes;
++    static constexpr std::array<AttributeInfo, 0> instanceAttributes{};
++    static const std::array<TextureInfo, 0> textures;
++
++    static constexpr auto prelude = R"(
++
++#define idAtmosphereUBO idDrawableReservedFragmentOnlyUBO
++
++)";
++    static constexpr auto vertex = R"(
++
++layout(location = 0) in ivec2 in_position;
++
++void main() {
++    gl_Position = vec4(vec2(in_position), 0.0, 1.0);
++}
++)";
++
++    static constexpr auto fragment = R"(
++
++layout(location = 0) out vec4 out_color;
++
++layout(push_constant) uniform Constants {
++    int ubo_index;
++} constant;
++
++struct AtmosphereUBO {
++    mat4 inv_proj;  // the globe's inverse projection (clip -> view)
++    vec4 sun_pos;   // xyz
++    vec4 globe;     // xyz: globe centre in view space; w: globe radius (px)
++    vec4 params;    // x: atmosphere blend
++    vec4 viewport;  // xy: viewport size in framebuffer pixels
++};
++
++layout(std140, set = LAYER_SET_INDEX, binding = idAtmosphereUBO) readonly buffer AtmosphereUBOVector {
++    AtmosphereUBO atmosphere_ubo[];
++} atmosphereVector;
++
++const float PI = 3.141592653589793;
++const int iSteps = 5;
++const int jSteps = 3;
++
++/* radius of the planet */
++const float EARTH_RADIUS = 6371e3;
++/* radius of the atmosphere */
++const float ATMOS_RADIUS = 6471e3;
++
++vec2 rsi(vec3 r0, vec3 rd, float sr) {
++    // ray-sphere intersection that assumes the sphere is centred at the origin.
++    // No intersection when result.x > result.y
++    float a = dot(rd, rd);
++    float b = 2.0 * dot(rd, r0);
++    float c = dot(r0, r0) - (sr * sr);
++    float d = (b * b) - 4.0 * a * c;
++    if (d < 0.0) return vec2(1e5, -1e5);
++    return vec2((-b - sqrt(d)) / (2.0 * a), (-b + sqrt(d)) / (2.0 * a));
++}
++
++vec4 atmosphere(vec3 r, vec3 r0, vec3 pSun, float iSun, float rPlanet, float rAtmos, vec3 kRlh, float kMie,
++                float shRlh, float shMie, float g) {
++    pSun = normalize(pSun);
++    r = normalize(r);
++
++    // Step size of the primary ray.
++    vec2 p = rsi(r0, r, rAtmos);
++    if (p.x > p.y) {
++        return vec4(0.0, 0.0, 0.0, 1.0);
++    }
++    if (p.x < 0.0) {
++        p.x = 0.0;
++    }
++
++    vec2 p2 = rsi(r0, r, rPlanet);
++    if (p2.x <= p2.y && p2.x > 0.0) {
++        p.y = min(p.y, p2.x);
++    }
++    float iStepSize = (p.y - p.x) / float(iSteps);
++    float iTime = p.x + iStepSize * 0.5;
++
++    vec3 totalRlh = vec3(0, 0, 0);
++    vec3 totalMie = vec3(0, 0, 0);
++    float iOdRlh = 0.0;
++    float iOdMie = 0.0;
++
++    float mu = dot(r, pSun);
++    float mumu = mu * mu;
++    float gg = g * g;
++    float pRlh = 3.0 / (16.0 * PI) * (1.0 + mumu);
++    float pMie = 3.0 / (8.0 * PI) * ((1.0 - gg) * (mumu + 1.0)) / (pow(1.0 + gg - 2.0 * mu * g, 1.5) * (2.0 + gg));
++
++    for (int i = 0; i < iSteps; i++) {
++        vec3 iPos = r0 + r * iTime;
++        float iHeight = length(iPos) - rPlanet;
++
++        float odStepRlh = exp(-iHeight / shRlh) * iStepSize;
++        float odStepMie = exp(-iHeight / shMie) * iStepSize;
++        iOdRlh += odStepRlh;
++        iOdMie += odStepMie;
++
++        float jStepSize = rsi(iPos, pSun, rAtmos).y / float(jSteps);
++        float jTime = jStepSize * 0.5;
++        float jOdRlh = 0.0;
++        float jOdMie = 0.0;
++
++        for (int j = 0; j < jSteps; j++) {
++            vec3 jPos = iPos + pSun * jTime;
++            float jHeight = length(jPos) - rPlanet;
++            jOdRlh += exp(-jHeight / shRlh) * jStepSize;
++            jOdMie += exp(-jHeight / shMie) * jStepSize;
++            jTime += jStepSize;
++        }
++
++        vec3 attn = exp(-(kMie * (iOdMie + jOdMie) + kRlh * (iOdRlh + jOdRlh)));
++        totalRlh += odStepRlh * attn;
++        totalMie += odStepMie * attn;
++        iTime += iStepSize;
++    }
++
++    // Approximate attenuation with a single "grayscale" value.
++    float opacity = exp(-(length(kRlh) * length(totalRlh) + kMie * length(totalMie)));
++    vec3 color = iSun * (pRlh * kRlh * totalRlh + pMie * kMie * totalMie);
++    return vec4(color, opacity);
++}
++
++void main() {
++    const AtmosphereUBO u = atmosphereVector.atmosphere_ubo[constant.ubo_index];
++
++    const vec2 ndc = vec2(gl_FragCoord.x / u.viewport.x * 2.0 - 1.0, 1.0 - gl_FragCoord.y / u.viewport.y * 2.0);
++    const vec3 view_direction = (u.inv_proj * vec4(ndc, 0.0, 1.0)).xyz;
++
++    // The globe is small compared to the real Earth. To still have a correct atmosphere, the whole world is scaled to
++    // EARTH_RADIUS and the camera position changed accordingly.
++    vec3 scale_camera_pos = -u.globe.xyz * EARTH_RADIUS / u.globe.w;
++
++    vec4 color = atmosphere(normalize(view_direction),             // ray direction
++                            scale_camera_pos,                      // ray origin
++                            u.sun_pos.xyz,                         // position of the sun
++                            22.0,                                  // intensity of the sun
++                            EARTH_RADIUS,                          // radius of the planet in metres
++                            ATMOS_RADIUS,                          // radius of the atmosphere in metres
++                            vec3(5.5e-6, 13.0e-6, 22.4e-6),        // Rayleigh scattering coefficient
++                            21e-6,                                 // Mie scattering coefficient
++                            8e3,                                   // Rayleigh scale height
++                            1.2e3,                                 // Mie scale height
++                            0.758);                                // Mie preferred scattering direction
++
++    // Exposure, then gamma (the alpha channel too, so blending looks better).
++    color.rgb = 1.0 - exp(-1.0 * color.rgb);
++    color = pow(color, vec4(1.0 / 2.2));
++    out_color = vec4(color.rgb, 1.0 - color.a) * u.params.x;
++}
++)";
++};
++
++} // namespace shaders
++} // namespace mln
+diff --git a/include/mln/shaders/vulkan/sky.hpp b/include/mln/shaders/vulkan/sky.hpp
+index 2bed1c7ab320..4e92e7eef590 100644
+--- a/include/mln/shaders/vulkan/sky.hpp
++++ b/include/mln/shaders/vulkan/sky.hpp
+@@ -6,8 +6,9 @@
+ namespace mln {
+ namespace shaders {
+ 
+-/// The sky: a screen-filling quad shaded by the distance above the horizon line (MapLibre GL JS `sky.fragment.glsl`,
+-/// Mercator branch). Drawn first, under everything else; the area below the horizon is left transparent.
++/// The sky: a screen-filling quad shaded by the distance above the horizon line (MapLibre GL JS `sky.fragment.glsl`).
++/// With the globe the horizon is the planet's limb and the sky fades out through the atmosphere. Drawn first, under
++/// everything else; the area below the horizon is left transparent.
+ template <>
+ struct ShaderSource<BuiltIn::SkyShader, gfx::Backend::Type::Vulkan> {
+     static constexpr const char* name = "SkyShader";
+@@ -39,21 +40,50 @@ layout(push_constant) uniform Constants {
+ } constant;
+ 
+ struct SkyUBO {
+-    vec4 sky_color;     // premultiplied
+-    vec4 horizon_color; // premultiplied
+-    vec4 horizon;       // xy: a point on the horizon line (framebuffer pixels, y down); z: sky-horizon blend (pixels)
+-    vec4 normal;        // xy: horizon normal (pointing up the screen, y down)
++    vec4 sky_color;      // premultiplied
++    vec4 horizon_color;  // premultiplied
++    vec4 horizon;        // xy: a point on the horizon line (framebuffer pixels, y down); z: sky-horizon blend (px)
++    vec4 normal;         // xy: horizon normal (pointing up the screen, y down)
++    mat4 inv_proj;       // the globe's inverse projection (clip -> view)
++    vec4 globe;          // xyz: globe centre in view space; w: globe radius (px)
++    vec4 params;         // x: sky blend (projection transition); y: atmosphere blend; z: camera-to-centre distance;
++                         // w: device pixel ratio
++    vec4 viewport;       // xy: viewport size in framebuffer pixels
+ };
+ 
+ layout(std140, set = LAYER_SET_INDEX, binding = idSkyUBO) readonly buffer SkyUBOVector {
+     SkyUBO sky_ubo[];
+ } skyVector;
+ 
++const float ATMOSPHERE_HEIGHT_TO_GLOBE_RADIUS = 100000.0 / 6371000.0;
++
+ void main() {
+     const SkyUBO sky = skyVector.sky_ubo[constant.ubo_index];
++    const float sky_blend = sky.params.x;
+ 
+     // Signed distance above the horizon, in pixels.
+-    const float blend = (sky.horizon.y - gl_FragCoord.y) * sky.normal.y + (gl_FragCoord.x - sky.horizon.x) * sky.normal.x;
++    float blend = (sky.horizon.y - gl_FragCoord.y) * sky.normal.y + (gl_FragCoord.x - sky.horizon.x) * sky.normal.x;
++    float opacity = 1.0;
++
++    if (sky_blend > 0.0) {
++        // The view ray of this pixel (GL convention: NDC y up, so the framebuffer's top row is +1).
++        const vec2 ndc = vec2(gl_FragCoord.x / sky.viewport.x * 2.0 - 1.0, 1.0 - gl_FragCoord.y / sky.viewport.y * 2.0);
++        const vec3 ray = normalize((sky.inv_proj * vec4(ndc, 0.0, 1.0)).xyz);
++        const vec3 globe_position = sky.globe.xyz;
++        const float globe_radius = sky.globe.w;
++        const float globe_distance = length(globe_position);
++        const float angle_to_globe_center = acos(clamp(dot(ray, globe_position) / globe_distance, -1.0, 1.0));
++        const float horizon_angle = asin(min(globe_radius / globe_distance, 1.0));
++        blend = mix(blend,
++                    ((angle_to_globe_center - horizon_angle) * sky.params.z + 1.0) * sky.params.w,
++                    sky_blend);
++        const float closest_approach = max(dot(ray, globe_position), 0.0);
++        const float lowest_altitude = sqrt(max(globe_distance * globe_distance - closest_approach * closest_approach, 0.0)) - globe_radius;
++        const float atmosphere_height = globe_radius * ATMOSPHERE_HEIGHT_TO_GLOBE_RADIUS;
++        const float inside_atmosphere = 1.0 - smoothstep(atmosphere_height, 10.0 * atmosphere_height, globe_distance - globe_radius);
++        const float through_atmosphere = 1.0 - smoothstep(0.0, atmosphere_height, lowest_altitude);
++        opacity = inside_atmosphere * through_atmosphere * (1.0 - sky.params.y);
++    }
+ 
+     out_color = vec4(0.0);
+     if (blend > 0.0) {
+@@ -63,6 +93,7 @@ void main() {
+             out_color = sky.sky_color;
+         }
+     }
++    out_color *= mix(1.0, opacity, sky_blend);
+ }
+ )";
+ };
+diff --git a/include/mln/style/sky.hpp b/include/mln/style/sky.hpp
+index bd4243c36f4e..03563c32ac0d 100644
+--- a/include/mln/style/sky.hpp
++++ b/include/mln/style/sky.hpp
+@@ -1,26 +1,62 @@
+ #pragma once
+ 
++#include <mln/style/conversion.hpp>
++#include <mln/style/property_value.hpp>
++#include <mln/style/style_property.hpp>
++#include <mln/style/transition_options.hpp>
+ #include <mln/util/color.hpp>
++#include <mln/util/immutable.hpp>
++
++#include <optional>
++#include <string>
+ 
+ namespace mln {
+ namespace style {
+ 
+-/// The style's root `sky` object (style-spec `sky`): the colours and blends of the sky gradient above the horizon and
+-/// of the fog that fades the terrain into it. Defaults are the style-spec defaults. A style without a `sky` object has
+-/// no sky; `sky: {}` has the default sky.
+-///
+-/// Values are constants for now (the spec also allows zoom expressions and transitions).
++class SkyObserver;
++
++/// The style's root `sky` object (style-spec `sky`; MapLibre GL JS `style/sky.ts`): the colours and blends of the sky
++/// gradient above the horizon, of the fog that fades the terrain into it and of the globe's atmosphere.
++/// A style without a `sky` object has no sky; `sky: {}` has the default sky. Every property accepts a constant or a
++/// zoom expression and has a transition (`<property>-transition`).
+ class Sky {
+ public:
+-    Color skyColor = *Color::parse("#88C6FC");
+-    Color horizonColor = *Color::parse("#ffffff");
+-    Color fogColor = *Color::parse("#ffffff");
+-    float fogGroundBlend = 0.5f;
+-    float horizonFogBlend = 0.8f;
+-    float skyHorizonBlend = 0.8f;
+-    float atmosphereBlend = 0.8f;
+-
+-    bool operator==(const Sky&) const = default;
++    Sky();
++    ~Sky();
++
++    // Dynamic properties: `sky-color`, `horizon-color`, `fog-color`, `fog-ground-blend`, `horizon-fog-blend`,
++    // `sky-horizon-blend`, `atmosphere-blend` and their `-transition` variants.
++    std::optional<conversion::Error> setProperty(const std::string& name, const conversion::Convertible& value);
++    StyleProperty getProperty(const std::string&) const;
++
++    PropertyValue<Color> getSkyColor() const;
++    void setSkyColor(PropertyValue<Color>);
++    PropertyValue<Color> getHorizonColor() const;
++    void setHorizonColor(PropertyValue<Color>);
++    PropertyValue<Color> getFogColor() const;
++    void setFogColor(PropertyValue<Color>);
++    PropertyValue<float> getFogGroundBlend() const;
++    void setFogGroundBlend(PropertyValue<float>);
++    PropertyValue<float> getHorizonFogBlend() const;
++    void setHorizonFogBlend(PropertyValue<float>);
++    PropertyValue<float> getSkyHorizonBlend() const;
++    void setSkyHorizonBlend(PropertyValue<float>);
++    PropertyValue<float> getAtmosphereBlend() const;
++    void setAtmosphereBlend(PropertyValue<float>);
++
++    class Impl;
++    Immutable<Impl> impl;
++    explicit Sky(Immutable<Impl>);
++    Mutable<Impl> mutableImpl() const;
++
++    SkyObserver* observer = nullptr;
++    void setObserver(SkyObserver*);
++};
++
++class SkyObserver {
++public:
++    virtual ~SkyObserver() = default;
++    virtual void onSkyChanged(const Sky&) {}
+ };
+ 
+ } // namespace style
+diff --git a/include/mln/style/style.hpp b/include/mln/style/style.hpp
+index 77879a3a3188..601cffc3b816 100644
+--- a/include/mln/style/style.hpp
++++ b/include/mln/style/style.hpp
+@@ -62,9 +62,11 @@ public:
+ 
+     void setTerrain(std::unique_ptr<Terrain>);
+ 
+-    // Sky (style-spec `sky`): none unless the style (or the application) sets one.
+-    std::optional<Sky> getSky() const;
+-    void setSky(std::optional<Sky>);
++    // Sky (style-spec `sky`): none (null) unless the style or the application sets one.
++    Sky* getSky();
++    const Sky* getSky() const;
++
++    void setSky(std::unique_ptr<Sky>);
+ 
+     // Images
+     std::optional<Image> getImage(const std::string&) const;
+diff --git a/src/mln/map/map_impl.cpp b/src/mln/map/map_impl.cpp
+index 294a0f4630c5..25ddf4b0b773 100644
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -176,7 +176,9 @@ void Map::Impl::onUpdate() {
+         }
+     }
+ 
+-    params.sky = style->impl->getSky();
++    if (const auto* sky = style->impl->getSky()) {
++        params.sky = sky->impl;
++    }
+ 
+     rendererFrontend.update(std::make_shared<UpdateParameters>(std::move(params)));
+ }
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index e470a8effbcb..f506bde1aa34 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -236,6 +236,24 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
+         renderLight.evaluate(evaluationParameters);
+     }
+ 
++    // Update the sky.
++    if (updateParameters->sky) {
++        const bool skyChanged = !renderSky || renderSky->impl != *updateParameters->sky;
++        if (!renderSky) {
++            renderSky.emplace(*updateParameters->sky);
++        } else if (skyChanged) {
++            renderSky->impl = *updateParameters->sky;
++        }
++        if (skyChanged) {
++            renderSky->transition(transitionParameters);
++        }
++        if (skyChanged || zoomChanged || renderSky->hasTransition()) {
++            renderSky->evaluate(evaluationParameters);
++        }
++    } else {
++        renderSky.reset();
++    }
++
+     const ImageDifference imageDiff = diffImages(imageImpls, updateParameters->images);
+     imageImpls = updateParameters->images;
+ 
+@@ -841,7 +859,7 @@ RenderSource* RenderOrchestrator::getRenderSource(const std::string& id) const {
+ }
+ 
+ bool RenderOrchestrator::hasTransitions(TimePoint timePoint) const {
+-    if (renderLight.hasTransition()) {
++    if (renderLight.hasTransition() || (renderSky && renderSky->hasTransition())) {
+         return true;
+     }
+ 
+@@ -1019,9 +1037,13 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+ 
+     globeDepthPass.update(shaders, context, state, *updateParameters, has3D);
+ 
+-    skyPass.update(shaders, context, state, paintParameters, *updateParameters);
++    const EvaluatedSky* evaluatedSky = renderSky ? &renderSky->getEvaluated() : nullptr;
++    SunLight sun;
++    sun.position = renderLight.getEvaluated().get<style::LightPosition>().getCartesian();
++    sun.anchoredToMap = renderLight.getEvaluated().get<style::LightAnchor>() == style::LightAnchorType::Map;
++    skyPass.update(shaders, context, state, paintParameters, evaluatedSky, sun, updateParameters->backgroundColor);
+ 
+-    terrainPass.update(shaders, context, state, paintParameters, *updateParameters);
++    terrainPass.update(shaders, context, state, paintParameters, *updateParameters, evaluatedSky);
+ 
+     // Terrain drape: one tile-sized offscreen target per terrain tile, holding the draped map layers.
+     const bool terrainEnabled = updateParameters->terrainTileset.has_value() &&
+diff --git a/src/mln/renderer/render_orchestrator.hpp b/src/mln/renderer/render_orchestrator.hpp
+index e8bb79debd87..6ba30e9e11b7 100644
+--- a/src/mln/renderer/render_orchestrator.hpp
++++ b/src/mln/renderer/render_orchestrator.hpp
+@@ -2,6 +2,7 @@
+ 
+ #include <mln/renderer/globe_depth_pass.hpp>
+ #include <mln/renderer/sky_pass.hpp>
++#include <mln/renderer/render_sky.hpp>
+ #include <mln/renderer/terrain_pass.hpp>
+ #include <mln/renderer/layer_group.hpp>
+ #include <mln/actor/scheduler.hpp>
+@@ -121,6 +122,7 @@ public:
+ 
+     LayerGroupBase* getTerrainLayerGroup() const { return terrainPass.getLayerGroup(); }
+     LayerGroupBase* getSkyLayerGroup() const { return skyPass.getLayerGroup(); }
++    LayerGroupBase* getAtmosphereLayerGroup() const { return skyPass.getAtmosphereLayerGroup(); }
+ 
+     // Sampler of the terrain elevation (world pixels) at a tile centre, for symbol elevation.
+     std::function<float(const UnwrappedTileID&)> getTerrainElevationFunction(const TransformState& state,
+@@ -290,6 +292,7 @@ private:
+     RenderItem::DebugLayerGroupMap debugLayerGroups;
+     GlobeDepthPass globeDepthPass;
+     SkyPass skyPass;
++    std::optional<RenderSky> renderSky;
+     TerrainPass terrainPass;
+ };
+ 
+diff --git a/src/mln/renderer/render_sky.cpp b/src/mln/renderer/render_sky.cpp
+new file mode 100644
+index 000000000000..9058c4b4674b
+--- /dev/null
++++ b/src/mln/renderer/render_sky.cpp
+@@ -0,0 +1,37 @@
++#include <mln/renderer/render_sky.hpp>
++
++namespace mln {
++
++RenderSky::RenderSky(Immutable<style::Sky::Impl> impl_)
++    : impl(std::move(impl_)),
++      transitioning(impl->properties.untransitioned()) {
++    const auto evaluated = style::SkyProperties::PossiblyEvaluated{};
++    values = {evaluated.get<style::SkyColor>(),
++              evaluated.get<style::SkyHorizonColor>(),
++              evaluated.get<style::SkyFogColor>(),
++              evaluated.get<style::SkyFogGroundBlend>(),
++              evaluated.get<style::SkyHorizonFogBlend>(),
++              evaluated.get<style::SkySkyHorizonBlend>(),
++              evaluated.get<style::SkyAtmosphereBlend>()};
++}
++
++void RenderSky::transition(const TransitionParameters& parameters) {
++    transitioning = impl->properties.transitioned(parameters, std::move(transitioning));
++}
++
++void RenderSky::evaluate(const PropertyEvaluationParameters& parameters) {
++    const auto evaluated = transitioning.evaluate(parameters);
++    values = {evaluated.get<style::SkyColor>(),
++              evaluated.get<style::SkyHorizonColor>(),
++              evaluated.get<style::SkyFogColor>(),
++              evaluated.get<style::SkyFogGroundBlend>(),
++              evaluated.get<style::SkyHorizonFogBlend>(),
++              evaluated.get<style::SkySkyHorizonBlend>(),
++              evaluated.get<style::SkyAtmosphereBlend>()};
++}
++
++bool RenderSky::hasTransition() const {
++    return transitioning.hasTransition();
++}
++
++} // namespace mln
+diff --git a/src/mln/renderer/render_sky.hpp b/src/mln/renderer/render_sky.hpp
+new file mode 100644
+index 000000000000..eef988589772
+--- /dev/null
++++ b/src/mln/renderer/render_sky.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include <mln/style/sky_impl.hpp>
++#include <mln/util/color.hpp>
++#include <mln/util/immutable.hpp>
++
++namespace mln {
++
++class TransitionParameters;
++class PropertyEvaluationParameters;
++
++/// The sky's values at the current zoom and transition time (premultiplied colours).
++struct EvaluatedSky {
++    Color skyColor;
++    Color horizonColor;
++    Color fogColor;
++    float fogGroundBlend;
++    float horizonFogBlend;
++    float skyHorizonBlend;
++    float atmosphereBlend;
++};
++
++/// Transitions and evaluates the style's `sky` (the way `RenderLight` does for the light).
++class RenderSky {
++public:
++    explicit RenderSky(Immutable<style::Sky::Impl>);
++
++    void transition(const TransitionParameters&);
++    void evaluate(const PropertyEvaluationParameters&);
++    bool hasTransition() const;
++
++    const EvaluatedSky& getEvaluated() const { return values; }
++
++    Immutable<style::Sky::Impl> impl;
++
++private:
++    style::SkyProperties::Unevaluated transitioning;
++    EvaluatedSky values;
++};
++
++} // namespace mln
+diff --git a/src/mln/renderer/renderer_impl.cpp b/src/mln/renderer/renderer_impl.cpp
+index e2100c25de60..49fdcbb92c77 100644
+--- a/src/mln/renderer/renderer_impl.cpp
++++ b/src/mln/renderer/renderer_impl.cpp
+@@ -297,6 +297,9 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+         if (auto* sky = orchestrator.getSkyLayerGroup()) {
+             sky->upload(*uploadPass);
+         }
++        if (auto* atmosphere = orchestrator.getAtmosphereLayerGroup()) {
++            atmosphere->upload(*uploadPass);
++        }
+         if (auto* globeDepth = orchestrator.getGlobeDepthLayerGroup()) {
+             globeDepth->upload(*uploadPass);
+         }
+@@ -490,6 +493,11 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
+                 terrain->render(orchestrator, parameters);
+             }
+         }
++
++        // The globe's atmosphere goes over the scene (GL JS draws it after the layers).
++        if (auto* atmosphere = orchestrator.getAtmosphereLayerGroup()) {
++            atmosphere->render(orchestrator, parameters);
++        }
+     };
+ 
+     const auto drawableDebugOverlays = [&] {
+diff --git a/src/mln/renderer/sky_pass.cpp b/src/mln/renderer/sky_pass.cpp
+index acec334fe774..a24d327e6717 100644
+--- a/src/mln/renderer/sky_pass.cpp
++++ b/src/mln/renderer/sky_pass.cpp
+@@ -6,14 +6,15 @@
+ #include <mln/gfx/drawable.hpp>
+ #include <mln/gfx/drawable_builder.hpp>
+ #include <mln/gfx/projection_variant.hpp>
+-#include <mln/gfx/uniform_buffer.hpp>
+-#include <mln/renderer/globe_tile_mesh.hpp> // SegmentVector
+ #include <mln/gfx/shader_registry.hpp>
++#include <mln/gfx/uniform_buffer.hpp>
+ #include <mln/map/transform_state.hpp>
++#include <mln/renderer/globe_tile_mesh.hpp> // SegmentVector
+ #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/renderer/render_pass.hpp>
+-#include <mln/renderer/update_parameters.hpp>
++#include <mln/renderer/render_sky.hpp>
+ #include <mln/shaders/shader_defines.hpp>
++#include <mln/util/mat4.hpp>
+ 
+ #include <algorithm>
+ #include <array>
+@@ -25,22 +26,151 @@ namespace mln {
+ namespace {
+ 
+ constexpr std::string_view SkyShaderName = "SkyShader";
++constexpr std::string_view AtmosphereShaderName = "AtmosphereShader";
+ 
+ // GL JS `maxMercatorHorizonAngle` (mercator_utils.ts).
+ constexpr double maxMercatorHorizonAngle = 89.25;
+ 
++// GL JS `ATMOSPHERE_HEIGHT_TO_GLOBE_RADIUS` (globe_utils.ts).
++constexpr double atmosphereHeightToGlobeRadius = 100000.0 / 6371000.0;
++
+ struct alignas(16) SkyUBO {
+     std::array<float, 4> skyColor;
+     std::array<float, 4> horizonColor;
+     std::array<float, 4> horizon; // x, y: point on the horizon (framebuffer px, y down); z: sky-horizon blend (px)
+     std::array<float, 4> normal;  // xy: up-the-screen normal (y down)
++    std::array<float, 16> invProj;
++    std::array<float, 4> globe;   // xyz: globe centre in view space; w: radius (px)
++    std::array<float, 4> params;  // sky blend, atmosphere blend, camera-to-centre distance, pixel ratio
++    std::array<float, 4> viewport;
++};
++static_assert(sizeof(SkyUBO) == 11 * 16);
++
++struct alignas(16) AtmosphereUBO {
++    std::array<float, 16> invProj;
++    std::array<float, 4> sunPos;
++    std::array<float, 4> globe;
++    std::array<float, 4> params;
++    std::array<float, 4> viewport;
+ };
+-static_assert(sizeof(SkyUBO) == 4 * 16);
++static_assert(sizeof(AtmosphereUBO) == 8 * 16);
+ 
+ constexpr double degToRad(double d) {
+     return d * std::numbers::pi / 180.0;
+ }
+ 
++gfx::ShaderProgramBasePtr getShader(gfx::ShaderRegistry& shaders, gfx::Context& context, std::string_view name) {
++    return context.getGenericShader(shaders, std::string(name), gfx::ProjectionVariant::Mercator);
++}
++
++/// A drawable of one screen-filling quad, drawn with `shader`.
++void addQuad(gfx::Context& context,
++             TileLayerGroup& group,
++             const gfx::ShaderProgramBasePtr& shader,
++             const char* name,
++             std::size_t vertexAttrId) {
++    auto builder = context.createDrawableBuilder(name);
++    builder->setShader(shader);
++    builder->setRenderPass(RenderPass::Translucent);
++    builder->setColorMode(gfx::ColorMode::alphaBlended());
++    builder->setIs3D(false);
++    builder->setEnableColor(true);
++    builder->setEnableDepth(false);
++    builder->setCullFaceMode(gfx::CullFaceMode::disabled());
++    builder->setVertexAttrId(vertexAttrId);
++
++    const std::array<int16_t, 8> corners{-1, -1, 1, -1, 1, 1, -1, 1};
++    const auto* bytes = reinterpret_cast<const uint8_t*>(corners.data());
++    builder->setRawVertices(std::vector<uint8_t>(bytes, bytes + sizeof(corners)), 4, gfx::AttributeDataType::Short2);
++    const std::vector<uint16_t> indices{0, 1, 2, 0, 2, 3};
++    SegmentVector segments;
++    segments.emplace_back(0, 0, 4, indices.size());
++    builder->setSegments(gfx::Triangles(), indices, segments.data(), segments.size());
++    builder->flush(context);
++    for (auto& drawable : builder->clearDrawables()) {
++        drawable->setUBOIndex(0);
++        const OverscaledTileID tileID(0, 0, 0);
++        drawable->setTileID(tileID);
++        group.addDrawable(RenderPass::Translucent, tileID, std::move(drawable));
++    }
++}
++
++/// The globe's view-space state (GL JS `getGlobeCenterInViewSpace`, `getGlobeRadiusPixels`): the inverse of the
++/// globe's perspective projection and the globe centre in view space.
++struct GlobeView {
++    mat4 invProj;
++    std::array<double, 3> position{};
++    double radius = 1.0;
++};
++
++GlobeView globeView(const TransformState& state) {
++    GlobeView view;
++    const Size size = state.getSize();
++    view.radius = state.getGlobeRadiusPixels();
++
++    // The globe's perspective, as built in `VerticalPerspectiveProjection::globeViewProjectionMatrix`.
++    mat4 proj;
++    matrix::perspective(proj,
++                        state.getFieldOfView(),
++                        static_cast<double>(size.width) / size.height,
++                        0.5,
++                        state.getCameraToCenterDistance() + view.radius * 2.0);
++    const ScreenCoordinate offset = state.getCenterOffset();
++    proj[8] = -offset.x * 2.0 / size.width;
++    proj[9] = offset.y * 2.0 / size.height;
++    if (matrix::invert(view.invProj, proj)) {
++        matrix::identity(view.invProj);
++    }
++
++    // The globe's centre is the origin of globe space: in clip space it is the translation column of the globe's
++    // view-projection matrix; the inverse projection takes it to view space.
++    const mat4& globeVP = state.getGlobeViewProjectionMatrix();
++    const std::array<double, 4> clip{globeVP[12], globeVP[13], globeVP[14], globeVP[15]};
++    std::array<double, 4> v{};
++    for (int i = 0; i < 4; ++i) {
++        v[i] = view.invProj[i] * clip[0] + view.invProj[4 + i] * clip[1] + view.invProj[8 + i] * clip[2] +
++               view.invProj[12 + i] * clip[3];
++    }
++    view.position = {v[0] / v[3], v[1] / v[3], v[2] / v[3]};
++    return view;
++}
++
++// GL JS `getAtmosphereAltitudeBlend`.
++double atmosphereAltitudeBlend(double altitude, double globeRadius) {
++    const double atmosphereHeight = globeRadius * atmosphereHeightToGlobeRadius;
++    const double x = std::clamp((altitude - atmosphereHeight) / (9.0 * atmosphereHeight), 0.0, 1.0);
++    return x * x * (3.0 - 2.0 * x);
++}
++
++std::array<float, 16> toFloats(const mat4& m) {
++    std::array<float, 16> out{};
++    for (std::size_t i = 0; i < 16; ++i) {
++        out[i] = static_cast<float>(m[i]);
++    }
++    return out;
++}
++
++// GL JS `getSunPos` (draw_sky.ts).
++std::array<float, 4> sunPosition(const TransformState& state, const SunLight& light) {
++    std::array<double, 3> p{-light.position[0], -light.position[1], -light.position[2]};
++    if (light.anchoredToMap) {
++        mat4 m;
++        matrix::identity(m);
++        matrix::rotate_z(m, m, state.getRoll());
++        matrix::rotate_x(m, m, -state.getPitch());
++        matrix::rotate_z(m, m, state.getBearing());
++        matrix::rotate_x(m, m, degToRad(state.getLatLng().latitude()));
++        matrix::rotate_y(m, m, -degToRad(state.getLatLng().longitude()));
++        const double x = p[0], y = p[1], z = p[2];
++        double w = m[3] * x + m[7] * y + m[11] * z + m[15];
++        w = w != 0.0 ? w : 1.0;
++        p = {(m[0] * x + m[4] * y + m[8] * z + m[12]) / w,
++             (m[1] * x + m[5] * y + m[9] * z + m[13]) / w,
++             (m[2] * x + m[6] * y + m[10] * z + m[14]) / w};
++    }
++    return {static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]), 0.0f};
++}
++
+ } // namespace
+ 
+ SkyPass::SkyPass() = default;
+@@ -50,53 +180,45 @@ void SkyPass::update(gfx::ShaderRegistry& shaders,
+                      gfx::Context& context,
+                      const TransformState& state,
+                      const PaintParameters& paintParameters,
+-                     const UpdateParameters& updateParameters) {
+-    // The globe's sky (atmosphere) is not drawn yet; GL JS blends from this horizon sky to the atmosphere.
+-    if (!updateParameters.sky || state.isGlobeRendering()) {
+-        if (layerGroup) {
+-            layerGroup->clearDrawables();
++                     const EvaluatedSky* evaluatedSky,
++                     const SunLight& light,
++                     const std::optional<Color>& spaceColor) {
++    // Without a sky the area above the flat map's horizon shows the app's "space" backdrop colour, when it has one
++    // (on the globe the backdrop is the clear colour already): the sky quad, drawn in that one colour.
++    EvaluatedSky spaceSky{};
++    if (evaluatedSky == nullptr && spaceColor && !state.isGlobeRendering()) {
++        spaceSky = {*spaceColor, *spaceColor, *spaceColor, 0.0f, 0.0f, 0.0f, 0.0f};
++        evaluatedSky = &spaceSky;
++    }
++    if (evaluatedSky == nullptr || state.getSize().isEmpty()) {
++        if (skyGroup) {
++            skyGroup->clearDrawables();
++        }
++        if (atmosphereGroup) {
++            atmosphereGroup->clearDrawables();
+         }
+         return;
+     }
+-    const style::Sky& sky = *updateParameters.sky;
++    const EvaluatedSky& sky = *evaluatedSky;
++    const bool globe = state.isGlobeRendering();
+ 
+-    if (!shader) {
+-        shader = context.getGenericShader(shaders, std::string(SkyShaderName), gfx::ProjectionVariant::Mercator);
++    if (!skyShader) {
++        skyShader = getShader(shaders, context, SkyShaderName);
+     }
+-    if (!shader) {
++    if (!skyShader) {
+         return;
+     }
+-    if (!layerGroup) {
+-        layerGroup = context.createTileLayerGroup(0, 1, "sky");
+-    }
+-
+-    if (layerGroup->getDrawableCount() == 0) {
+-        auto builder = context.createDrawableBuilder("sky");
+-        builder->setShader(shader);
+-        builder->setRenderPass(RenderPass::Translucent);
+-        builder->setColorMode(gfx::ColorMode::alphaBlended());
+-        builder->setIs3D(false);
+-        builder->setEnableColor(true);
+-        builder->setEnableDepth(false);
+-        builder->setCullFaceMode(gfx::CullFaceMode::disabled());
+-        builder->setVertexAttrId(shaders::idSkyPosVertexAttribute);
+-
+-        const std::array<int16_t, 8> corners{-1, -1, 1, -1, 1, 1, -1, 1};
+-        const auto* bytes = reinterpret_cast<const uint8_t*>(corners.data());
+-        builder->setRawVertices(std::vector<uint8_t>(bytes, bytes + sizeof(corners)), 4, gfx::AttributeDataType::Short2);
+-        const std::vector<uint16_t> indices{0, 1, 2, 0, 2, 3};
+-        SegmentVector segments;
+-        segments.emplace_back(0, 0, 4, indices.size());
+-        builder->setSegments(gfx::Triangles(), indices, segments.data(), segments.size());
+-        builder->flush(context);
+-        for (auto& drawable : builder->clearDrawables()) {
+-            drawable->setUBOIndex(0);
+-            const OverscaledTileID tileID(0, 0, 0);
+-            drawable->setTileID(tileID);
+-            layerGroup->addDrawable(RenderPass::Translucent, tileID, std::move(drawable));
+-        }
++    if (!skyGroup) {
++        skyGroup = context.createTileLayerGroup(0, 1, "sky");
++    }
++    if (skyGroup->getDrawableCount() == 0) {
++        addQuad(context, *skyGroup, skyShader, "sky", shaders::idSkyPosVertexAttribute);
+     }
+ 
++    const double pixelRatio = paintParameters.pixelRatio;
++    const double width = state.getSize().width;
++    const double height = state.getSize().height;
++
+     // GL JS `skyUniformValues`: the horizon line through (width/2 - h*sin(roll), height/2 + h*cos(roll)) with the
+     // normal (-sin(roll), cos(roll)), h = getMercatorHorizon(transform); the blend distance is in pixels.
+     const double pitchDeg = state.getPitch() * 180.0 / std::numbers::pi;
+@@ -106,9 +228,16 @@ void SkyPass::update(gfx::ShaderRegistry& shaders,
+     const double roll = state.getRoll();
+     const double cosRoll = std::cos(roll);
+     const double sinRoll = std::sin(roll);
+-    const double pixelRatio = paintParameters.pixelRatio;
+-    const double width = state.getSize().width;
+-    const double height = state.getSize().height;
++
++    GlobeView view;
++    matrix::identity(view.invProj);
++    double altitudeBlend = 0.0;
++    if (globe) {
++        view = globeView(state);
++        const double distance = std::hypot(view.position[0], view.position[1], view.position[2]);
++        altitudeBlend = atmosphereAltitudeBlend(distance - view.radius, view.radius);
++    }
++    const double projectionTransition = state.getProjectionTransition();
+ 
+     SkyUBO ubo{};
+     ubo.skyColor = {sky.skyColor.r, sky.skyColor.g, sky.skyColor.b, sky.skyColor.a};
+@@ -119,13 +248,57 @@ void SkyPass::update(gfx::ShaderRegistry& shaders,
+                    static_cast<float>(sky.skyHorizonBlend * height / 2.0 * pixelRatio),
+                    0.0f};
+     ubo.normal = {static_cast<float>(-sinRoll), static_cast<float>(cosRoll), 0.0f, 0.0f};
++    ubo.invProj = toFloats(view.invProj);
++    ubo.globe = {static_cast<float>(view.position[0]),
++                 static_cast<float>(view.position[1]),
++                 static_cast<float>(view.position[2]),
++                 static_cast<float>(view.radius)};
++    ubo.params = {static_cast<float>(projectionTransition),
++                  static_cast<float>(sky.atmosphereBlend * altitudeBlend),
++                  state.getCameraToCenterDistance(),
++                  static_cast<float>(pixelRatio)};
++    ubo.viewport = {static_cast<float>(width * pixelRatio), static_cast<float>(height * pixelRatio), 0.0f, 0.0f};
++
++    if (!skyBuffer) {
++        skyBuffer = context.createUniformBuffer(&ubo, sizeof(ubo), false, true);
++    } else {
++        skyBuffer->update(&ubo, sizeof(ubo));
++    }
++    skyGroup->mutableUniformBuffers().set(shaders::idDrawableReservedFragmentOnlyUBO, skyBuffer);
++
++    // The atmosphere (GL JS `drawAtmosphere`): only with the globe, and nothing when it is fully transparent.
++    const double atmosphereBlend = sky.atmosphereBlend * projectionTransition * altitudeBlend;
++    if (!globe || atmosphereBlend <= 0.0) {
++        if (atmosphereGroup) {
++            atmosphereGroup->clearDrawables();
++        }
++        return;
++    }
++    if (!atmosphereShader) {
++        atmosphereShader = getShader(shaders, context, AtmosphereShaderName);
++    }
++    if (!atmosphereShader) {
++        return;
++    }
++    if (!atmosphereGroup) {
++        atmosphereGroup = context.createTileLayerGroup(0, 1, "atmosphere");
++    }
++    if (atmosphereGroup->getDrawableCount() == 0) {
++        addQuad(context, *atmosphereGroup, atmosphereShader, "atmosphere", shaders::idAtmospherePosVertexAttribute);
++    }
+ 
+-    if (!uniformBuffer) {
+-        uniformBuffer = context.createUniformBuffer(&ubo, sizeof(ubo), false, true);
++    AtmosphereUBO atmosphere{};
++    atmosphere.invProj = toFloats(view.invProj);
++    atmosphere.sunPos = sunPosition(state, light);
++    atmosphere.globe = ubo.globe;
++    atmosphere.params = {static_cast<float>(atmosphereBlend), 0.0f, 0.0f, 0.0f};
++    atmosphere.viewport = ubo.viewport;
++    if (!atmosphereBuffer) {
++        atmosphereBuffer = context.createUniformBuffer(&atmosphere, sizeof(atmosphere), false, true);
+     } else {
+-        uniformBuffer->update(&ubo, sizeof(ubo));
++        atmosphereBuffer->update(&atmosphere, sizeof(atmosphere));
+     }
+-    layerGroup->mutableUniformBuffers().set(shaders::idDrawableReservedFragmentOnlyUBO, uniformBuffer);
++    atmosphereGroup->mutableUniformBuffers().set(shaders::idDrawableReservedFragmentOnlyUBO, atmosphereBuffer);
+ }
+ 
+ } // namespace mln
+diff --git a/src/mln/renderer/sky_pass.hpp b/src/mln/renderer/sky_pass.hpp
+index 8144e9449c9b..f1b9b12ec2a2 100644
+--- a/src/mln/renderer/sky_pass.hpp
++++ b/src/mln/renderer/sky_pass.hpp
+@@ -4,6 +4,11 @@
+ #include <mln/gfx/uniform_buffer.hpp>
+ #include <mln/shaders/shader_program_base.hpp>
+ 
++#include <array>
++#include <optional>
++
++#include <mln/util/color.hpp>
++
+ namespace mln {
+ 
+ namespace gfx {
+@@ -12,10 +17,17 @@ class ShaderRegistry;
+ } // namespace gfx
+ 
+ class TransformState;
+-class UpdateParameters;
+ class PaintParameters;
++struct EvaluatedSky;
++
++/// The style light's direction, which the atmosphere uses as the sun (GL JS `getSunPos`).
++struct SunLight {
++    std::array<float, 3> position{{0.0f, 0.0f, 1.0f}}; // the light position as a Cartesian vector
++    bool anchoredToMap = false;
++};
+ 
+-/// Draws the style's `sky` (MapLibre GL JS `drawSky`): a screen quad, shaded by the distance above the horizon.
++/// Draws the style's `sky` (MapLibre GL JS `drawSky` / `drawAtmosphere`): a screen quad shaded by the distance above
++/// the horizon (the planet's limb on the globe), and the globe's atmosphere over the scene.
+ class SkyPass {
+ public:
+     SkyPass();
+@@ -25,15 +37,22 @@ public:
+                 gfx::Context&,
+                 const TransformState&,
+                 const PaintParameters&,
+-                const UpdateParameters&);
++                const EvaluatedSky*,
++                const SunLight&,
++                const std::optional<Color>& spaceColor);
+ 
+-    /// The layer group holding the sky quad, or null before the first sky.
+-    LayerGroupBase* getLayerGroup() const { return layerGroup.get(); }
++    /// The layer group holding the sky quad (drawn first), or null before the first sky.
++    LayerGroupBase* getLayerGroup() const { return skyGroup.get(); }
++    /// The layer group holding the atmosphere quad (drawn over the scene), or null before the first globe sky.
++    LayerGroupBase* getAtmosphereLayerGroup() const { return atmosphereGroup.get(); }
+ 
+ private:
+-    TileLayerGroupPtr layerGroup;
+-    gfx::ShaderProgramBasePtr shader;
+-    gfx::UniformBufferPtr uniformBuffer;
++    TileLayerGroupPtr skyGroup;
++    TileLayerGroupPtr atmosphereGroup;
++    gfx::ShaderProgramBasePtr skyShader;
++    gfx::ShaderProgramBasePtr atmosphereShader;
++    gfx::UniformBufferPtr skyBuffer;
++    gfx::UniformBufferPtr atmosphereBuffer;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index 114d503a37a1..a9a8657e89dd 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -16,6 +16,7 @@
+ #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/renderer/render_pass.hpp>
+ #include <mln/renderer/terrain_tile_manager.hpp>
++#include <mln/renderer/render_sky.hpp>
+ #include <mln/renderer/update_parameters.hpp>
+ #include <mln/shaders/shader_defines.hpp>
+ #include <mln/util/constants.hpp>
+@@ -160,7 +161,8 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+                          gfx::Context& context,
+                          const TransformState& state,
+                          const PaintParameters& paintParameters,
+-                         const UpdateParameters& updateParameters) {
++                         const UpdateParameters& updateParameters,
++                         const EvaluatedSky* evaluatedSky) {
+     if (!updateParameters.terrainTileset || updateParameters.terrainTileset->tiles.empty()) {
+         if (layerGroup) {
+             layerGroup->clearDrawables();
+@@ -323,8 +325,8 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         fogUBO.depthRange = {1.0f, 2.0f, 0.0f, 0.0f};
+         double nearDistance = 1.0;
+         double farDistance = 2.0;
+-        if (updateParameters.sky && !globeShader && state.getFogDepthRange(nearDistance, farDistance)) {
+-            const auto& sky = *updateParameters.sky;
++        if (evaluatedSky != nullptr && !globeShader && state.getFogDepthRange(nearDistance, farDistance)) {
++            const auto& sky = *evaluatedSky;
+             const double pitchDegrees = state.getPitch() * 180.0 / std::numbers::pi;
+             const double opacity = pitchDegrees < 60.0 ? 0.0 : (pitchDegrees < 70.0 ? (pitchDegrees - 60.0) / 10.0 : 1.0);
+             fogUBO.fogColor = {sky.fogColor.r, sky.fogColor.g, sky.fogColor.b, sky.fogColor.a};
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index a4acf86fc665..f085f307a3bf 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -25,6 +25,7 @@ class ShaderRegistry;
+ 
+ class TransformState;
+ class UpdateParameters;
++struct EvaluatedSky;
+ class PaintParameters;
+ class TerrainTileManager;
+ 
+@@ -35,7 +36,7 @@ public:
+     TerrainPass();
+     ~TerrainPass();
+ 
+-    void update(gfx::ShaderRegistry&, gfx::Context&, const TransformState&, const PaintParameters&, const UpdateParameters&);
++    void update(gfx::ShaderRegistry&, gfx::Context&, const TransformState&, const PaintParameters&, const UpdateParameters&, const EvaluatedSky*);
+ 
+     /// The layer group holding the terrain drawables, or null before the first enable.
+     LayerGroupBase* getLayerGroup() const { return layerGroup.get(); }
+diff --git a/src/mln/renderer/update_parameters.hpp b/src/mln/renderer/update_parameters.hpp
+index ef8df4558235..57ce4d7142ff 100644
+--- a/src/mln/renderer/update_parameters.hpp
++++ b/src/mln/renderer/update_parameters.hpp
+@@ -10,7 +10,7 @@
+ #include <mln/util/chrono.hpp>
+ #include <mln/util/color.hpp>
+ #include <mln/util/immutable.hpp>
+-#include <mln/style/sky.hpp>
++#include <mln/style/sky_impl.hpp>
+ #include <mln/util/tileset.hpp>
+ 
+ #include <numbers>
+@@ -68,7 +68,7 @@ public:
+     double terrainExaggeration = 1.0;
+ 
+     // The style's `sky` (none when the style has no sky).
+-    std::optional<style::Sky> sky = std::nullopt;
++    std::optional<Immutable<style::Sky::Impl>> sky = std::nullopt;
+ };
+ 
+ } // namespace mln
+diff --git a/src/mln/shaders/vulkan/atmosphere.cpp b/src/mln/shaders/vulkan/atmosphere.cpp
+new file mode 100644
+index 000000000000..3d7e70dfb0ff
+--- /dev/null
++++ b/src/mln/shaders/vulkan/atmosphere.cpp
+@@ -0,0 +1,15 @@
++#include <mln/shaders/vulkan/atmosphere.hpp>
++#include <mln/shaders/shader_defines.hpp>
++
++namespace mln {
++namespace shaders {
++
++using AtmosphereShaderSource = ShaderSource<BuiltIn::AtmosphereShader, gfx::Backend::Type::Vulkan>;
++
++const std::array<AttributeInfo, 1> AtmosphereShaderSource::attributes = {
++    AttributeInfo{0, gfx::AttributeDataType::Short2, idAtmospherePosVertexAttribute},
++};
++const std::array<TextureInfo, 0> AtmosphereShaderSource::textures = {};
++
++} // namespace shaders
++} // namespace mln
+diff --git a/src/mln/style/conversion/sky.cpp b/src/mln/style/conversion/sky.cpp
+index 745b171fb312..d4286b3c657a 100644
+--- a/src/mln/style/conversion/sky.cpp
++++ b/src/mln/style/conversion/sky.cpp
+@@ -1,41 +1,10 @@
+ #include <mln/style/conversion/sky.hpp>
+ #include <mln/style/conversion_impl.hpp>
+-#include <mln/style/conversion/constant.hpp>
+ 
+ namespace mln {
+ namespace style {
+ namespace conversion {
+ 
+-namespace {
+-
+-bool convertBlend(const Convertible& value, const char* name, float& out, Error& error) {
+-    const auto member = objectMember(value, name);
+-    if (!member) {
+-        return true;
+-    }
+-    const auto converted = convert<float>(*member, error);
+-    if (!converted) {
+-        return false;
+-    }
+-    out = std::clamp(*converted, 0.0f, 1.0f);
+-    return true;
+-}
+-
+-bool convertColor(const Convertible& value, const char* name, Color& out, Error& error) {
+-    const auto member = objectMember(value, name);
+-    if (!member) {
+-        return true;
+-    }
+-    const auto converted = convert<Color>(*member, error);
+-    if (!converted) {
+-        return false;
+-    }
+-    out = *converted;
+-    return true;
+-}
+-
+-} // namespace
+-
+ std::optional<Sky> Converter<Sky>::operator()(const Convertible& value, Error& error) const {
+     if (!isObject(value)) {
+         error.message = "sky must be an object";
+@@ -43,13 +12,11 @@ std::optional<Sky> Converter<Sky>::operator()(const Convertible& value, Error& e
+     }
+ 
+     Sky sky;
+-    if (!convertColor(value, "sky-color", sky.skyColor, error) ||
+-        !convertColor(value, "horizon-color", sky.horizonColor, error) ||
+-        !convertColor(value, "fog-color", sky.fogColor, error) ||
+-        !convertBlend(value, "fog-ground-blend", sky.fogGroundBlend, error) ||
+-        !convertBlend(value, "horizon-fog-blend", sky.horizonFogBlend, error) ||
+-        !convertBlend(value, "sky-horizon-blend", sky.skyHorizonBlend, error) ||
+-        !convertBlend(value, "atmosphere-blend", sky.atmosphereBlend, error)) {
++    const auto failure = eachMember(value, [&](const std::string& name, const Convertible& member) -> std::optional<Error> {
++        return sky.setProperty(name, member);
++    });
++    if (failure) {
++        error = *failure;
+         return std::nullopt;
+     }
+     return {std::move(sky)};
+diff --git a/src/mln/style/sky.cpp b/src/mln/style/sky.cpp
+new file mode 100644
+index 000000000000..4829cf10d0f2
+--- /dev/null
++++ b/src/mln/style/sky.cpp
+@@ -0,0 +1,216 @@
++#include <mln/style/sky.hpp>
++#include <mln/style/sky_impl.hpp>
++#include <mln/style/conversion/property_value.hpp>
++#include <mln/style/conversion/transition_options.hpp>
++#include <mln/style/conversion_impl.hpp>
++
++#include <mapbox/eternal.hpp>
++
++#include <utility>
++
++namespace mln {
++namespace style {
++
++namespace {
++SkyObserver nullObserver;
++
++enum class Property : uint8_t {
++    SkyColor,
++    HorizonColor,
++    FogColor,
++    FogGroundBlend,
++    HorizonFogBlend,
++    SkyHorizonBlend,
++    AtmosphereBlend,
++    SkyColorTransition,
++    HorizonColorTransition,
++    FogColorTransition,
++    FogGroundBlendTransition,
++    HorizonFogBlendTransition,
++    SkyHorizonBlendTransition,
++    AtmosphereBlendTransition,
++};
++
++constexpr uint8_t toUint8(Property p) noexcept {
++    return static_cast<uint8_t>(p);
++}
++
++constexpr const auto properties = mapbox::eternal::hash_map<mapbox::eternal::string, uint8_t>(
++    {{"sky-color", toUint8(Property::SkyColor)},
++     {"horizon-color", toUint8(Property::HorizonColor)},
++     {"fog-color", toUint8(Property::FogColor)},
++     {"fog-ground-blend", toUint8(Property::FogGroundBlend)},
++     {"horizon-fog-blend", toUint8(Property::HorizonFogBlend)},
++     {"sky-horizon-blend", toUint8(Property::SkyHorizonBlend)},
++     {"atmosphere-blend", toUint8(Property::AtmosphereBlend)},
++     {"sky-color-transition", toUint8(Property::SkyColorTransition)},
++     {"horizon-color-transition", toUint8(Property::HorizonColorTransition)},
++     {"fog-color-transition", toUint8(Property::FogColorTransition)},
++     {"fog-ground-blend-transition", toUint8(Property::FogGroundBlendTransition)},
++     {"horizon-fog-blend-transition", toUint8(Property::HorizonFogBlendTransition)},
++     {"sky-horizon-blend-transition", toUint8(Property::SkyHorizonBlendTransition)},
++     {"atmosphere-blend-transition", toUint8(Property::AtmosphereBlendTransition)}});
++
++template <class P>
++void setValue(Sky& sky, PropertyValue<typename P::Type> value) {
++    auto impl_ = sky.mutableImpl();
++    impl_->properties.template get<P>().value = std::move(value);
++    sky.impl = std::move(impl_);
++    sky.observer->onSkyChanged(sky);
++}
++
++template <class P>
++void setTransition(Sky& sky, const TransitionOptions& options) {
++    auto impl_ = sky.mutableImpl();
++    impl_->properties.template get<P>().options = options;
++    sky.impl = std::move(impl_);
++    sky.observer->onSkyChanged(sky);
++}
++
++template <class P>
++std::optional<conversion::Error> convertAndSet(Sky& sky, const conversion::Convertible& value) {
++    conversion::Error error;
++    // Zoom expressions are allowed (not feature or data-driven).
++    std::optional<PropertyValue<typename P::Type>> typed = conversion::convert<PropertyValue<typename P::Type>>(
++        value, error, false, false);
++    if (!typed) {
++        return error;
++    }
++    setValue<P>(sky, std::move(*typed));
++    return std::nullopt;
++}
++
++} // namespace
++
++Sky::Sky(Immutable<Sky::Impl> impl_)
++    : impl(std::move(impl_)),
++      observer(&nullObserver) {}
++
++Sky::Sky()
++    : Sky(makeMutable<Impl>()) {}
++
++Sky::~Sky() = default;
++
++void Sky::setObserver(SkyObserver* observer_) {
++    observer = observer_ ? observer_ : &nullObserver;
++}
++
++Mutable<Sky::Impl> Sky::mutableImpl() const {
++    return makeMutable<Impl>(*impl);
++}
++
++std::optional<conversion::Error> Sky::setProperty(const std::string& name, const conversion::Convertible& value) {
++    const auto it = properties.find(name.c_str());
++    if (it == properties.end()) {
++        return conversion::Error{"sky doesn't support this property"};
++    }
++    switch (static_cast<Property>(it->second)) {
++        case Property::SkyColor:
++            return convertAndSet<SkyColor>(*this, value);
++        case Property::HorizonColor:
++            return convertAndSet<SkyHorizonColor>(*this, value);
++        case Property::FogColor:
++            return convertAndSet<SkyFogColor>(*this, value);
++        case Property::FogGroundBlend:
++            return convertAndSet<SkyFogGroundBlend>(*this, value);
++        case Property::HorizonFogBlend:
++            return convertAndSet<SkyHorizonFogBlend>(*this, value);
++        case Property::SkyHorizonBlend:
++            return convertAndSet<SkySkyHorizonBlend>(*this, value);
++        case Property::AtmosphereBlend:
++            return convertAndSet<SkyAtmosphereBlend>(*this, value);
++        default:
++            break;
++    }
++
++    conversion::Error error;
++    std::optional<TransitionOptions> transition = conversion::convert<TransitionOptions>(value, error);
++    if (!transition) {
++        return error;
++    }
++    switch (static_cast<Property>(it->second)) {
++        case Property::SkyColorTransition:
++            setTransition<SkyColor>(*this, *transition);
++            break;
++        case Property::HorizonColorTransition:
++            setTransition<SkyHorizonColor>(*this, *transition);
++            break;
++        case Property::FogColorTransition:
++            setTransition<SkyFogColor>(*this, *transition);
++            break;
++        case Property::FogGroundBlendTransition:
++            setTransition<SkyFogGroundBlend>(*this, *transition);
++            break;
++        case Property::HorizonFogBlendTransition:
++            setTransition<SkyHorizonFogBlend>(*this, *transition);
++            break;
++        case Property::SkyHorizonBlendTransition:
++            setTransition<SkySkyHorizonBlend>(*this, *transition);
++            break;
++        case Property::AtmosphereBlendTransition:
++            setTransition<SkyAtmosphereBlend>(*this, *transition);
++            break;
++        default:
++            return conversion::Error{"sky doesn't support this property"};
++    }
++    return std::nullopt;
++}
++
++StyleProperty Sky::getProperty(const std::string& name) const {
++    const auto it = properties.find(name.c_str());
++    if (it == properties.end()) {
++        return {};
++    }
++    switch (static_cast<Property>(it->second)) {
++        case Property::SkyColor:
++            return conversion::makeStyleProperty(getSkyColor());
++        case Property::HorizonColor:
++            return conversion::makeStyleProperty(getHorizonColor());
++        case Property::FogColor:
++            return conversion::makeStyleProperty(getFogColor());
++        case Property::FogGroundBlend:
++            return conversion::makeStyleProperty(getFogGroundBlend());
++        case Property::HorizonFogBlend:
++            return conversion::makeStyleProperty(getHorizonFogBlend());
++        case Property::SkyHorizonBlend:
++            return conversion::makeStyleProperty(getSkyHorizonBlend());
++        case Property::AtmosphereBlend:
++            return conversion::makeStyleProperty(getAtmosphereBlend());
++        case Property::SkyColorTransition:
++            return conversion::makeStyleProperty(impl->properties.template get<SkyColor>().options);
++        case Property::HorizonColorTransition:
++            return conversion::makeStyleProperty(impl->properties.template get<SkyHorizonColor>().options);
++        case Property::FogColorTransition:
++            return conversion::makeStyleProperty(impl->properties.template get<SkyFogColor>().options);
++        case Property::FogGroundBlendTransition:
++            return conversion::makeStyleProperty(impl->properties.template get<SkyFogGroundBlend>().options);
++        case Property::HorizonFogBlendTransition:
++            return conversion::makeStyleProperty(impl->properties.template get<SkyHorizonFogBlend>().options);
++        case Property::SkyHorizonBlendTransition:
++            return conversion::makeStyleProperty(impl->properties.template get<SkySkyHorizonBlend>().options);
++        case Property::AtmosphereBlendTransition:
++            return conversion::makeStyleProperty(impl->properties.template get<SkyAtmosphereBlend>().options);
++    }
++    return {};
++}
++
++#define MLN_SKY_ACCESSORS(Name, Prop, Type)                                       \
++    PropertyValue<Type> Sky::get##Name() const {                                  \
++        return impl->properties.template get<Prop>().value;                       \
++    }                                                                             \
++    void Sky::set##Name(PropertyValue<Type> value) {                              \
++        setValue<Prop>(*this, std::move(value));                                  \
++    }
++
++MLN_SKY_ACCESSORS(SkyColor, SkyColor, Color)
++MLN_SKY_ACCESSORS(HorizonColor, SkyHorizonColor, Color)
++MLN_SKY_ACCESSORS(FogColor, SkyFogColor, Color)
++MLN_SKY_ACCESSORS(FogGroundBlend, SkyFogGroundBlend, float)
++MLN_SKY_ACCESSORS(HorizonFogBlend, SkyHorizonFogBlend, float)
++MLN_SKY_ACCESSORS(SkyHorizonBlend, SkySkyHorizonBlend, float)
++MLN_SKY_ACCESSORS(AtmosphereBlend, SkyAtmosphereBlend, float)
++
++#undef MLN_SKY_ACCESSORS
++
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/sky_impl.hpp b/src/mln/style/sky_impl.hpp
+new file mode 100644
+index 000000000000..456678c86513
+--- /dev/null
++++ b/src/mln/style/sky_impl.hpp
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <mln/style/sky.hpp>
++#include <mln/style/properties.hpp>
++#include <mln/style/property_value.hpp>
++#include <mln/renderer/property_evaluator.hpp>
++#include <mln/util/color.hpp>
++
++namespace mln {
++namespace style {
++
++template <class T>
++class SkyProperty {
++public:
++    using TransitionableType = Transitionable<PropertyValue<T>>;
++    using UnevaluatedType = Transitioning<PropertyValue<T>>;
++    using EvaluatorType = PropertyEvaluator<T>;
++    using PossiblyEvaluatedType = T;
++    using Type = T;
++    static constexpr bool IsDataDriven = false;
++    static constexpr bool IsOverridable = false;
++};
++
++// Defaults: the style-spec `sky` defaults.
++struct SkyColor : SkyProperty<Color> {
++    static Color defaultValue() { return *Color::parse("#88C6FC"); }
++};
++struct SkyHorizonColor : SkyProperty<Color> {
++    static Color defaultValue() { return *Color::parse("#ffffff"); }
++};
++struct SkyFogColor : SkyProperty<Color> {
++    static Color defaultValue() { return *Color::parse("#ffffff"); }
++};
++struct SkyFogGroundBlend : SkyProperty<float> {
++    static float defaultValue() { return 0.5f; }
++};
++struct SkyHorizonFogBlend : SkyProperty<float> {
++    static float defaultValue() { return 0.8f; }
++};
++struct SkySkyHorizonBlend : SkyProperty<float> {
++    static float defaultValue() { return 0.8f; }
++};
++struct SkyAtmosphereBlend : SkyProperty<float> {
++    static float defaultValue() { return 0.8f; }
++};
++
++using SkyProperties = Properties<SkyColor,
++                                 SkyHorizonColor,
++                                 SkyFogColor,
++                                 SkyFogGroundBlend,
++                                 SkyHorizonFogBlend,
++                                 SkySkyHorizonBlend,
++                                 SkyAtmosphereBlend>;
++
++class Sky::Impl {
++public:
++    SkyProperties::Transitionable properties;
++};
++
++} // namespace style
++} // namespace mln
+diff --git a/src/mln/style/style.cpp b/src/mln/style/style.cpp
+index b794bfb59af7..934dbcbcffe8 100644
+--- a/src/mln/style/style.cpp
++++ b/src/mln/style/style.cpp
+@@ -90,11 +90,15 @@ const Projection* Style::getProjection() const {
+     return impl->getProjection();
+ }
+ 
+-std::optional<Sky> Style::getSky() const {
++Sky* Style::getSky() {
+     return impl->getSky();
+ }
+ 
+-void Style::setSky(std::optional<Sky> sky) {
++const Sky* Style::getSky() const {
++    return impl->getSky();
++}
++
++void Style::setSky(std::unique_ptr<Sky> sky) {
+     impl->setSky(std::move(sky));
+ }
+ 
+diff --git a/src/mln/style/style_impl.cpp b/src/mln/style/style_impl.cpp
+index 3add18538eb4..6698c510a711 100644
+--- a/src/mln/style/style_impl.cpp
++++ b/src/mln/style/style_impl.cpp
+@@ -131,7 +131,7 @@ void Style::Impl::parse(const std::string& json_) {
+     setLight(std::make_unique<Light>(parser.light));
+     setProjection(std::make_unique<Projection>(parser.projection));
+     setTerrain(std::make_unique<Terrain>(parser.terrain));
+-    setSky(parser.sky);
++    setSky(parser.sky ? std::make_unique<Sky>(*parser.sky) : nullptr);
+ 
+     if (fileSource) {
+         if (parser.sprites.empty()) {
+@@ -276,16 +276,20 @@ void Style::Impl::setTerrain(std::unique_ptr<Terrain> terrain_) {
+     onTerrainChanged(*terrain);
+ }
+ 
+-void Style::Impl::setSky(std::optional<Sky> sky_) {
+-    if (sky == sky_) {
+-        return;
+-    }
++void Style::Impl::setSky(std::unique_ptr<Sky> sky_) {
+     sky = std::move(sky_);
++    if (sky) {
++        sky->setObserver(this);
++    }
+     observer->onUpdate();
+ }
+ 
+-const std::optional<Sky>& Style::Impl::getSky() const {
+-    return sky;
++Sky* Style::Impl::getSky() const {
++    return sky.get();
++}
++
++void Style::Impl::onSkyChanged(const Sky&) {
++    observer->onUpdate();
+ }
+ 
+ Terrain* Style::Impl::getTerrain() const {
+diff --git a/src/mln/style/style_impl.hpp b/src/mln/style/style_impl.hpp
+index 538003a29131..5189b72cb48c 100644
+--- a/src/mln/style/style_impl.hpp
++++ b/src/mln/style/style_impl.hpp
+@@ -9,6 +9,7 @@
+ #include <mln/style/light_observer.hpp>
+ #include <mln/style/projection_observer.hpp>
+ #include <mln/style/terrain_observer.hpp>
++#include <mln/style/sky.hpp>
+ #include <mln/sprite/sprite_loader_observer.hpp>
+ #include <mln/style/image.hpp>
+ #include <mln/style/source.hpp>
+@@ -39,6 +40,7 @@ class Style::Impl : public SpriteLoaderObserver,
+                     public SourceObserver,
+                      public LayerObserver,
+                      public LightObserver,
++                     public SkyObserver,
+                      public ProjectionObserver,
+                      public TerrainObserver,
+                      public util::noncopyable {
+@@ -93,8 +95,8 @@ public:
+     Projection* getProjection() const;
+ 
+     void setTerrain(std::unique_ptr<Terrain>);
+-    void setSky(std::optional<Sky>);
+-    const std::optional<Sky>& getSky() const;
++    void setSky(std::unique_ptr<Sky>);
++    Sky* getSky() const;
+     Terrain* getTerrain() const;
+ 
+     std::optional<Immutable<style::Image::Impl>> getImage(const std::string&) const;
+@@ -135,7 +137,7 @@ private:
+     std::unique_ptr<Light> light;
+     std::unique_ptr<Projection> projection;
+     std::unique_ptr<Terrain> terrain;
+-    std::optional<Sky> sky;
++    std::unique_ptr<Sky> sky;
+     std::unordered_map<std::string, bool> spritesLoadingStatus;
+ 
+     // Defaults
+@@ -159,6 +161,9 @@ private:
+     // LightObserver implementation.
+     void onLightChanged(const Light&) override;
+ 
++    // SkyObserver implementation.
++    void onSkyChanged(const Sky&) override;
++
+     // ProjectionObserver implementation.
+     void onProjectionChanged(const Projection&) override;
+ 
+diff --git a/src/mln/vulkan/renderer_backend.cpp b/src/mln/vulkan/renderer_backend.cpp
+index d431da62560f..f23903dd9988 100644
+--- a/src/mln/vulkan/renderer_backend.cpp
++++ b/src/mln/vulkan/renderer_backend.cpp
+@@ -20,6 +20,7 @@
+ #include <mln/shaders/vulkan/fill_extrusion.hpp>
+ #include <mln/shaders/vulkan/globe_depth.hpp>
+ #include <mln/shaders/vulkan/sky.hpp>
++#include <mln/shaders/vulkan/atmosphere.hpp>
+ #include <mln/shaders/vulkan/heatmap.hpp>
+ #include <mln/shaders/vulkan/heatmap_texture.hpp>
+ #include <mln/shaders/vulkan/hillshade.hpp>
+@@ -716,6 +717,7 @@ void RendererBackend::initShaders(gfx::ShaderRegistry& shaders, const ProgramPar
+                   shaders::BuiltIn::FillExtrusionPatternInstancedShader,
+                   shaders::BuiltIn::GlobeDepthShader,
+                   shaders::BuiltIn::SkyShader,
++                  shaders::BuiltIn::AtmosphereShader,
+                   shaders::BuiltIn::HeatmapShader,
+                   shaders::BuiltIn::HeatmapTextureShader,
+                   shaders::BuiltIn::HillshadeShader,
+diff --git a/test/style/conversion/sky.test.cpp b/test/style/conversion/sky.test.cpp
+index 6835e927f74f..ab046b9d4660 100644
+--- a/test/style/conversion/sky.test.cpp
++++ b/test/style/conversion/sky.test.cpp
+@@ -5,6 +5,7 @@
+ #include <mln/style/conversion/sky.hpp>
+ #include <mln/style/conversion_impl.hpp>
+ #include <mln/style/rapidjson_conversion.hpp>
++#include <mln/style/sky_impl.hpp>
+ #include <mln/util/color.hpp>
+ 
+ using namespace mln;
+@@ -16,36 +17,60 @@ TEST(StyleConversion, SkyDefaults) {
+     const auto sky = convertJSON<Sky>("{}", error);
+     ASSERT_TRUE(sky.has_value()) << error.message;
+ 
+-    // The style-spec defaults.
+-    EXPECT_EQ(sky->skyColor, *Color::parse("#88C6FC"));
+-    EXPECT_EQ(sky->horizonColor, *Color::parse("#ffffff"));
+-    EXPECT_EQ(sky->fogColor, *Color::parse("#ffffff"));
+-    EXPECT_FLOAT_EQ(sky->fogGroundBlend, 0.5f);
+-    EXPECT_FLOAT_EQ(sky->horizonFogBlend, 0.8f);
+-    EXPECT_FLOAT_EQ(sky->skyHorizonBlend, 0.8f);
+-    EXPECT_FLOAT_EQ(sky->atmosphereBlend, 0.8f);
++    // Unset properties are undefined and evaluate to the style-spec defaults.
++    EXPECT_TRUE(sky->getSkyColor().isUndefined());
++    EXPECT_EQ(SkyColor::defaultValue(), *Color::parse("#88C6FC"));
++    EXPECT_EQ(SkyHorizonColor::defaultValue(), *Color::parse("#ffffff"));
++    EXPECT_EQ(SkyFogColor::defaultValue(), *Color::parse("#ffffff"));
++    EXPECT_FLOAT_EQ(SkyFogGroundBlend::defaultValue(), 0.5f);
++    EXPECT_FLOAT_EQ(SkyHorizonFogBlend::defaultValue(), 0.8f);
++    EXPECT_FLOAT_EQ(SkySkyHorizonBlend::defaultValue(), 0.8f);
++    EXPECT_FLOAT_EQ(SkyAtmosphereBlend::defaultValue(), 0.8f);
+ }
+ 
+-TEST(StyleConversion, SkyProperties) {
++TEST(StyleConversion, SkyConstants) {
+     Error error;
+     const auto sky = convertJSON<Sky>(
+         R"({"sky-color": "#199EF3", "horizon-color": "#ff0000", "fog-color": "#0000ff", "fog-ground-blend": 0.25,
+-            "horizon-fog-blend": 0.5, "sky-horizon-blend": 2.0, "atmosphere-blend": -1})",
++            "horizon-fog-blend": 0.5, "sky-horizon-blend": 0.6, "atmosphere-blend": 0.1})",
+         error);
+     ASSERT_TRUE(sky.has_value()) << error.message;
+ 
+-    EXPECT_EQ(sky->skyColor, *Color::parse("#199EF3"));
+-    EXPECT_EQ(sky->horizonColor, *Color::parse("#ff0000"));
+-    EXPECT_EQ(sky->fogColor, *Color::parse("#0000ff"));
+-    EXPECT_FLOAT_EQ(sky->fogGroundBlend, 0.25f);
+-    EXPECT_FLOAT_EQ(sky->horizonFogBlend, 0.5f);
+-    // Blends are limited to [0, 1] (style-spec minimum / maximum).
+-    EXPECT_FLOAT_EQ(sky->skyHorizonBlend, 1.0f);
+-    EXPECT_FLOAT_EQ(sky->atmosphereBlend, 0.0f);
++    ASSERT_TRUE(sky->getSkyColor().isConstant());
++    EXPECT_EQ(sky->getSkyColor().asConstant(), *Color::parse("#199EF3"));
++    EXPECT_EQ(sky->getHorizonColor().asConstant(), *Color::parse("#ff0000"));
++    EXPECT_EQ(sky->getFogColor().asConstant(), *Color::parse("#0000ff"));
++    EXPECT_FLOAT_EQ(sky->getFogGroundBlend().asConstant(), 0.25f);
++    EXPECT_FLOAT_EQ(sky->getHorizonFogBlend().asConstant(), 0.5f);
++    EXPECT_FLOAT_EQ(sky->getSkyHorizonBlend().asConstant(), 0.6f);
++    EXPECT_FLOAT_EQ(sky->getAtmosphereBlend().asConstant(), 0.1f);
++}
++
++TEST(StyleConversion, SkyExpressionsAndTransitions) {
++    Error error;
++    const auto sky = convertJSON<Sky>(
++        R"({"atmosphere-blend": ["interpolate", ["linear"], ["zoom"], 0, 1, 10, 1, 12, 0],
++            "sky-color": ["interpolate", ["linear"], ["zoom"], 0, "red", 10, "blue"],
++            "sky-color-transition": {"duration": 1500, "delay": 100}})",
++        error);
++    ASSERT_TRUE(sky.has_value()) << error.message;
++
++    // Zoom expressions are accepted.
++    EXPECT_TRUE(sky->getAtmosphereBlend().isExpression());
++    EXPECT_TRUE(sky->getSkyColor().isExpression());
++
++    const auto options = sky->impl->properties.template get<SkyColor>().options;
++    ASSERT_TRUE(options.duration.has_value());
++    EXPECT_EQ(std::chrono::duration_cast<std::chrono::milliseconds>(*options.duration).count(), 1500);
++    ASSERT_TRUE(options.delay.has_value());
++    EXPECT_EQ(std::chrono::duration_cast<std::chrono::milliseconds>(*options.delay).count(), 100);
+ }
+ 
+ TEST(StyleConversion, SkyErrors) {
+     Error error;
+     EXPECT_FALSE(convertJSON<Sky>("[]", error).has_value());
+     EXPECT_FALSE(convertJSON<Sky>(R"({"sky-color": 3})", error).has_value());
++    EXPECT_FALSE(convertJSON<Sky>(R"({"no-such-property": 1})", error).has_value());
++    // Data-driven expressions are not allowed.
++    EXPECT_FALSE(convertJSON<Sky>(R"({"fog-ground-blend": ["get", "x"]})", error).has_value());
+ }

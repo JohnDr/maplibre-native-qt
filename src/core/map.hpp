@@ -140,6 +140,16 @@ public:
     void setTerrain(const QString &source, double exaggeration = 1.0);
     void clearTerrain();
     [[nodiscard]] QVariant terrainElevation(const Coordinate &coordinate) const;
+
+    // Sky (style-spec `sky`, as MapLibre GL JS `map.setSky`): the horizon gradient, the terrain fog and, with the
+    // globe projection, the atmosphere. \a properties holds the style-spec sky properties (`sky-color`,
+    // `horizon-color`, `fog-color`, `fog-ground-blend`, `horizon-fog-blend`, `sky-horizon-blend`,
+    // `atmosphere-blend` and their `-transition` variants); each value is a constant or a (zoom) expression, as a Qt
+    // value or a JSON string. An empty map is the default sky. Returns false (and warns) if a property is invalid.
+    // A style (re)load replaces the sky with the style's own.
+    bool setSky(const QVariantMap &properties = QVariantMap());
+    void clearSky();
+    [[nodiscard]] bool hasSky() const;
     [[nodiscard]] double elevation() const;
     [[nodiscard]] double cameraAltitude() const;
 

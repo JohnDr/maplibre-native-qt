@@ -44,6 +44,7 @@
 #include <mln/style/layers/raster_layer.hpp>
 #include <mln/style/layers/symbol_layer.hpp>
 #include <mln/style/rapidjson_conversion.hpp>
+#include <mln/style/sky.hpp>
 #include <mln/style/sources/geojson_source.hpp>
 #include <mln/style/sources/image_source.hpp>
 #include <mln/style/style.hpp>
@@ -953,6 +954,54 @@ void Map::setProjectionType(ProjectionType type) {
 */
 void Map::setTerrain(const QString &source, double exaggeration) {
     d_ptr->mapObj->setTerrain(source.toStdString(), exaggeration);
+}
+
+/*!
+    \brief Set the sky, as MapLibre GL JS \c map.setSky().
+
+    \a properties holds style-spec \c sky properties; an empty map gives the default sky. Returns \c false, leaving
+    the sky unchanged, if a property is invalid.
+*/
+bool Map::setSky(const QVariantMap &properties) {
+    auto sky = std::make_unique<mln::style::Sky>();
+    for (auto it = properties.cbegin(); it != properties.cend(); ++it) {
+        const std::string name = it.key().toStdString();
+        const QVariant &value = it.value();
+        std::optional<mln::style::conversion::Error> result;
+        if (value.typeId() == QMetaType::QString) {
+            // A JSON string (an expression, a transition object, a number) is parsed; any other string is a value.
+            mln::JSDocument document;
+            document.Parse<0>(value.toString().toStdString());
+            if (!document.HasParseError()) {
+                const mln::JSValue *jsonValue = &document;
+                result = sky->setProperty(name, jsonValue);
+            } else {
+                result = sky->setProperty(name, value);
+            }
+        } else {
+            result = sky->setProperty(name, value);
+        }
+        if (result) {
+            qWarning() << "Sky property" << it.key() << "rejected:" << result->message.c_str();
+            return false;
+        }
+    }
+    d_ptr->mapObj->getStyle().setSky(std::move(sky));
+    return true;
+}
+
+/*!
+    \brief Returns \c true if the style has a sky (its own or one set with setSky()).
+*/
+bool Map::hasSky() const {
+    return d_ptr->mapObj->getStyle().getSky() != nullptr;
+}
+
+/*!
+    \brief Remove the sky.
+*/
+void Map::clearSky() {
+    d_ptr->mapObj->getStyle().setSky(nullptr);
 }
 
 /*!

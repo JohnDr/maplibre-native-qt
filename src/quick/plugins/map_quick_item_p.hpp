@@ -34,6 +34,7 @@ public:
 
     // Re-applies the terrain selected through this item to the map (once the style is loaded).
     void applyTerrain();
+    void applySky();
 
     Settings m_settings;
     std::shared_ptr<Map> m_map;
@@ -47,6 +48,9 @@ public:
         QColor m_backgroundColor;
         QString m_terrainSource;
         double m_terrainExaggeration = 1.0;
+        bool m_skyEnabled = false;
+        bool m_skyExplicit = false;
+        QVariantMap m_sky;
 
     QString m_mapItemsBefore; // TODO: make this a property
     QList<StyleParameter *> m_mapParameters;
