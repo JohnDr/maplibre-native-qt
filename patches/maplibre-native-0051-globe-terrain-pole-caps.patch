@@ -1,0 +1,66 @@
+diff --git a/include/mln/shaders/vulkan/common.hpp b/include/mln/shaders/vulkan/common.hpp
+index f919f31c3bad..88f7085738f9 100644
+--- a/include/mln/shaders/vulkan/common.hpp
++++ b/include/mln/shaders/vulkan/common.hpp
+@@ -214,6 +214,13 @@ vec4 interpolateProjectionFor3D(vec2 posInTile, vec3 spherePos, float elevation,
+     if (projection.projection_transition > 0.999) {
+         return globePosition;
+     }
++    if ((posInTile.y < GLOBE_POLE_NORTH_Y) || (posInTile.y > GLOBE_POLE_SOUTH_Y)) {
++        // Pole vertices only exist on the globe: they stay while it is (nearly) fully globe and are clipped away
++        // (beyond the far plane) as the projection flattens, as in interpolateProjection.
++        vec4 poleResult = globePosition;
++        poleResult.z = mix(globePosition.z, 2.0 * globePosition.w, pow(max((1.0 - projection.projection_transition) / 0.02, 0.0), 8.0));
++        return poleResult;
++    }
+     const vec4 fallbackPosition = projection.fallback_matrix * vec4(posInTile, elevation, 1.0);
+     return mix(fallbackPosition, globePosition, projection.projection_transition);
+ }
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index d71972cdde7f..fa344ee5e735 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -22,6 +22,7 @@
+ #include <mln/shaders/shader_defines.hpp>
+ #include <mln/util/constants.hpp>
+ #include <mln/util/projection.hpp>
++#include <mln/util/subdivision.hpp> // NORTH_POLE_Y / SOUTH_POLE_Y
+ #include <mln/util/tile_cover.hpp>
+ #include <algorithm>
+ #include <array>
+@@ -89,7 +90,9 @@ struct EdgeStitch {
+ /// from that tile's mesh edge, so the two meets without a crack (GL JS hides the crack with the skirt only).
+ TerrainMesh buildTerrainMesh(const TileDem& dem,
+                              double exaggeration,
+-                             const std::array<std::optional<EdgeStitch>, 4>& stitch) {
++                             const std::array<std::optional<EdgeStitch>, 4>& stitch,
++                             bool northPole,
++                             bool southPole) {
+     const std::size_t n = TerrainGridPoints;
+     const double extent = static_cast<double>(util::EXTENT);
+ 
+@@ -152,6 +155,12 @@ TerrainMesh buildTerrainMesh(const TileDem& dem,
+             dst[1] = src[1];
+             dst[2] = src[2];
+             dst[3] = 1.0f; // lowered by the skirt length in the vertex shader (GL JS `u_ele_delta`)
++            // GL JS `_buildSkirts`: on the globe the outer edge row of a polar tile is the pole itself (a sentinel Y
++            // the vertex shader maps to the pole), not lowered, so the tile is capped up to the pole.
++            if ((side == 0 && northPole) || (side == 1 && southPole)) {
++                dst[1] = static_cast<float>(side == 0 ? util::NORTH_POLE_Y : util::SOUTH_POLE_Y);
++                dst[3] = 0.0f;
++            }
+         }
+     }
+     mesh.vertexCount = n * n + 4 * n;
+@@ -372,7 +381,10 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+             stitch[static_cast<std::size_t>(side)] = std::move(edge);
+         }
+         stitchInfo[tileID] = std::move(stitchNow);
+-        auto mesh = buildTerrainMesh(tileDemFor(canonical, source), updateParameters.terrainExaggeration, stitch);
++        const bool northPole = globeShader && canonical.y == 0;
++        const bool southPole = globeShader && canonical.y + 1 == (1u << canonical.z);
++        auto mesh = buildTerrainMesh(
++            tileDemFor(canonical, source), updateParameters.terrainExaggeration, stitch, northPole, southPole);
+         const auto vertexCount = mesh.vertexCount;
+         const auto indexCount = mesh.indices.size();
+         builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float4);

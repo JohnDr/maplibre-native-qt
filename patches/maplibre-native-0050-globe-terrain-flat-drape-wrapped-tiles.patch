@@ -1,0 +1,46 @@
+diff --git a/src/mln/renderer/layer_tweaker.cpp b/src/mln/renderer/layer_tweaker.cpp
+index 0fbd00a903d7..190b269dfe31 100644
+--- a/src/mln/renderer/layer_tweaker.cpp
++++ b/src/mln/renderer/layer_tweaker.cpp
+@@ -43,7 +43,10 @@ mat4 LayerTweaker::getTileMatrix(const UnwrappedTileID& tileID,
+                                  bool aligned) {
+     // from RenderTile::prepare
+     mat4 tileMatrix;
+-    parameters.state.matrixFor(/*out*/ tileMatrix, tileID);
++    // A terrain drape target covers the canonical tile, whichever world copy (wrap) the source tile belongs to
++    // (GL JS renders the wrapped tile ID).
++    parameters.state.matrixFor(/*out*/ tileMatrix,
++                               parameters.projMatrixOverride ? UnwrappedTileID(0, tileID.canonical) : tileID);
+     if (const auto& origin{drawable.getOrigin()}; origin.has_value()) {
+         matrix::translate(tileMatrix, tileMatrix, origin->x, origin->y, 0);
+     }
+@@ -63,6 +66,12 @@ ProjectionData LayerTweaker::getProjectionData(const UnwrappedTileID& tileID,
+     auto data = parameters.state.getProjectionDataForMatrix(
+         tileID,
+         getTileMatrix(tileID, parameters, translation, anchor, nearClipped, inViewportPixelUnits, drawable, aligned));
++    if (parameters.projMatrixOverride) {
++        // A terrain drape target is flat Mercator whatever the map projection (GL JS draws render-to-texture tiles with
++        // `applyGlobeMatrix: false`): the globe variants of the shaders fall back to the Mercator matrix.
++        data.mainMatrix = data.fallbackMatrix;
++        data.projectionTransition = 0.0;
++    }
+ #if MLN_GLOBE_DEPTH_OFFSET_IN_SHADER
+     // The same per-layer shift `multiplyWithProjectionMatrix` bakes into the Mercator matrix.
+     if (!drawable.getIs3D() && drawable.getEnableDepth()) {
+diff --git a/src/mln/renderer/paint_parameters.cpp b/src/mln/renderer/paint_parameters.cpp
+index eca4e395b868..bf6862e36337 100644
+--- a/src/mln/renderer/paint_parameters.cpp
++++ b/src/mln/renderer/paint_parameters.cpp
+@@ -117,7 +117,11 @@ mat4 PaintParameters::matrixForTile(const UnwrappedTileID& tileID, bool aligned)
+ 
+ ProjectionData PaintParameters::projectionDataForTile(const UnwrappedTileID& tileID, bool aligned) const {
+     if (projMatrixOverride) {
+-        return state.getProjectionData(tileID, *projMatrixOverride);
++        // A terrain drape target is flat Mercator whatever the map projection (see LayerTweaker::getProjectionData).
++        auto data = state.getProjectionData(UnwrappedTileID(0, tileID.canonical), *projMatrixOverride);
++        data.mainMatrix = data.fallbackMatrix;
++        data.projectionTransition = 0.0;
++        return data;
+     }
+     return state.getProjectionData(tileID, aligned ? transformParams.alignedProjMatrix : transformParams.projMatrix);
+ }
