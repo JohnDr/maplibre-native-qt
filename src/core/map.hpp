@@ -259,6 +259,8 @@ public slots:
 signals:
     void needsRendering();
     void mapChanged(Map::MapChange);
+    // A frame finished: the CPU time spent encoding and rendering it, in milliseconds.
+    void frameRendered(double encodingMs, double renderingMs);
     void mapLoadingFailed(Map::MapLoadingFailure, const QString &reason);
     void copyrightsChanged(const QString &copyrightsHtml);
 

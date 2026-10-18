@@ -1,0 +1,505 @@
+diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
+index 79815a19ce10..f5df8e6381c6 100644
+--- a/include/mln/shaders/vulkan/terrain.hpp
++++ b/include/mln/shaders/vulkan/terrain.hpp
+@@ -84,12 +84,8 @@ layout(set = DRAWABLE_IMAGE_SET_INDEX, binding = 0) uniform sampler2D drapeSampl
+ layout(location = 0) out vec4 out_color;
+ 
+ void main() {
+-    // Per-tile drape: this tile's own texture, drawn as is (GL JS draws the render-to-texture result directly). Where
+-    // no draping layer was rendered (alpha 0, e.g. before imagery loads or a hillshade-only style over flat ground)
+-    // fall back to a flat tint so the surface is not see-through.
+-    const vec4 draped = texture(drapeSampler, v_uv);
+-    const vec3 tint = vec3(0.86, 0.83, 0.72);
+-    vec4 surface = vec4(draped.a < 0.5 ? tint : draped.rgb, 1.0);
++    // Per-tile drape: this tile's own texture, drawn as is (GL JS terrain.fragment.glsl: `fragColor = surface_color`).
++    vec4 surface = texture(drapeSampler, v_uv);
+ 
+     // GL JS terrain.fragment.glsl: blend the surface towards the fog / horizon colour with distance, in linear colour.
+     const float ground_blend = fog.params.x;
+diff --git a/src/mln/map/map_impl.cpp b/src/mln/map/map_impl.cpp
+index 25ddf4b0b773..62a08898a937 100644
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -172,6 +172,7 @@ void Map::Impl::onUpdate() {
+             if (const Tileset* resolved = resolvedTerrainTileset(static_cast<style::TileSource*>(source))) {
+                 params.terrainTileset = *resolved;
+                 params.terrainExaggeration = terrain->getExaggeration();
++                params.terrainTileSize = static_cast<style::TileSource*>(source)->impl().getTileSize();
+             }
+         }
+     }
+@@ -188,7 +189,11 @@ std::optional<double> Map::Impl::terrainElevationAt(const LatLng& latLng) {
+         return std::nullopt;
+     }
+     constexpr uint8_t coarseZoom = 9; // answers quickly while the fine tile is still loading
+-    return terrainElevation->sampleElevation(latLng.wrapped(), terrainDemZoom, std::min(coarseZoom, terrainDemZoom));
++    // The DEM zoom the terrain mesh samples at this map zoom (GL JS `TerrainTileManager#getSourceTile`).
++    const auto source = terrainElevation->sourceTileFor(
++        CanonicalTileID(TerrainTileManager::terrainZoomFor(transform.getZoom(), terrainTileSize), 0, 0));
++    const uint8_t demZoom = source ? source->z : 0;
++    return terrainElevation->sampleElevation(latLng.wrapped(), demZoom, std::min(coarseZoom, demZoom));
+ }
+ 
+ void Map::Impl::updateTerrainCamera() {
+@@ -203,6 +208,7 @@ void Map::Impl::updateTerrainCamera() {
+                 if (resolved != nullptr) {
+                     tileset = resolved;
+                     exaggeration = terrain->getExaggeration();
++                    terrainTileSize = static_cast<style::TileSource*>(source)->impl().getTileSize();
+                 }
+             }
+         }
+@@ -225,7 +231,6 @@ void Map::Impl::updateTerrainCamera() {
+         terrainElevation->setTileset(*tileset);
+     }
+     terrainElevationExaggeration = exaggeration;
+-    terrainDemZoom = std::min<uint8_t>(tileset->zoomRange.max, 14);
+ 
+     // While the DEM under the centre is still loading, leave the camera alone rather than snap it to sea level.
+     const auto centreElevation = terrainElevationAt(transform.getLatLng());
+diff --git a/src/mln/map/map_impl.hpp b/src/mln/map/map_impl.hpp
+index b70ff12cdce8..b60fb1180f21 100644
+--- a/src/mln/map/map_impl.hpp
++++ b/src/mln/map/map_impl.hpp
+@@ -135,7 +135,7 @@ public:
+     // 3D terrain camera: a DEM sampler on this (map) thread, since the renderer's own one is not reachable from here.
+     std::unique_ptr<TerrainTileManager> terrainElevation;
+     double terrainElevationExaggeration = 1.0;
+-    uint8_t terrainDemZoom = 14;
++    uint16_t terrainTileSize = 512; // the terrain source's tile size (sets the terrain tiles' zoom)
+     bool terrainElevationApplied = false;
+ };
+ 
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index f506bde1aa34..ea7cfd5dc957 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -24,6 +24,7 @@
+ #include <mln/renderer/property_evaluation_parameters.hpp>
+ #include <mln/renderer/tile_parameters.hpp>
+ #include <mln/renderer/render_tile.hpp>
++#include <mln/renderer/terrain_tile_manager.hpp>
+ #include <mln/renderer/style_diff.hpp>
+ #include <mln/renderer/query.hpp>
+ #include <mln/renderer/image_manager.hpp>
+@@ -1068,17 +1069,59 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+         // Drape render-target size, per MapLibre GL JS (render_to_texture.ts):
+         //   rttSize = terrainTileManager.tileSize * qualityFactor
+         //   terrainTileManager.tileSize = source.tileSize * 2 (deltaZoom = 1), qualityFactor = 2
+-        // i.e. rttSize = source.tileSize * 4 => 1024 for our 256-px raster sources. We use 512 (2x the
+-        // source, GL JS's terrain tile size) as a first step to bound texture memory until an RTT cache
+-        // like GL JS's exists, since we allocate one target per covered DEM tile with no LRU.
+-        constexpr uint32_t drapeTileSize = 512;
++        // i.e. rttSize = source.tileSize * 4: 1024 for 256-px sources, 2048 for the 512-px DEM sources.
++        constexpr uint32_t qualityFactor = 2;
++        const uint32_t drapeTileSize = static_cast<uint32_t>(updateParameters->terrainTileSize) *
++                                       (1u << TerrainTileManager::deltaZoom) * qualityFactor;
++        if (drapeTileSize != terrainDrapeTileSize) {
++            terrainDrapeTileSize = drapeTileSize;
++            terrainDrapeTargets.clear();
++            terrainDrapeFingerprints.clear();
++        }
+         const auto& cover = terrainPass.getCover();
+-        const uint64_t fingerprint = (reinterpret_cast<uintptr_t>(updateParameters->layers.get()) * 1000003ULL) ^
+-                                     (reinterpret_cast<uintptr_t>(updateParameters->sources.get()) * 1000033ULL) ^
+-                                     (reinterpret_cast<uintptr_t>(updateParameters->images.get()) * 1000037ULL) ^
+-                                     (static_cast<uint64_t>(terrainDrapeZoom) << 32) ^
+-                                     (static_cast<uint64_t>(layerGroupsByLayerIndex.size()) << 20) ^
+-                                     (static_cast<uint64_t>(drapeLayerIndices.size()) << 8) ^ drapeGeneration;
++
++        // A drape tile's fingerprint is GL JS's `RTTFingerprint`: the style (layers, sources, images), and the source
++        // tiles drawn into it with their data revision. It is re-rendered only when that changes, not on every
++        // source tile load anywhere in the view.
++        const uint64_t styleFingerprint = (reinterpret_cast<uintptr_t>(updateParameters->layers.get()) * 1000003ULL) ^
++                                          (reinterpret_cast<uintptr_t>(updateParameters->sources.get()) * 1000033ULL) ^
++                                          (reinterpret_cast<uintptr_t>(updateParameters->images.get()) * 1000037ULL) ^
++                                          (static_cast<uint64_t>(layerGroupsByLayerIndex.size()) << 20) ^
++                                          (static_cast<uint64_t>(drapeLayerIndices.size()) << 8);
++        std::vector<std::pair<int32_t, std::set<std::tuple<uint8_t, uint32_t, uint32_t>>>> drapeGroupTiles;
++        for (const auto& [index, layerGroup] : layerGroupsByLayerIndex) {
++            if (!layerGroup || !drapeLayerIndices.contains(index)) {
++                continue;
++            }
++            auto& tilesOfGroup = drapeGroupTiles.emplace_back(index, std::set<std::tuple<uint8_t, uint32_t, uint32_t>>{});
++            visitLayerGroupDrawables(*layerGroup, [&](gfx::Drawable& drawable) {
++                if (const auto& id = drawable.getTileID()) {
++                    tilesOfGroup.second.emplace(id->canonical.z, id->canonical.x, id->canonical.y);
++                }
++            });
++        }
++        const auto sourceTilesFingerprint = [&](const std::tuple<uint8_t, uint32_t, uint32_t>& key) {
++            const auto [kz, kx, ky] = key;
++            uint64_t hash = 1469598103934665603ULL;
++            const auto mix = [&hash](uint64_t value) { hash = (hash ^ value) * 1099511628211ULL; };
++            const auto& styleLayers = *updateParameters->layers;
++            for (const auto& [index, group] : drapeGroupTiles) {
++                mix(static_cast<uint64_t>(index) + 1);
++                const std::string& sourceID = styleLayers[static_cast<std::size_t>(index)]->source;
++                for (const auto& [z, x, y] : group) {
++                    // Overlap: one tile contains the other.
++                    const bool overlaps = z >= kz ? (x >> (z - kz)) == kx && (y >> (z - kz)) == ky
++                                                  : (kx >> (kz - z)) == x && (ky >> (kz - z)) == y;
++                    if (!overlaps) {
++                        continue;
++                    }
++                    const auto revision = drapeTileRevisions.find({sourceID, z, x, y});
++                    mix((static_cast<uint64_t>(z) << 56) ^ (static_cast<uint64_t>(x) << 28) ^ y);
++                    mix(revision != drapeTileRevisions.end() ? revision->second : 0);
++                }
++            }
++            return hash;
++        };
+ 
+         std::map<std::tuple<uint8_t, uint32_t, uint32_t>, gfx::Texture2DPtr> drapeTextures;
+         std::set<std::tuple<uint8_t, uint32_t, uint32_t>> live;
+@@ -1104,6 +1147,7 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+             }
+             drapeTextures[key] = it->second->getTexture();
+             // Re-render only tiles that are new or whose source state changed.
++            const uint64_t fingerprint = styleFingerprint ^ sourceTilesFingerprint(key);
+             const auto fpIt = terrainDrapeFingerprints.find(key);
+             if (fpIt == terrainDrapeFingerprints.end() || fpIt->second != fingerprint) {
+                 drapeTilesToRender.insert(key);
+@@ -1239,11 +1283,11 @@ void RenderOrchestrator::onTileError(RenderSource& source, const OverscaledTileI
+     observer->onResourceError(error);
+ }
+ 
+-void RenderOrchestrator::onTileChanged(RenderSource&, const OverscaledTileID&) {
++void RenderOrchestrator::onTileChanged(RenderSource& source, const OverscaledTileID& tileID) {
+     MLN_TRACE_FUNC();
+ 
+-    // A source tile changed: the drape textures may be stale.
+-    ++drapeGeneration;
++    // A source tile changed: the drape tiles it lies under are stale (their fingerprints include this revision).
++    ++drapeTileRevisions[{source.baseImpl->id, tileID.canonical.z, tileID.canonical.x, tileID.canonical.y}];
+     observer->onInvalidate();
+ }
+ 
+diff --git a/src/mln/renderer/render_orchestrator.hpp b/src/mln/renderer/render_orchestrator.hpp
+index 6ba30e9e11b7..239e08362def 100644
+--- a/src/mln/renderer/render_orchestrator.hpp
++++ b/src/mln/renderer/render_orchestrator.hpp
+@@ -281,12 +281,14 @@ private:
+ 
+     // Per-tile offscreen targets holding the map layers draped over the terrain, keyed by tile (z, x, y).
+     std::map<std::tuple<uint8_t, uint32_t, uint32_t>, RenderTargetPtr> terrainDrapeTargets;
+-    std::uint8_t terrainDrapeZoom = 0;
+-    // Per-tile fingerprint of the state the drape texture was rendered from; a tile is re-rendered only when it
+-    // changes (style/source/image identity, zoom) or a source tile changed (`drapeGeneration`).
++    uint32_t terrainDrapeTileSize = 0;
++    // Per-tile fingerprint of the state the drape texture was rendered from (GL JS `RTTFingerprint`): the style
++    // identity and the source tiles under the drape tile with their revisions. A tile is re-rendered only when it
++    // changes.
+     std::map<std::tuple<uint8_t, uint32_t, uint32_t>, uint64_t> terrainDrapeFingerprints;
+     std::set<std::tuple<uint8_t, uint32_t, uint32_t>> drapeTilesToRender;
+-    uint64_t drapeGeneration = 0;
++    // How often each source tile's data changed, keyed by (source id, tile z, x, y).
++    std::map<std::tuple<std::string, uint8_t, uint32_t, uint32_t>, uint64_t> drapeTileRevisions;
+     // Style layer indices rendered into the drape (background/fill/line/raster/hillshade/color-relief).
+     std::set<int32_t> drapeLayerIndices;
+     RenderItem::DebugLayerGroupMap debugLayerGroups;
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index 8557ed05f1c2..3a99413fc259 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -46,13 +46,14 @@ struct TerrainMesh {
+     std::vector<uint16_t> indices;
+ };
+ 
+-/// Builds a grid over one DEM tile: xy in tile units (0..EXTENT), z the elevation in metres (the camera's
+-/// world-to-camera matrix scales z by pixels-per-metre, like every 3D layer). The relief shading comes from the draped
+-/// hillshade layer, as in GL JS; the mesh carries none.
+-TerrainMesh buildTerrainMesh(const DEMData* dem, double exaggeration, const CanonicalTileID& tile) {
++/// Builds a grid over one terrain tile: xy in tile units (0..EXTENT), z the elevation in metres (the camera's
++/// world-to-camera matrix scales z by pixels-per-metre, like every 3D layer). The terrain tile covers the square
++/// `size` DEM pixels wide at (`offsetX`, `offsetY`) of its DEM tile (GL JS samples a sub-rectangle of the coarser DEM
++/// tile the same way). The relief shading comes from the draped hillshade layer, as in GL JS; the mesh carries none.
++TerrainMesh buildTerrainMesh(
++    const DEMData* dem, double offsetX, double offsetY, double size, double exaggeration, const CanonicalTileID& tile) {
+     // A null `dem` is a tile the source does not have (open sea): flat at sea level, as GL JS treats missing DEM.
+     const std::size_t n = TerrainGridPoints;
+-    const double dim = dem != nullptr ? static_cast<double>(dem->dim) : 256.0;
+     // Ground width of this tile at its own latitude.
+     const double tilesAcross = static_cast<double>(1ull << tile.z);
+     const double tileLat = std::atan(std::sinh(std::numbers::pi * (1.0 - 2.0 * (tile.y + 0.5) / tilesAcross)));
+@@ -64,7 +65,7 @@ TerrainMesh buildTerrainMesh(const DEMData* dem, double exaggeration, const Cano
+         for (std::size_t i = 0; i < n; i++) {
+             const double u = static_cast<double>(i) / static_cast<double>(TerrainGridSegments);
+             const double v = static_cast<double>(j) / static_cast<double>(TerrainGridSegments);
+-            elevation[j * n + i] = dem != nullptr ? dem->getElevation(u * dim, v * dim) : 0.0;
++            elevation[j * n + i] = dem != nullptr ? dem->getElevation(offsetX + u * size, offsetY + v * size) : 0.0;
+         }
+     }
+ 
+@@ -150,8 +151,9 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         return;
+     }
+ 
+-    if (!tileset || *tileset != *updateParameters.terrainTileset) {
++    if (!tileset || *tileset != *updateParameters.terrainTileset || tileSize != updateParameters.terrainTileSize) {
+         tileset = updateParameters.terrainTileset;
++        tileSize = updateParameters.terrainTileSize;
+         terrain = std::make_shared<TerrainTileManager>(updateParameters.fileSource.get(), *tileset);
+         terrain->setOnTileLoaded(onTileLoaded);
+         if (layerGroup) {
+@@ -179,15 +181,16 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         layerGroup = context.createTileLayerGroup(0, initialCapacity, "terrain");
+     }
+ 
+-    // A neighbour's DEM border changed these tiles' edges: rebuild their meshes so shared edges agree.
++    // A DEM tile loaded, or a neighbour's DEM border changed its edges: rebuild the meshes sampling it, so they use
++    // the finer tile and shared edges agree.
+     for (const auto& updated : terrain->takeUpdatedTiles()) {
+         layerGroup->removeDrawablesIf([&](gfx::Drawable& drawable) {
+-            return drawable.getTileID() && drawable.getTileID()->canonical == updated;
++            return drawable.getTileID() && terrain->sourceTileFor(drawable.getTileID()->canonical) == updated;
+         });
+     }
+ 
+     const double zoom = state.getZoom();
+-    const auto newDemZoom = static_cast<uint8_t>(std::clamp(std::floor(zoom) + 2.0, 0.0, 14.0));
++    const uint8_t newDemZoom = TerrainTileManager::terrainZoomFor(zoom, tileSize);
+     if (newDemZoom != demZoom || builtZoom < 0 ||
+         builtExaggeration != updateParameters.terrainExaggeration) {
+         demZoom = newDemZoom;
+@@ -211,7 +214,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+                                       .tileLodMode = updateParameters.tileLodMode,
+                                       .terrainVariableZoom = true},
+                                      demZoom,
+-                                     Range<uint8_t>(0, demZoom));
++                                     Range<uint8_t>(0, TerrainTileManager::maxTerrainZoom));
+     // Backstop only: the LOD cover is a few dozen tiles. It is sorted nearest the centre first.
+     constexpr std::size_t maxTerrainTiles = 192;
+     if (tileCover.size() > maxTerrainTiles) {
+@@ -230,8 +233,8 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+             continue;
+         }
+         const auto& canonical = tileID.canonical;
+-        const auto data = terrain->getTileData(canonical);
+-        if (!data && !terrain->isMissing(canonical)) {
++        const auto source = terrain->getSourceTile(canonical);
++        if (!source && !terrain->isMissing(canonical)) {
+             continue; // still loading
+         }
+ 
+@@ -248,7 +251,23 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+             builder->setVertexAttrId(shaders::idTerrainPosVertexAttribute);
+         }
+ 
+-        auto mesh = buildTerrainMesh(data.get(), updateParameters.terrainExaggeration, canonical);
++        // The terrain tile is a square of the (coarser) DEM tile it samples, as GL JS's DEM matrix selects.
++        double offsetX = 0.0;
++        double offsetY = 0.0;
++        double sampleSize = 0.0;
++        if (source) {
++            const int shift = canonical.z - source->id.z;
++            const double dim = static_cast<double>(source->data->dim);
++            sampleSize = dim / static_cast<double>(1ull << shift);
++            offsetX = static_cast<double>(canonical.x - (source->id.x << shift)) * sampleSize;
++            offsetY = static_cast<double>(canonical.y - (source->id.y << shift)) * sampleSize;
++        }
++        auto mesh = buildTerrainMesh(source ? source->data.get() : nullptr,
++                                     offsetX,
++                                     offsetY,
++                                     sampleSize,
++                                     updateParameters.terrainExaggeration,
++                                     canonical);
+         const auto vertexCount = mesh.vertexCount;
+         const auto indexCount = mesh.indices.size();
+         builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float3);
+@@ -379,7 +398,8 @@ std::function<float(const UnwrappedTileID&)> TerrainPass::elevationFunction(cons
+     TerrainTileManager* manager = terrain.get();
+     const double scale = state.getScale();
+     const double worldSize = Projection::worldSize(scale);
+-    const uint8_t zoom = demZoom;
++    const auto sourceTile = terrain->sourceTileFor(CanonicalTileID(demZoom, 0, 0));
++    const uint8_t zoom = sourceTile ? sourceTile->z : 0; // the DEM zoom the mesh samples
+     // Metres, like the terrain mesh: the camera matrix scales z by pixels-per-metre.
+     return [manager, scale, worldSize, zoom, exaggeration](const UnwrappedTileID& tileID) -> float {
+         const double n = std::ldexp(1.0, tileID.canonical.z);
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index f085f307a3bf..89403a5e3902 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -66,7 +66,8 @@ private:
+     std::shared_ptr<TerrainTileManager> terrain;
+     std::optional<Tileset> tileset;
+     std::function<void()> onTileLoaded;
+-    uint8_t demZoom = 0;
++    uint8_t demZoom = 0; // the terrain tile cover zoom (its DEM tiles are one zoom coarser, GL JS deltaZoom)
++    uint16_t tileSize = 512;
+     double builtZoom = -1;
+     double builtExaggeration = -1;
+ };
+diff --git a/src/mln/renderer/terrain_tile_manager.cpp b/src/mln/renderer/terrain_tile_manager.cpp
+index dcccd24f404b..87446db23198 100644
+--- a/src/mln/renderer/terrain_tile_manager.cpp
++++ b/src/mln/renderer/terrain_tile_manager.cpp
+@@ -9,6 +9,7 @@
+ #include <mln/util/constants.hpp>
+ #include <mln/util/image.hpp>
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <stdexcept>
+ 
+@@ -93,10 +94,50 @@ std::optional<double> TerrainTileManager::sampleElevation(const LatLng& latLng,
+     return stillLoading ? std::nullopt : std::optional<double>(0.0);
+ }
+ 
++uint8_t TerrainTileManager::terrainZoomFor(double mapZoom, uint16_t sourceTileSize) {
++    const double terrainTileSize = static_cast<double>(sourceTileSize) * static_cast<double>(1u << deltaZoom);
++    const double desired = std::floor(mapZoom + std::log2(512.0 / terrainTileSize));
++    return static_cast<uint8_t>(std::clamp(desired, 0.0, static_cast<double>(maxTerrainZoom)));
++}
++
++std::optional<CanonicalTileID> TerrainTileManager::sourceTileFor(const CanonicalTileID& terrainTile) const {
++    int z = static_cast<int>(terrainTile.z) - deltaZoom;
++    z = std::min<int>(z, tileset.zoomRange.max);
++    if (z < static_cast<int>(tileset.zoomRange.min) || z < 0) {
++        return std::nullopt;
++    }
++    const int shift = terrainTile.z - z;
++    return CanonicalTileID(static_cast<uint8_t>(z), terrainTile.x >> shift, terrainTile.y >> shift);
++}
++
++std::optional<TerrainTileManager::SourceTile> TerrainTileManager::getSourceTile(const CanonicalTileID& terrainTile) {
++    const auto source = sourceTileFor(terrainTile);
++    if (!source) {
++        return std::nullopt;
++    }
++    if (auto data = getDEMData(*source)) {
++        return SourceTile{std::move(data), *source};
++    }
++    // Still loading: use the nearest loaded ancestor meanwhile.
++    for (int z = static_cast<int>(source->z) - 1; z >= static_cast<int>(tileset.zoomRange.min) && z >= 0; --z) {
++        const int shift = source->z - z;
++        const CanonicalTileID id(static_cast<uint8_t>(z), source->x >> shift, source->y >> shift);
++        const auto it = tiles.find(keyFor(id));
++        if (it != tiles.end() && it->second.data) {
++            return SourceTile{it->second.data, id};
++        }
++    }
++    return std::nullopt;
++}
++
+ std::optional<std::pair<double, double>> TerrainTileManager::getMinMaxElevation(const CanonicalTileID& id) const {
+-    for (int z = id.z; z >= 0; --z) {
+-        const int shift = id.z - z;
+-        const auto it = tiles.find(keyFor(CanonicalTileID(static_cast<uint8_t>(z), id.x >> shift, id.y >> shift)));
++    const auto source = sourceTileFor(id);
++    if (!source) {
++        return std::nullopt;
++    }
++    for (int z = source->z; z >= 0; --z) {
++        const int shift = source->z - z;
++        const auto it = tiles.find(keyFor(CanonicalTileID(static_cast<uint8_t>(z), source->x >> shift, source->y >> shift)));
+         if (it != tiles.end() && it->second.data) {
+             return std::make_pair(it->second.data->minElevation, it->second.data->maxElevation);
+         }
+diff --git a/src/mln/renderer/terrain_tile_manager.hpp b/src/mln/renderer/terrain_tile_manager.hpp
+index c37bcce285cb..464bc17f6364 100644
+--- a/src/mln/renderer/terrain_tile_manager.hpp
++++ b/src/mln/renderer/terrain_tile_manager.hpp
+@@ -45,17 +45,44 @@ public:
+     /// flat and the result is 0 metres.
+     std::optional<double> sampleElevation(const LatLng& latLng, uint8_t zoom, uint8_t fallbackZoom);
+ 
++    /// GL JS `TerrainTileManager#deltaZoom`: the DEM tile of a terrain tile is one zoom level coarser, so the terrain
++    /// mesh and drape are denser than the DEM they sample (a terrain tile covers a quadrant of its DEM tile).
++    static constexpr uint8_t deltaZoom = 1;
++
++    /// GL JS `Terrain` tile cover zoom: `coveringTiles` with tile size `source tile size * 2^deltaZoom` and a
++    /// 512-pixel transform tile size, so `floor(zoom + log2(512 / (sourceTileSize * 2)))`, at most `maxTerrainZoom`.
++    static uint8_t terrainZoomFor(double mapZoom, uint16_t sourceTileSize);
++    static constexpr uint8_t maxTerrainZoom = 22;
++
++    /// The DEM source tile a terrain tile samples: `z - deltaZoom`, capped at the source's maximum zoom (GL JS
++    /// `getSourceTile`). Nullopt where the source has no tile (below its minimum zoom).
++    std::optional<CanonicalTileID> sourceTileFor(const CanonicalTileID& terrainTile) const;
++
++    /// A DEM tile a terrain tile samples, and where the terrain tile lies in it.
++    struct SourceTile {
++        std::shared_ptr<DEMData> data;
++        CanonicalTileID id;
++    };
++
++    /// The loaded DEM tile for a terrain tile (GL JS `getSourceTile(tileID, searchForDEM)`): the tile `sourceTileFor`
++    /// names, else, while that is loading, the nearest loaded ancestor. Requests the tile. Nullopt while nothing has
++    /// loaded.
++    std::optional<SourceTile> getSourceTile(const CanonicalTileID& terrainTile);
++
+     /// The elevation range (metres) of the terrain in tile `id`: GL JS `Terrain#getMinMaxElevation`. Uses the loaded DEM
+-    /// tile at `id`'s zoom, else the nearest loaded ancestor; nullopt when none has loaded. Never requests a tile.
++    /// tile of `id`, else the nearest loaded ancestor; nullopt when none has loaded. Never requests a tile.
+     std::optional<std::pair<double, double>> getMinMaxElevation(const CanonicalTileID& id) const;
+ 
+     /// Requests the DEM tile at `zoom` that contains `id` (a no-op when `id` is coarser), so that a coarse elevation
+     /// range exists for the tile cover to use while the fine tiles are still unknown.
+     void requestAncestor(const CanonicalTileID& id, uint8_t zoom);
+ 
+-    /// The tile's request failed or returned no data recently (a source without tiles over open sea): the terrain there
+-    /// is flat. False while it is loading and once it has loaded.
+-    bool isMissing(const CanonicalTileID& id) const { return isFailed(id); }
++    /// The terrain tile's DEM tile request failed or returned no data recently (a source without tiles over open sea),
++    /// or the source has none: the terrain there is flat. False while it is loading and once it has loaded.
++    bool isMissing(const CanonicalTileID& terrainTile) const {
++        const auto source = sourceTileFor(terrainTile);
++        return !source || isFailed(*source);
++    }
+ 
+     /// Tiles whose DEM border was changed by a neighbour's data since the last call (their meshes must be rebuilt so
+     /// shared edges agree; GL JS `DEMData#backfillBorder`).
+@@ -64,9 +91,6 @@ public:
+     /// Whether any DEM tile has been loaded.
+     bool hasData() const;
+ 
+-    /// The DEM data for a tile, requesting it when necessary. Null until it has loaded.
+-    std::shared_ptr<DEMData> getTileData(const CanonicalTileID& id) { return getDEMData(id); }
+-
+     /// Called when a tile finishes loading, so the map can schedule a repaint.
+     void setOnTileLoaded(std::function<void()> callback) { onTileLoaded = std::move(callback); }
+ 
+diff --git a/src/mln/renderer/update_parameters.hpp b/src/mln/renderer/update_parameters.hpp
+index 57ce4d7142ff..dfc64d44d19e 100644
+--- a/src/mln/renderer/update_parameters.hpp
++++ b/src/mln/renderer/update_parameters.hpp
+@@ -66,6 +66,8 @@ public:
+     // CFID: 3D terrain. When the tileset is set, the terrain pass fetches this raster-dem source and drapes it.
+     std::optional<Tileset> terrainTileset = std::nullopt;
+     double terrainExaggeration = 1.0;
++    // The terrain source's tile size in pixels; terrain tiles are twice that (GL JS `TerrainTileManager#tileSize`).
++    uint16_t terrainTileSize = 512;
+ 
+     // The style's `sky` (none when the style has no sky).
+     std::optional<Immutable<style::Sky::Impl>> sky = std::nullopt;
+diff --git a/test/renderer/terrain_tile_manager.test.cpp b/test/renderer/terrain_tile_manager.test.cpp
+index fef71ecdfcf9..c0aa777c5091 100644
+--- a/test/renderer/terrain_tile_manager.test.cpp
++++ b/test/renderer/terrain_tile_manager.test.cpp
+@@ -48,3 +48,24 @@ TEST(TerrainTileManager, GetElevationUniform) {
+     EXPECT_DOUBLE_EQ(manager.getElevation({45.0, 10.0}, 12), -10000.0);
+     EXPECT_DOUBLE_EQ(manager.getElevation({-33.0, 151.0}, 10), -10000.0);
+ }
++
++TEST(TerrainTileManager, TerrainZoomFollowsGLJS) {
++    // GL JS: coveringTiles with tileSize = source.tileSize * 2 on a 512-px transform => floor(zoom + log2(512 / that)).
++    EXPECT_EQ(TerrainTileManager::terrainZoomFor(13.3, 512), 12);
++    EXPECT_EQ(TerrainTileManager::terrainZoomFor(14.5, 512), 13);
++    EXPECT_EQ(TerrainTileManager::terrainZoomFor(13.3, 256), 13); // 256-px sources: terrain tiles are 512 px
++    EXPECT_EQ(TerrainTileManager::terrainZoomFor(0.4, 512), 0);
++    EXPECT_EQ(TerrainTileManager::terrainZoomFor(40.0, 256), TerrainTileManager::maxTerrainZoom);
++}
++
++TEST(TerrainTileManager, SourceTileIsOneZoomCoarserAndCapped) {
++    Tileset tileset;
++    tileset.zoomRange = {1, 12};
++    TerrainTileManager manager(nullptr, tileset);
++    // deltaZoom 1: the terrain tile (z, x, y) samples the DEM tile (z - 1, x / 2, y / 2).
++    EXPECT_TRUE(manager.sourceTileFor({10, 5, 7}) == CanonicalTileID(9, 2, 3));
++    // Capped at the source's maximum zoom (the DEM is then overzoomed).
++    EXPECT_TRUE(manager.sourceTileFor({16, 100, 200}) == CanonicalTileID(12, 100 >> 4, 200 >> 4));
++    // Below the source's minimum zoom there is none.
++    EXPECT_FALSE(manager.sourceTileFor({1, 0, 0}).has_value());
++}

@@ -102,6 +102,11 @@ public:
     Q_INVOKABLE void flyTo(const QVariantMap &camera, const QVariantMap &animation = QVariantMap());
     // Terrain height in metres at a position, without exaggeration; NaN while its elevation tile is loading.
     Q_INVOKABLE double terrainElevation(double latitude, double longitude) const;
+    // Number of frames the map has rendered since creation (for a frames-per-second readout).
+    Q_INVOKABLE int renderedFrames() const;
+    // Average CPU time (encoding + rendering) per rendered frame in milliseconds since the previous call; NaN if no
+    // frame was rendered since then.
+    Q_INVOKABLE double averageFrameTimeMs();
     // Camera centre and camera altitude in metres above sea level.
     Q_INVOKABLE double elevation() const;
     Q_INVOKABLE double cameraAltitude() const;
@@ -118,6 +123,10 @@ signals:
     void backgroundColorChanged();
     void terrainChanged();
     void skyChanged();
+    // The map finished loading (style, sprites) / became fully rendered (nothing left to load or draw): the
+    // equivalents of MapLibre GL JS' `load` and `idle` events. Emitted every time, not only the first.
+    void mapLoaded();
+    void mapIdle();
 
 protected:
     void componentComplete() override;

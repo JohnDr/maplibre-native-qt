@@ -42,6 +42,7 @@ public:
 
 signals:
     void mapChanged(Map::MapChange);
+    void frameRendered(double encodingMs, double renderingMs);
     void mapLoadingFailed(Map::MapLoadingFailure, const QString &reason);
     void copyrightsChanged(const QString &copyrightsHtml);
 

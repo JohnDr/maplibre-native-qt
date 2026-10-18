@@ -76,6 +76,7 @@ void MapObserver::onWillStartRenderingFrame() {
 }
 
 void MapObserver::onDidFinishRenderingFrame(const mln::MapObserver::RenderFrameStatus &status) {
+    emit frameRendered(status.renderingStats.encodingTime * 1000.0, status.renderingStats.renderingTime * 1000.0);
     if (status.mode == mln::MapObserver::RenderMode::Partial) {
         emit mapChanged(Map::MapChangeDidFinishRenderingFrame);
     } else {

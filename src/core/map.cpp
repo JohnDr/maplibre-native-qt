@@ -1944,6 +1944,7 @@ MapPrivate::MapPrivate(Map *map, const Settings &settings, const QSize &size, qr
     qRegisterMetaType<Map::MapChange>("Map::MapChange");
 
     connect(m_mapObserver.get(), &MapObserver::mapChanged, map, &Map::mapChanged);
+    connect(m_mapObserver.get(), &MapObserver::frameRendered, map, &Map::frameRendered);
     connect(m_mapObserver.get(), &MapObserver::mapLoadingFailed, map, &Map::mapLoadingFailed);
     connect(m_mapObserver.get(), &MapObserver::copyrightsChanged, map, &Map::copyrightsChanged);
 

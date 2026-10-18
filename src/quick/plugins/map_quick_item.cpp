@@ -568,8 +568,28 @@ void MapQuickItem::initialize() {
     d->initialize();
 }
 
+double MapQuickItem::averageFrameTimeMs() {
+    Q_D(MapQuickItem);
+
+    const double average = d->m_frameTimeCount > 0 ? d->m_frameTimeSumMs / d->m_frameTimeCount
+                                                   : std::numeric_limits<double>::quiet_NaN();
+    d->m_frameTimeSumMs = 0.0;
+    d->m_frameTimeCount = 0;
+    return average;
+}
+
+int MapQuickItem::renderedFrames() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_renderedFrames;
+}
+
 void MapQuickItem::onMapChanged(Map::MapChange change) {
     Q_D(MapQuickItem);
+
+    if (change == Map::MapChangeDidFinishRenderingFrameFullyRendered) {
+        ++d->m_renderedFrames;
+    }
 
     if (change == Map::MapChangeDidFinishLoadingStyle || change == Map::MapChangeDidFailLoadingMap) {
         if (!d->m_styleLoaded) {
@@ -598,7 +618,11 @@ void MapQuickItem::onMapChanged(Map::MapChange change) {
     } else if (change == Map::MapChangeDidFinishLoadingMap) {
         // TODO: make it more elegant
         QTimer::singleShot(intervalTime, this, &QQuickItem::update);
+        emit mapLoaded();
+    } else if (change == Map::MapChangeDidFinishRenderingMapFullyRendered) {
+        emit mapIdle();
     } else if (change == Map::MapChangeDidFinishRenderingFrame) {
+        ++d->m_renderedFrames;
         // The map rendered a partial frame (e.g. tiles arriving after the initial load). Rendering is
         // driven by Qt scene-graph repaints, so without scheduling another update the freshly rendered
         // frame is never shown until some other input forces a repaint. Keep repainting until the map
@@ -677,6 +701,10 @@ void MapQuickItemPrivate::initialize() {
     // the cache, emits MapChangeDidFinishLoadingStyle with nothing listening and the event is lost.
     QObject::connect(m_map.get(), &Map::needsRendering, q, &QQuickItem::update);
     QObject::connect(m_map.get(), &Map::mapChanged, q, &MapQuickItem::onMapChanged);
+    QObject::connect(m_map.get(), &Map::frameRendered, q, [this](double encodingMs, double renderingMs) {
+        m_frameTimeSumMs += encodingMs + renderingMs;
+        ++m_frameTimeCount;
+    });
 
     m_map->setProjectionType(projectionFromMapQuickItem(m_projectionType));
 

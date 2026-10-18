@@ -1,0 +1,300 @@
+diff --git a/include/mln/renderer/layer_tweaker.hpp b/include/mln/renderer/layer_tweaker.hpp
+index 95805acc4934..ead1ba688332 100644
+--- a/include/mln/renderer/layer_tweaker.hpp
++++ b/include/mln/renderer/layer_tweaker.hpp
+@@ -89,6 +89,25 @@ protected:
+                               std::uint32_t baseElement = 0,
+                               std::uint32_t totalElements = 0);
+     gfx::UniformBufferPtr projectionUniformBuffer;
++
++    /// Block layout of a layer's consolidated UBO arrays when it is drawn into terrain drape targets. All drape
++    /// targets are recorded into one command buffer and each has its own projection, so every target needs its own
++    /// block of `drawableCount` elements, selected per draw through `uboIndex`. Block 0 is the normal (non-drape)
++    /// pass, drape target `ordinal` uses block `ordinal + 1`. Without draping `base` is 0 and `total` is
++    /// `drawableCount`.
++    struct DrapeUBOWindow {
++        std::uint32_t base = 0;
++        std::uint32_t total = 0;
++    };
++    static DrapeUBOWindow drapeUBOWindow(const PaintParameters&, std::size_t drawableCount);
++
++    /// Write `count` elements of `elementSize` bytes at the window's block, sizing the buffer for all blocks.
++    static void updateWindowedBuffer(gfx::UniformBufferPtr&,
++                                     gfx::Context&,
++                                     const void* data,
++                                     std::size_t elementSize,
++                                     std::size_t count,
++                                     const DrapeUBOWindow&);
+ #endif
+ 
+     /// Multiplies with the projection matrix (either default, near clipped or aligned) for the given drawable
+diff --git a/src/mln/renderer/layer_tweaker.cpp b/src/mln/renderer/layer_tweaker.cpp
+index 364754a90e0f..0fbd00a903d7 100644
+--- a/src/mln/renderer/layer_tweaker.cpp
++++ b/src/mln/renderer/layer_tweaker.cpp
+@@ -113,6 +113,32 @@ void LayerTweaker::uploadProjectionUBOs(gfx::UniformBufferArray& layerUniforms,
+ }
+ #endif
+ 
++#if MLN_UBO_CONSOLIDATION
++LayerTweaker::DrapeUBOWindow LayerTweaker::drapeUBOWindow(const PaintParameters& parameters,
++                                                          std::size_t drawableCount) {
++    const auto dc = static_cast<std::uint32_t>(drawableCount);
++    DrapeUBOWindow window;
++    window.base = parameters.drapeTargetOrdinal >= 0 ? (static_cast<std::uint32_t>(parameters.drapeTargetOrdinal) + 1u) * dc
++                                                     : 0u;
++    window.total = parameters.drapeTargetCount > 0 ? (parameters.drapeTargetCount + 1u) * dc : dc;
++    return window;
++}
++
++void LayerTweaker::updateWindowedBuffer(gfx::UniformBufferPtr& buffer,
++                                        gfx::Context& context,
++                                        const void* data,
++                                        std::size_t elementSize,
++                                        std::size_t count,
++                                        const DrapeUBOWindow& window) {
++    const std::size_t totalBytes = elementSize * std::max<std::size_t>(window.total, window.base + count);
++    if (!buffer || buffer->getSize() < totalBytes) {
++        std::vector<std::uint8_t> initial(totalBytes, 0);
++        buffer = context.createUniformBuffer(initial.data(), totalBytes, false, true);
++    }
++    buffer->update(data, elementSize * count, elementSize * window.base);
++}
++#endif
++
+ void LayerTweaker::updateProperties(Immutable<style::LayerProperties> newProps) {
+     evaluatedProperties = std::move(newProps);
+     propertiesUpdated = true;
+diff --git a/src/mln/renderer/layers/background_layer_tweaker.cpp b/src/mln/renderer/layers/background_layer_tweaker.cpp
+index a1f9af183157..a32ffe1e8a41 100644
+--- a/src/mln/renderer/layers/background_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/background_layer_tweaker.cpp
+@@ -71,6 +71,7 @@ void BackgroundLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPara
+ 
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
++    const auto drapeWindow = drapeUBOWindow(parameters, layerGroup.getDrawableCount());
+     std::vector<BackgroundDrawableUnionUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+ #endif
+@@ -142,21 +143,15 @@ void BackgroundLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPara
+         }
+ 
+ #if MLN_UBO_CONSOLIDATION
+-        drawable.setUBOIndex(i++);
++        drawable.setUBOIndex(static_cast<int32_t>(drapeWindow.base + static_cast<std::uint32_t>(i++)));
+ #endif
+     });
+ 
+ #if MLN_UBO_CONSOLIDATION
+-    const size_t drawableUBOVectorSize = sizeof(BackgroundDrawableUnionUBO) * drawableUBOVector.size();
+-    if (!drawableUniformBuffer || drawableUniformBuffer->getSize() < drawableUBOVectorSize) {
+-        drawableUniformBuffer = context.createUniformBuffer(
+-            drawableUBOVector.data(), drawableUBOVectorSize, false, true);
+-    } else {
+-        drawableUniformBuffer->update(drawableUBOVector.data(), drawableUBOVectorSize);
+-    }
++    updateWindowedBuffer(drawableUniformBuffer, context, drawableUBOVector.data(), sizeof(BackgroundDrawableUnionUBO), drawableUBOVector.size(), drapeWindow);
+ 
+     layerUniforms.set(idBackgroundDrawableUBO, drawableUniformBuffer);
+-    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context, drapeWindow.base, drapeWindow.total);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/color_relief_layer_tweaker.cpp b/src/mln/renderer/layers/color_relief_layer_tweaker.cpp
+index 6cb9ea42f19e..4341fa0d3535 100644
+--- a/src/mln/renderer/layers/color_relief_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/color_relief_layer_tweaker.cpp
+@@ -36,6 +36,7 @@ void ColorReliefLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPar
+ 
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
++    const auto drapeWindow = drapeUBOWindow(parameters, layerGroup.getDrawableCount());
+     std::vector<ColorReliefDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<ColorReliefTilePropsUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
+     std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+@@ -60,7 +61,7 @@ void ColorReliefLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPar
+             }
+         }
+ 
+-        drawable.setUBOIndex(i++);
++        drawable.setUBOIndex(static_cast<int32_t>(drapeWindow.base + static_cast<std::uint32_t>(i++)));
+ #else
+         ColorReliefDrawableUBO drawableUBO;
+         drawableUBO.matrix = util::cast<float>(projection.mainMatrix);
+@@ -74,25 +75,13 @@ void ColorReliefLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintPar
+     });
+ 
+ #if MLN_UBO_CONSOLIDATION
+-    const size_t drawableUBOVectorSize = sizeof(ColorReliefDrawableUBO) * drawableUBOVector.size();
+-    if (!drawableUniformBuffer || drawableUniformBuffer->getSize() < drawableUBOVectorSize) {
+-        drawableUniformBuffer = context.createUniformBuffer(
+-            drawableUBOVector.data(), drawableUBOVectorSize, false, true);
+-    } else {
+-        drawableUniformBuffer->update(drawableUBOVector.data(), drawableUBOVectorSize);
+-    }
++    updateWindowedBuffer(drawableUniformBuffer, context, drawableUBOVector.data(), sizeof(ColorReliefDrawableUBO), drawableUBOVector.size(), drapeWindow);
+ 
+-    const size_t tilePropsUBOVectorSize = sizeof(ColorReliefTilePropsUBO) * tilePropsUBOVector.size();
+-    if (!tilePropsUniformBuffer || tilePropsUniformBuffer->getSize() < tilePropsUBOVectorSize) {
+-        tilePropsUniformBuffer = context.createUniformBuffer(
+-            tilePropsUBOVector.data(), tilePropsUBOVectorSize, false, true);
+-    } else {
+-        tilePropsUniformBuffer->update(tilePropsUBOVector.data(), tilePropsUBOVectorSize);
+-    }
++    updateWindowedBuffer(tilePropsUniformBuffer, context, tilePropsUBOVector.data(), sizeof(ColorReliefTilePropsUBO), tilePropsUBOVector.size(), drapeWindow);
+ 
+     layerUniforms.set(idColorReliefDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idColorReliefTilePropsUBO, tilePropsUniformBuffer);
+-    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context, drapeWindow.base, drapeWindow.total);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/fill_layer_tweaker.cpp b/src/mln/renderer/layers/fill_layer_tweaker.cpp
+index cf10dee3140b..0e3b0b7e4043 100644
+--- a/src/mln/renderer/layers/fill_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/fill_layer_tweaker.cpp
+@@ -59,6 +59,7 @@ void FillLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+ 
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
++    const auto drapeWindow = drapeUBOWindow(parameters, layerGroup.getDrawableCount());
+     std::vector<FillDrawableUnionUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<FillTilePropsUnionUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
+     std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+@@ -250,30 +251,18 @@ void FillLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+             }
+         }
+ #if MLN_UBO_CONSOLIDATION
+-        drawable.setUBOIndex(i++);
++        drawable.setUBOIndex(static_cast<int32_t>(drapeWindow.base + static_cast<std::uint32_t>(i++)));
+ #endif
+     });
+ 
+ #if MLN_UBO_CONSOLIDATION
+-    const size_t drawableUBOVectorSize = sizeof(FillDrawableUnionUBO) * drawableUBOVector.size();
+-    if (!drawableUniformBuffer || drawableUniformBuffer->getSize() < drawableUBOVectorSize) {
+-        drawableUniformBuffer = context.createUniformBuffer(
+-            drawableUBOVector.data(), drawableUBOVectorSize, false, true);
+-    } else {
+-        drawableUniformBuffer->update(drawableUBOVector.data(), drawableUBOVectorSize);
+-    }
++    updateWindowedBuffer(drawableUniformBuffer, context, drawableUBOVector.data(), sizeof(FillDrawableUnionUBO), drawableUBOVector.size(), drapeWindow);
+ 
+-    const size_t tilePropsUBOVectorSize = sizeof(FillTilePropsUnionUBO) * tilePropsUBOVector.size();
+-    if (!tilePropsUniformBuffer || tilePropsUniformBuffer->getSize() < tilePropsUBOVectorSize) {
+-        tilePropsUniformBuffer = context.createUniformBuffer(
+-            tilePropsUBOVector.data(), tilePropsUBOVectorSize, false, true);
+-    } else {
+-        tilePropsUniformBuffer->update(tilePropsUBOVector.data(), tilePropsUBOVectorSize);
+-    }
++    updateWindowedBuffer(tilePropsUniformBuffer, context, tilePropsUBOVector.data(), sizeof(FillTilePropsUnionUBO), tilePropsUBOVector.size(), drapeWindow);
+ 
+     layerUniforms.set(idFillDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idFillTilePropsUBO, tilePropsUniformBuffer);
+-    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context, drapeWindow.base, drapeWindow.total);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/hillshade_layer_tweaker.cpp b/src/mln/renderer/layers/hillshade_layer_tweaker.cpp
+index c0fe6192e795..ea8d8755985b 100644
+--- a/src/mln/renderer/layers/hillshade_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/hillshade_layer_tweaker.cpp
+@@ -161,6 +161,7 @@ void HillshadeLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParam
+ 
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
++    const auto drapeWindow = drapeUBOWindow(parameters, layerGroup.getDrawableCount());
+     std::vector<HillshadeDrawableUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<HillshadeTilePropsUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
+     std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+@@ -206,7 +207,7 @@ void HillshadeLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParam
+         };
+ 
+ #if MLN_UBO_CONSOLIDATION
+-        drawable.setUBOIndex(i++);
++        drawable.setUBOIndex(static_cast<int32_t>(drapeWindow.base + static_cast<std::uint32_t>(i++)));
+ #else
+         auto& drawableUniforms = drawable.mutableUniformBuffers();
+         drawableUniforms.createOrUpdate(idHillshadeDrawableUBO, &drawableUBO, parameters.context);
+@@ -216,25 +217,14 @@ void HillshadeLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParam
+ 
+ #if MLN_UBO_CONSOLIDATION
+     auto& context = parameters.context;
+-    const size_t drawableUBOVectorSize = sizeof(HillshadeDrawableUBO) * drawableUBOVector.size();
+-    if (!drawableUniformBuffer || drawableUniformBuffer->getSize() < drawableUBOVectorSize) {
+-        drawableUniformBuffer = context.createUniformBuffer(
+-            drawableUBOVector.data(), drawableUBOVectorSize, false, true);
+-    } else {
+-        drawableUniformBuffer->update(drawableUBOVector.data(), drawableUBOVectorSize);
+-    }
+-
+-    const size_t tilePropsUBOVectorSize = sizeof(HillshadeTilePropsUBO) * tilePropsUBOVector.size();
+-    if (!tilePropsUniformBuffer || tilePropsUniformBuffer->getSize() < tilePropsUBOVectorSize) {
+-        tilePropsUniformBuffer = context.createUniformBuffer(
+-            tilePropsUBOVector.data(), tilePropsUBOVectorSize, false, true);
+-    } else {
+-        tilePropsUniformBuffer->update(tilePropsUBOVector.data(), tilePropsUBOVectorSize);
+-    }
++    updateWindowedBuffer(
++        drawableUniformBuffer, context, drawableUBOVector.data(), sizeof(HillshadeDrawableUBO), drawableUBOVector.size(), drapeWindow);
++    updateWindowedBuffer(
++        tilePropsUniformBuffer, context, tilePropsUBOVector.data(), sizeof(HillshadeTilePropsUBO), tilePropsUBOVector.size(), drapeWindow);
+ 
+     layerUniforms.set(idHillshadeDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idHillshadeTilePropsUBO, tilePropsUniformBuffer);
+-    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context, drapeWindow.base, drapeWindow.total);
+ #endif
+ }
+ 
+diff --git a/src/mln/renderer/layers/line_layer_tweaker.cpp b/src/mln/renderer/layers/line_layer_tweaker.cpp
+index ec610852def0..9ab9794d49a0 100644
+--- a/src/mln/renderer/layers/line_layer_tweaker.cpp
++++ b/src/mln/renderer/layers/line_layer_tweaker.cpp
+@@ -197,6 +197,7 @@ void LineLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+ 
+ #if MLN_UBO_CONSOLIDATION
+     int i = 0;
++    const auto drapeWindow = drapeUBOWindow(parameters, layerGroup.getDrawableCount());
+     std::vector<LineDrawableUnionUBO> drawableUBOVector(layerGroup.getDrawableCount());
+     std::vector<LineTilePropsUnionUBO> tilePropsUBOVector(layerGroup.getDrawableCount());
+     std::vector<ProjectionUBO> projectionUBOVector(layerGroup.getDrawableCount());
+@@ -401,30 +402,18 @@ void LineLayerTweaker::execute(LayerGroupBase& layerGroup, const PaintParameters
+         }
+ 
+ #if MLN_UBO_CONSOLIDATION
+-        drawable.setUBOIndex(i++);
++        drawable.setUBOIndex(static_cast<int32_t>(drapeWindow.base + static_cast<std::uint32_t>(i++)));
+ #endif
+     });
+ 
+ #if MLN_UBO_CONSOLIDATION
+-    const size_t drawableUBOVectorSize = sizeof(LineDrawableUnionUBO) * drawableUBOVector.size();
+-    if (!drawableUniformBuffer || drawableUniformBuffer->getSize() < drawableUBOVectorSize) {
+-        drawableUniformBuffer = context.createUniformBuffer(
+-            drawableUBOVector.data(), drawableUBOVectorSize, false, true);
+-    } else {
+-        drawableUniformBuffer->update(drawableUBOVector.data(), drawableUBOVectorSize);
+-    }
++    updateWindowedBuffer(drawableUniformBuffer, context, drawableUBOVector.data(), sizeof(LineDrawableUnionUBO), drawableUBOVector.size(), drapeWindow);
+ 
+-    const size_t tilePropsUBOVectorSize = sizeof(LineTilePropsUnionUBO) * tilePropsUBOVector.size();
+-    if (!tilePropsUniformBuffer || tilePropsUniformBuffer->getSize() < tilePropsUBOVectorSize) {
+-        tilePropsUniformBuffer = context.createUniformBuffer(
+-            tilePropsUBOVector.data(), tilePropsUBOVectorSize, false, true);
+-    } else {
+-        tilePropsUniformBuffer->update(tilePropsUBOVector.data(), tilePropsUBOVectorSize);
+-    }
++    updateWindowedBuffer(tilePropsUniformBuffer, context, tilePropsUBOVector.data(), sizeof(LineTilePropsUnionUBO), tilePropsUBOVector.size(), drapeWindow);
+ 
+     layerUniforms.set(idLineDrawableUBO, drawableUniformBuffer);
+     layerUniforms.set(idLineTilePropsUBO, tilePropsUniformBuffer);
+-    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context);
++    uploadProjectionUBOs(layerUniforms, projectionUBOVector, context, drapeWindow.base, drapeWindow.total);
+ #endif
+ }
+ 

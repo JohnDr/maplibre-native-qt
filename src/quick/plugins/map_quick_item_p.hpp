@@ -49,6 +49,9 @@ public:
         QString m_terrainSource;
         double m_terrainExaggeration = 1.0;
         bool m_skyEnabled = false;
+        int m_renderedFrames = 0;
+        double m_frameTimeSumMs = 0.0;
+        int m_frameTimeCount = 0;
         bool m_skyExplicit = false;
         QVariantMap m_sky;
 

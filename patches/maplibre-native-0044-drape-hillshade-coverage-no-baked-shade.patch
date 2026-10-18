@@ -1,0 +1,211 @@
+diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
+index 52ed328f45b8..79815a19ce10 100644
+--- a/include/mln/shaders/vulkan/terrain.hpp
++++ b/include/mln/shaders/vulkan/terrain.hpp
+@@ -6,7 +6,8 @@
+ namespace mln {
+ namespace shaders {
+ 
+-/// Renders the terrain surface: a 3D mesh whose vertices carry an elevation in metres and a precomputed shade.
++/// Renders the terrain surface: a 3D mesh whose vertices carry an elevation in metres and no shading (the relief
++/// comes from the draped hillshade layer, as in GL JS).
+ /// The projection matrix scales z by pixels-per-metre (as for every 3D layer), so the vertex shader is the same
+ /// projection the other 3D layers use.
+ template <>
+@@ -24,8 +25,8 @@ struct ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan> {
+ )";
+     static constexpr auto vertex = R"(
+ 
+-// xy: tile units (0..EXTENT); z: elevation in metres; w: shade in [0, 1].
+-layout(location = 0) in vec4 in_position;
++// xy: tile units (0..EXTENT); z: elevation in metres.
++layout(location = 0) in vec3 in_position;
+ 
+ layout(push_constant) uniform Constants {
+     int ubo_index;
+@@ -42,9 +43,8 @@ layout(set = LAYER_SET_INDEX, binding = idTerrainFogUBO) uniform TerrainFogUBO {
+     vec4 depth_range;    // x: near, y: far (fog depth range, in the projection's eye-space units)
+ } fog;
+ 
+-layout(location = 0) out float v_shade;
+-layout(location = 1) out vec2 v_uv;
+-layout(location = 2) out float v_fog_depth;
++layout(location = 0) out vec2 v_uv;
++layout(location = 1) out float v_fog_depth;
+ 
+ void main() {
+     gl_Position = projectTileFor3D(in_position.xy, in_position.z, projectionVector.projection_ubo[constant.ubo_index]);
+@@ -54,7 +54,6 @@ void main() {
+     // d the eye-space depth, which is the clip w of the main projection.
+     const float eyeDepth = max(gl_Position.w, 1e-6);
+     v_fog_depth = fog.depth_range.y * (eyeDepth - fog.depth_range.x) / ((fog.depth_range.y - fog.depth_range.x) * eyeDepth);
+-    v_shade = in_position.w;
+     // Tile-local texture coordinate (0..1) for this tile's own drape texture.
+     v_uv = in_position.xy / 8192.0;
+ }
+@@ -62,9 +61,8 @@ void main() {
+ 
+     static constexpr auto fragment = R"(
+ 
+-layout(location = 0) in float v_shade;
+-layout(location = 1) in vec2 v_uv;
+-layout(location = 2) in float v_fog_depth;
++layout(location = 0) in vec2 v_uv;
++layout(location = 1) in float v_fog_depth;
+ 
+ layout(set = LAYER_SET_INDEX, binding = idTerrainFogUBO) uniform TerrainFogUBO {
+     vec4 fog_color;
+@@ -86,14 +84,12 @@ layout(set = DRAWABLE_IMAGE_SET_INDEX, binding = 0) uniform sampler2D drapeSampl
+ layout(location = 0) out vec4 out_color;
+ 
+ void main() {
+-    // Per-tile drape: this tile's own texture, shaded by the precomputed hillshade. Where no draping layer was
+-    // rendered (exactly black, e.g. before imagery loads; near-black imagery such as deep water stays as drawn) fall back to a hypsometric tint so the relief is still visible.
++    // Per-tile drape: this tile's own texture, drawn as is (GL JS draws the render-to-texture result directly). Where
++    // no draping layer was rendered (alpha 0, e.g. before imagery loads or a hillshade-only style over flat ground)
++    // fall back to a flat tint so the surface is not see-through.
+     const vec4 draped = texture(drapeSampler, v_uv);
+-    const float shade = clamp(v_shade, 0.0, 1.0);
+-    const vec3 low = vec3(0.24, 0.42, 0.24);
+-    const vec3 high = vec3(0.86, 0.83, 0.72);
+-    const vec3 tint = mix(low, high, shade);
+-    vec4 surface = vec4((draped.a < 0.5 ? tint : draped.rgb) * shade, 1.0);
++    const vec3 tint = vec3(0.86, 0.83, 0.72);
++    vec4 surface = vec4(draped.a < 0.5 ? tint : draped.rgb, 1.0);
+ 
+     // GL JS terrain.fragment.glsl: blend the surface towards the fog / horizon colour with distance, in linear colour.
+     const float ground_blend = fog.params.x;
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index a9a8657e89dd..8557ed05f1c2 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -40,11 +40,6 @@ constexpr std::string_view TerrainShaderName = "TerrainShader";
+ constexpr std::size_t TerrainGridSegments = 128;
+ constexpr std::size_t TerrainGridPoints = TerrainGridSegments + 1;
+ 
+-// A light pointing from the north-west, 45 degrees up.
+-constexpr double LightX = -0.7071067811865476 * 0.7071067811865476;
+-constexpr double LightY = -0.7071067811865476 * 0.7071067811865476;
+-constexpr double LightZ = 0.7071067811865476;
+-
+ struct TerrainMesh {
+     std::vector<uint8_t> vertices;
+     std::size_t vertexCount = 0;
+@@ -52,7 +47,8 @@ struct TerrainMesh {
+ };
+ 
+ /// Builds a grid over one DEM tile: xy in tile units (0..EXTENT), z the elevation in metres (the camera's
+-/// world-to-camera matrix scales z by pixels-per-metre, like every 3D layer), w a hillshade.
++/// world-to-camera matrix scales z by pixels-per-metre, like every 3D layer). The relief shading comes from the draped
++/// hillshade layer, as in GL JS; the mesh carries none.
+ TerrainMesh buildTerrainMesh(const DEMData* dem, double exaggeration, const CanonicalTileID& tile) {
+     // A null `dem` is a tile the source does not have (open sea): flat at sea level, as GL JS treats missing DEM.
+     const std::size_t n = TerrainGridPoints;
+@@ -61,7 +57,6 @@ TerrainMesh buildTerrainMesh(const DEMData* dem, double exaggeration, const Cano
+     const double tilesAcross = static_cast<double>(1ull << tile.z);
+     const double tileLat = std::atan(std::sinh(std::numbers::pi * (1.0 - 2.0 * (tile.y + 0.5) / tilesAcross)));
+     const double metersPerTile = util::M2PI * util::EARTH_RADIUS_M * std::cos(tileLat) / tilesAcross;
+-    const double pixelMeters = metersPerTile / dim;
+     const double extent = static_cast<double>(util::EXTENT);
+ 
+     std::vector<double> elevation(n * n);
+@@ -73,32 +68,16 @@ TerrainMesh buildTerrainMesh(const DEMData* dem, double exaggeration, const Cano
+         }
+     }
+ 
+-    // Slopes straight from the DEM one pixel either side, so the hillshade at a tile edge uses the neighbour's pixels
+-    // (the backfilled border) and matches across the seam; grid neighbours would clamp at the edge.
+-    const auto demElevation = [&](double x, double y) {
+-        return dem != nullptr ? dem->getElevation(std::clamp(x, -1.0, dim), std::clamp(y, -1.0, dim)) : 0.0;
+-    };
+-
+     TerrainMesh mesh;
+-    mesh.vertices.resize(n * n * 4 * sizeof(float));
++    mesh.vertices.resize(n * n * 3 * sizeof(float));
+     auto* out = reinterpret_cast<float*>(mesh.vertices.data());
+     for (std::size_t j = 0; j < n; j++) {
+         for (std::size_t i = 0; i < n; i++) {
+             const double e = elevation[j * n + i];
+-            const double px = static_cast<double>(i) / static_cast<double>(TerrainGridSegments) * dim;
+-            const double py = static_cast<double>(j) / static_cast<double>(TerrainGridSegments) * dim;
+-            const double dzdx = (demElevation(px + 1.0, py) - demElevation(px - 1.0, py)) / (2.0 * pixelMeters);
+-            const double dzdy = (demElevation(px, py + 1.0) - demElevation(px, py - 1.0)) / (2.0 * pixelMeters);
+-            const double length = std::sqrt(dzdx * dzdx + dzdy * dzdy + 1.0);
+-            // normal . light, with normal = (-dzdx, -dzdy, 1) / length
+-            const double diffuse = std::clamp((LightX * -dzdx + LightY * -dzdy + LightZ) / length, 0.0, 1.0);
+-            const double shade = 0.35 + 0.65 * diffuse;
+-
+-            float* vertex = out + (j * n + i) * 4;
++            float* vertex = out + (j * n + i) * 3;
+             vertex[0] = static_cast<float>(static_cast<double>(i) / static_cast<double>(TerrainGridSegments) * extent);
+             vertex[1] = static_cast<float>(static_cast<double>(j) / static_cast<double>(TerrainGridSegments) * extent);
+             vertex[2] = static_cast<float>(e * exaggeration);
+-            vertex[3] = static_cast<float>(shade);
+         }
+     }
+     mesh.vertexCount = n * n;
+@@ -107,7 +86,7 @@ TerrainMesh buildTerrainMesh(const DEMData* dem, double exaggeration, const Cano
+     // meet (their edge vertices differ) are covered. GL JS uses a fifth of the tile width.
+     const double skirtMeters = metersPerTile / 5.0;
+     const std::size_t skirtVertexBase = mesh.vertexCount;
+-    mesh.vertices.resize((n * n + 4 * n) * 4 * sizeof(float));
++    mesh.vertices.resize((n * n + 4 * n) * 3 * sizeof(float));
+     out = reinterpret_cast<float*>(mesh.vertices.data());
+     // Edge vertex indices, per side, in order along the edge.
+     const auto edgeIndex = [&](int side, std::size_t k) -> std::size_t {
+@@ -120,12 +99,11 @@ TerrainMesh buildTerrainMesh(const DEMData* dem, double exaggeration, const Cano
+     };
+     for (int side = 0; side < 4; ++side) {
+         for (std::size_t k = 0; k < n; ++k) {
+-            const float* src = out + edgeIndex(side, k) * 4;
+-            float* dst = out + (skirtVertexBase + static_cast<std::size_t>(side) * n + k) * 4;
++            const float* src = out + edgeIndex(side, k) * 3;
++            float* dst = out + (skirtVertexBase + static_cast<std::size_t>(side) * n + k) * 3;
+             dst[0] = src[0];
+             dst[1] = src[1];
+             dst[2] = src[2] - static_cast<float>(skirtMeters);
+-            dst[3] = src[3];
+         }
+     }
+     mesh.vertexCount = n * n + 4 * n;
+@@ -273,7 +251,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         auto mesh = buildTerrainMesh(data.get(), updateParameters.terrainExaggeration, canonical);
+         const auto vertexCount = mesh.vertexCount;
+         const auto indexCount = mesh.indices.size();
+-        builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float4);
++        builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float3);
+         SegmentVector segments;
+         segments.emplace_back(0, 0, vertexCount, indexCount);
+         builder->setSegments(gfx::Triangles(), std::move(mesh.indices), segments.data(), segments.size());
+diff --git a/src/mln/renderer/tile_pyramid.cpp b/src/mln/renderer/tile_pyramid.cpp
+index 613b7a419e24..c7303ccf0b29 100644
+--- a/src/mln/renderer/tile_pyramid.cpp
++++ b/src/mln/renderer/tile_pyramid.cpp
+@@ -186,10 +186,11 @@ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& l
+     std::optional<util::TileRange> tileRange = std::nullopt;
+     if (bounds) {
+         // The cover may request tiles finer than the nominal covering zoom (the globe's
+-        // variable-zoom / level-of-detail path), so the bounds guard must span the full
+-        // source zoom range or those tiles get rejected and the view renders empty.
++        // variable-zoom / level-of-detail path, and the terrain's near-field tiles), so the bounds guard must span
++        // the full source zoom range or those tiles get rejected and the view renders without them.
+         const bool variableZoom = parameters.transformState.isGlobeRendering() ||
+-                                  parameters.tileLodMode == TileLodMode::Distance;
++                                  parameters.tileLodMode == TileLodMode::Distance ||
++                                  tileCoverParameters.terrainVariableZoom;
+         int32_t maxZoom = variableZoom ? static_cast<int32_t>(zoomRange.max)
+                                        : std::min(tileZoom, static_cast<int32_t>(zoomRange.max));
+         tileRange = util::TileRange::fromLatLngBounds(*bounds, zoomRange.min, maxZoom);
+diff --git a/src/mln/shaders/vulkan/terrain.cpp b/src/mln/shaders/vulkan/terrain.cpp
+index 762713de0e3f..dad9b9f8d247 100644
+--- a/src/mln/shaders/vulkan/terrain.cpp
++++ b/src/mln/shaders/vulkan/terrain.cpp
+@@ -7,7 +7,7 @@ namespace shaders {
+ using TerrainShaderSource = ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan>;
+ 
+ const std::array<AttributeInfo, 1> TerrainShaderSource::attributes = {
+-    AttributeInfo{0, gfx::AttributeDataType::Float4, idTerrainPosVertexAttribute},
++    AttributeInfo{0, gfx::AttributeDataType::Float3, idTerrainPosVertexAttribute},
+ };
+ const std::array<TextureInfo, 1> TerrainShaderSource::textures = {
+     TextureInfo{0, idTerrainDrapeTexture},
