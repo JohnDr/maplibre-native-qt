@@ -1,0 +1,332 @@
+diff --git a/include/mln/vulkan/renderable_resource.hpp b/include/mln/vulkan/renderable_resource.hpp
+index 01efce018527..9cea9a0a66f3 100644
+--- a/include/mln/vulkan/renderable_resource.hpp
++++ b/include/mln/vulkan/renderable_resource.hpp
+@@ -21,6 +21,9 @@ public:
+         // explicitly can override this method.
+     }
+ 
++    /// Called after the renderable's render pass has ended and before it is sampled or presented, outside any pass.
++    virtual void finishRender([[maybe_unused]] const vk::UniqueCommandBuffer& buffer) {}
++
+     const vk::Extent2D& getExtent() const { return extent; }
+     const vk::UniqueRenderPass& getRenderPass() const { return renderPass; }
+     virtual const vk::UniqueFramebuffer& getFramebuffer() const = 0;
+diff --git a/include/mln/vulkan/texture2d.hpp b/include/mln/vulkan/texture2d.hpp
+index df0954e94dc8..fb2bf1004825 100644
+--- a/include/mln/vulkan/texture2d.hpp
++++ b/include/mln/vulkan/texture2d.hpp
+@@ -84,6 +84,14 @@ public:
+     const vk::ImageLayout& getVulkanImageLayout() const { return imageLayout; }
+     const vk::UniqueImageView& getVulkanImageView() const { return imageAllocation->imageView; }
+     const vk::Image& getVulkanImage() const { return imageAllocation->image; }
++
++    /// A view of mip level 0 only: a framebuffer attachment must have a single level, while the texture's own view
++    /// spans all levels when it is mipmapped.
++    vk::UniqueImageView createLevel0View() const;
++
++    /// Fill mip levels 1.. of a mipmapped attachment texture from level 0, which the render pass left in shader-read
++    /// layout (GL JS `obj.texture.generateMipmap()` after each render-to-texture pass). Call outside a render pass.
++    void generateAttachmentMips(const vk::UniqueCommandBuffer& buffer);
+     const vk::Sampler& getVulkanSampler();
+ 
+     void copyImage(vk::Image image, Size imageSize, uint16_t xOffset = 0, uint16_t yOffset = 0);
+diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
+index 8f011d6c29e1..8693cb1d7089 100644
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -181,20 +181,60 @@ bool TransformState::getFogDepthRange(double& nearDistance, double& farDistance)
+     if (size.isEmpty()) {
+         return false;
+     }
++    // GL JS `MercatorTransform#_calcMatrices` / `_calculateNearFarZ` (mercator_transform.ts): the fog matrix uses the
++    // camera-to-sea-level distance as its near plane and the far plane GL JS computes for its projection, which is
++    // set by the lowest terrain point and the horizon rather than by the sea-level plane alone.
+     const double cameraToCenterDistance = getCameraToCenterDistance();
+     const ScreenCoordinate offset = getCenterOffset();
+-    const double limitedPitch = util::clamp(getPitch(), 0.0, maxMercatorHorizonAngle);
+-
+-    // Far plane: as in getProjMatrix.
+-    const double seaLevelDistance = cameraToCenterDistance + std::abs(z) / std::cos(limitedPitch);
+-    const double tanFovAboveCenter = (0.5 + (offset.y - frustumOffset.top()) / size.height) * 2.0 *
+-                                     std::tan(fov / 2.0) *
+-                                     (std::abs(std::cos(roll)) + std::abs(std::sin(roll)) * size.width / size.height);
+-    const double tanMultiple = util::clamp(tanFovAboveCenter * std::tan(limitedPitch), 0.0, 0.99);
+-    farDistance = seaLevelDistance / (1 - tanMultiple) * 1.01;
+-
+-    // Near plane: GL JS `cameraToSeaLevelDistance` of the fog matrix (mercator_transform.ts `_calcMatrices`).
+-    nearDistance = std::max(cameraToCenterDistance / 2.0, cameraToCenterDistance + z / std::cos(limitedPitch));
++    const double pitch = getPitch();
++    const double limitedPitch = util::clamp(pitch, 0.0, maxMercatorHorizonAngle);
++    const double pixelsPerMeter = 1.0 / Projection::getMetersPerPixelAtLatitude(getLatLng().latitude(), getZoom());
++    const double elevation = getElevation();
++
++    const double cameraToSeaLevelDistance = std::max(
++        cameraToCenterDistance / 2.0, cameraToCenterDistance + elevation * pixelsPerMeter / std::cos(limitedPitch));
++    nearDistance = cameraToSeaLevelDistance;
++
++    // The lowest elevation to account for: the centre, the terrain tile under it (its DEM minimum, as
++    // `Terrain#getMinTileElevationForLngLatZoom`), and a point 100 m below the camera.
++    double minElevationForCurrentTile = 0.0;
++    if (tileElevationRange) {
++        const auto tileZoom = static_cast<uint8_t>(util::clamp(std::floor(getZoom()), 0.0, 22.0));
++        const LatLng latLng = getLatLng();
++        const double tiles = std::ldexp(1.0, tileZoom);
++        const double lat = util::clamp(latLng.latitude(), -util::LATITUDE_MAX, util::LATITUDE_MAX);
++        const double tileX = std::floor((latLng.longitude() + 180.0) / 360.0 * tiles);
++        const double tileY = std::floor((0.5 - std::log(std::tan(pi / 4.0 + util::deg2rad(lat) / 2.0)) / (2.0 * pi)) * tiles);
++        const double maxIndex = tiles - 1.0;
++        if (const auto range = (*tileElevationRange)(CanonicalTileID(tileZoom,
++                                                                     static_cast<uint32_t>(util::clamp(tileX, 0.0, maxIndex)),
++                                                                     static_cast<uint32_t>(util::clamp(tileY, 0.0, maxIndex))))) {
++            minElevationForCurrentTile = range->first;
++        }
++    }
++    constexpr double minRenderDistanceBelowCameraInMeters = 100.0;
++    const double minElevation = std::min({elevation, minElevationForCurrentTile, getCameraAltitude() - minRenderDistanceBelowCameraInMeters});
++    const double cameraToLowestPointDistance = cameraToSeaLevelDistance - minElevation * pixelsPerMeter / std::cos(limitedPitch);
++    const double lowestPlane = minElevation < 0 ? cameraToLowestPointDistance : cameraToSeaLevelDistance;
++
++    // Distance, along the view ray, from the centre to the top edge of the screen and to the horizon (law of sines).
++    const double groundAngle = pi / 2.0 + pitch;
++    const double zfov = fov * (std::abs(std::cos(roll)) * size.height + std::abs(std::sin(roll)) * size.width) / size.height;
++    const double fovAboveCenter = zfov * (0.5 + offset.y / size.height);
++    const double topHalfSurfaceDistance = std::sin(fovAboveCenter) * lowestPlane /
++                                          std::sin(util::clamp(pi - groundAngle - fovAboveCenter, 0.01, pi - 0.01));
++
++    // GL JS `getMercatorHorizon`: the horizon above the centre in pixels.
++    const double horizon = cameraToCenterDistance * std::min(std::tan(pi / 2.0 - pitch) * 0.85, std::tan(maxMercatorHorizonAngle - pitch));
++    const double horizonAngle = std::atan(horizon / cameraToCenterDistance);
++    const double minFovCenterToHorizon = pi / 2.0 - maxMercatorHorizonAngle;
++    const double fovCenterToHorizon = horizonAngle > minFovCenterToHorizon ? 2.0 * horizonAngle * (0.5 + offset.y / (horizon * 2.0))
++                                                                           : minFovCenterToHorizon;
++    const double topHalfSurfaceDistanceHorizon = std::sin(fovCenterToHorizon) * lowestPlane /
++                                                 std::sin(util::clamp(pi - groundAngle - fovCenterToHorizon, 0.01, pi - 0.01));
++
++    const double topHalfMinDistance = std::min(topHalfSurfaceDistance, topHalfSurfaceDistanceHorizon);
++    farDistance = (std::cos(pi / 2.0 - limitedPitch) * topHalfMinDistance + lowestPlane) * 1.01;
+     return true;
+ }
+ 
+diff --git a/src/mln/renderer/render_orchestrator.cpp b/src/mln/renderer/render_orchestrator.cpp
+index 95395b2b585c..24b045d91ec6 100644
+--- a/src/mln/renderer/render_orchestrator.cpp
++++ b/src/mln/renderer/render_orchestrator.cpp
+@@ -1212,6 +1212,13 @@ void RenderOrchestrator::updateLayers(gfx::ShaderRegistry& shaders,
+                                                     gfx::TextureChannelDataType::UnsignedByte);
+                     if (rt) {
+                         rt->setClearColor(Color{0.0f, 0.0f, 0.0f, 0.0f}); // transparent: unrendered != black imagery
++                        // GL JS `acquireRTT`: LINEAR_MIPMAP_LINEAR with the device's maximum anisotropy (clamped to
++                        // 16 here), the mips regenerated after each render (the backend does that when the pass ends).
++                        rt->getTexture()->setSamplerConfiguration({.filter = gfx::TextureFilterType::Linear,
++                                                                   .wrapU = gfx::TextureWrapType::Clamp,
++                                                                   .wrapV = gfx::TextureWrapType::Clamp,
++                                                                   .maxAnisotropy = 16,
++                                                                   .mipmapped = true});
+                     }
+                 }
+                 if (!rt) {
+diff --git a/src/mln/renderer/sources/render_raster_dem_source.cpp b/src/mln/renderer/sources/render_raster_dem_source.cpp
+index ff40de4415d8..4dae21fc3149 100644
+--- a/src/mln/renderer/sources/render_raster_dem_source.cpp
++++ b/src/mln/renderer/sources/render_raster_dem_source.cpp
+@@ -100,6 +100,9 @@ void RenderRasterDEMSource::onTileChanged(Tile& tile) {
+                     const DEMTileNeighbors& borderMask = opposites[mask];
+                     if ((borderTile.neighboringTiles & borderMask) != borderMask) {
+                         borderTile.backfillBorder(demtile, borderMask);
++                        // Its hillshade is prepared again with the new border: tell the observers (the terrain drape
++                        // re-renders the tiles it is drawn into).
++                        RenderTileSource::onTileChanged(borderTile);
+                     }
+                 }
+             }
+diff --git a/src/mln/vulkan/command_encoder.cpp b/src/mln/vulkan/command_encoder.cpp
+index 93b1f3663274..9c7cb282d6b4 100644
+--- a/src/mln/vulkan/command_encoder.cpp
++++ b/src/mln/vulkan/command_encoder.cpp
+@@ -25,7 +25,9 @@ std::unique_ptr<gfx::RenderPass> CommandEncoder::createRenderPass(const char* na
+ }
+ 
+ void CommandEncoder::present(gfx::Renderable& renderable) {
+-    renderable.getResource<RenderableResource>().swap();
++    auto& resource = renderable.getResource<RenderableResource>();
++    resource.finishRender(commandBuffer);
++    resource.swap();
+ }
+ 
+ void CommandEncoder::pushDebugGroup(const char* name) {
+diff --git a/src/mln/vulkan/offscreen_texture.cpp b/src/mln/vulkan/offscreen_texture.cpp
+index b71878bf6327..64c5c7b34d92 100644
+--- a/src/mln/vulkan/offscreen_texture.cpp
++++ b/src/mln/vulkan/offscreen_texture.cpp
+@@ -32,12 +32,19 @@ public:
+ 
+     ~OffscreenTextureResource() noexcept override {
+         framebuffer.reset();
++        attachmentView.reset();
+         renderPass.reset();
+         colorTexture.reset();
+ 
+         backend.getContext().renderingStats().numFrameBuffers--;
+     }
+ 
++    void finishRender(const vk::UniqueCommandBuffer& buffer) override {
++        if (colorTexture) {
++            static_cast<Texture2D&>(*colorTexture).generateAttachmentMips(buffer);
++        }
++    }
++
+     void bind() override {
+         colorTexture->create();
+         createRenderPass();
+@@ -64,6 +71,8 @@ public:
+ 
+         assert(colorTexture);
+         auto& texture = static_cast<Texture2D&>(*colorTexture);
++        // The texture's own view spans every mip level; a framebuffer attachment is one level.
++        attachmentView = texture.createLevel0View();
+ 
+         const auto colorAttachment = vk::AttachmentDescription(vk::AttachmentDescriptionFlags())
+                                          .setFormat(texture.getVulkanFormat())
+@@ -110,7 +119,7 @@ public:
+ 
+         const auto framebufferCreateInfo = vk::FramebufferCreateInfo()
+                                                .setRenderPass(renderPass.get())
+-                                               .setAttachments(texture.getVulkanImageView().get())
++                                               .setAttachments(attachmentView.get())
+                                                .setAttachmentCount(1)
+                                                .setWidth(extent.width)
+                                                .setHeight(extent.height)
+@@ -125,6 +134,7 @@ private:
+     const gfx::TextureChannelDataType type;
+ 
+     gfx::Texture2DPtr colorTexture;
++    vk::UniqueImageView attachmentView;
+     vk::UniqueFramebuffer framebuffer;
+ };
+ 
+diff --git a/src/mln/vulkan/texture2d.cpp b/src/mln/vulkan/texture2d.cpp
+index 66d0e4555b1d..a6f164a65c99 100644
+--- a/src/mln/vulkan/texture2d.cpp
++++ b/src/mln/vulkan/texture2d.cpp
+@@ -308,6 +308,10 @@ void Texture2D::createTexture() {
+             imageUsage = vk::ImageUsageFlags() | vk::ImageUsageFlagBits::eColorAttachment |
+                          vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc;
+             imageTiling = vk::ImageTiling::eOptimal;
++
++            if (samplerState.mipmapped) {
++                imageUsage |= vk::ImageUsageFlagBits::eTransferDst; // the mip chain is blitted into
++            }
+             break;
+ 
+         case Texture2DUsage::Read:
+@@ -767,6 +771,109 @@ std::shared_ptr<PremultipliedImage> Texture2D::readImage() {
+     }
+ }
+ 
++vk::UniqueImageView Texture2D::createLevel0View() const {
++    const auto createInfo = vk::ImageViewCreateInfo()
++                                .setImage(imageAllocation->image)
++                                .setViewType(vk::ImageViewType::e2D)
++                                .setFormat(vulkanFormat(pixelFormat, channelType))
++                                .setSubresourceRange({vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
++    return context.getBackend().getDevice()->createImageViewUnique(
++        createInfo, nullptr, context.getBackend().getDispatcher());
++}
++
++void Texture2D::generateAttachmentMips(const vk::UniqueCommandBuffer& buffer) {
++    const uint32_t mipLevels = getMipLevels();
++    if (mipLevels <= 1 || !imageAllocation) {
++        return;
++    }
++    const auto& dispatcher = context.getBackend().getDispatcher();
++    const auto image = imageAllocation->image;
++
++    // Level 0: the render pass left it readable by shaders. Levels 1..: nothing to keep, write them. The execution
++    // dependency also waits for earlier frames that sampled the old mips.
++    const auto prepare = [&](uint32_t baseLevel, uint32_t levelCount, vk::ImageLayout oldLayout, vk::ImageLayout newLayout,
++                             vk::AccessFlags srcAccess, vk::AccessFlags dstAccess) {
++        const auto barrier = vk::ImageMemoryBarrier()
++                                 .setImage(image)
++                                 .setOldLayout(oldLayout)
++                                 .setNewLayout(newLayout)
++                                 .setSrcAccessMask(srcAccess)
++                                 .setDstAccessMask(dstAccess)
++                                 .setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
++                                 .setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
++                                 .setSubresourceRange({vk::ImageAspectFlagBits::eColor, baseLevel, levelCount, 0, 1});
++        buffer->pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput |
++                                    vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eTransfer,
++                                vk::PipelineStageFlagBits::eTransfer,
++                                {},
++                                nullptr,
++                                nullptr,
++                                barrier,
++                                dispatcher);
++    };
++    prepare(0,
++            1,
++            vk::ImageLayout::eShaderReadOnlyOptimal,
++            vk::ImageLayout::eTransferSrcOptimal,
++            vk::AccessFlagBits::eColorAttachmentWrite,
++            vk::AccessFlagBits::eTransferRead);
++    prepare(1,
++            mipLevels - 1,
++            vk::ImageLayout::eUndefined,
++            vk::ImageLayout::eTransferDstOptimal,
++            vk::AccessFlags(),
++            vk::AccessFlagBits::eTransferWrite);
++
++    int32_t mipWidth = size.width;
++    int32_t mipHeight = size.height;
++    for (uint32_t i = 1; i < mipLevels; ++i) {
++        const int32_t nextMipWidth = std::max(1, mipWidth / 2);
++        const int32_t nextMipHeight = std::max(1, mipHeight / 2);
++
++        const auto blit = vk::ImageBlit()
++                              .setSrcOffsets({vk::Offset3D{0, 0, 0}, {mipWidth, mipHeight, 1}})
++                              .setDstOffsets({vk::Offset3D{0, 0, 0}, {nextMipWidth, nextMipHeight, 1}})
++                              .setSrcSubresource({vk::ImageAspectFlagBits::eColor, i - 1, 0, 1})
++                              .setDstSubresource({vk::ImageAspectFlagBits::eColor, i, 0, 1});
++        buffer->blitImage(image,
++                          vk::ImageLayout::eTransferSrcOptimal,
++                          image,
++                          vk::ImageLayout::eTransferDstOptimal,
++                          blit,
++                          vk::Filter::eLinear,
++                          dispatcher);
++
++        // This level is the source of the next one.
++        prepare(i,
++                1,
++                vk::ImageLayout::eTransferDstOptimal,
++                vk::ImageLayout::eTransferSrcOptimal,
++                vk::AccessFlagBits::eTransferWrite,
++                vk::AccessFlagBits::eTransferRead);
++        mipWidth = nextMipWidth;
++        mipHeight = nextMipHeight;
++    }
++
++    // Every level is now a transfer source; hand the whole chain to the fragment shaders.
++    const auto toShader = vk::ImageMemoryBarrier()
++                              .setImage(image)
++                              .setOldLayout(vk::ImageLayout::eTransferSrcOptimal)
++                              .setNewLayout(vk::ImageLayout::eShaderReadOnlyOptimal)
++                              .setSrcAccessMask(vk::AccessFlagBits::eTransferRead)
++                              .setDstAccessMask(vk::AccessFlagBits::eShaderRead)
++                              .setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
++                              .setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
++                              .setSubresourceRange({vk::ImageAspectFlagBits::eColor, 0, mipLevels, 0, 1});
++    buffer->pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
++                            vk::PipelineStageFlagBits::eFragmentShader,
++                            {},
++                            nullptr,
++                            nullptr,
++                            toShader,
++                            dispatcher);
++    imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
++}
++
+ uint32_t Texture2D::getMipLevels() const {
+     if (samplerState.mipmapped && size.width > 0 && size.height > 0) {
+         return static_cast<uint32_t>(std::floor(std::log2(std::max(size.width, size.height))) + 1);

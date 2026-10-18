@@ -1,0 +1,590 @@
+diff --git a/include/mln/shaders/vulkan/terrain.hpp b/include/mln/shaders/vulkan/terrain.hpp
+index f5df8e6381c6..733b353252ea 100644
+--- a/include/mln/shaders/vulkan/terrain.hpp
++++ b/include/mln/shaders/vulkan/terrain.hpp
+@@ -25,8 +25,8 @@ struct ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan> {
+ )";
+     static constexpr auto vertex = R"(
+ 
+-// xy: tile units (0..EXTENT); z: elevation in metres.
+-layout(location = 0) in vec3 in_position;
++// xy: tile units (0..EXTENT); z: elevation in metres; w: 1 for skirt vertices, which hang `skirt_length` below.
++layout(location = 0) in vec4 in_position;
+ 
+ layout(push_constant) uniform Constants {
+     int ubo_index;
+@@ -40,14 +40,14 @@ layout(set = LAYER_SET_INDEX, binding = idTerrainFogUBO) uniform TerrainFogUBO {
+     vec4 fog_color;      // premultiplied
+     vec4 horizon_color;  // premultiplied
+     vec4 params;         // x: fog-ground-blend, y: fog opacity (0 = off), z: horizon-fog-blend
+-    vec4 depth_range;    // x: near, y: far (fog depth range, in the projection's eye-space units)
++    vec4 depth_range;    // x: near, y: far (fog depth range, in the projection's eye-space units), z: skirt length (m)
+ } fog;
+ 
+ layout(location = 0) out vec2 v_uv;
+ layout(location = 1) out float v_fog_depth;
+ 
+ void main() {
+-    gl_Position = projectTileFor3D(in_position.xy, in_position.z, projectionVector.projection_ubo[constant.ubo_index]);
++    gl_Position = projectTileFor3D(in_position.xy, in_position.z - in_position.w * fog.depth_range.z, projectionVector.projection_ubo[constant.ubo_index]);
+     applySurfaceTransform();
+     // GL JS `v_fog_depth`: the depth of this vertex in a projection whose near plane is the camera-to-sea-level
+     // distance (terrain.vertex.glsl), in [0, 1]. For a perspective projection that is f*(d - n) / ((f - n)*d), with
+diff --git a/src/mln/map/transform_state.cpp b/src/mln/map/transform_state.cpp
+index 8693cb1d7089..b9a2a8f8e5f4 100644
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -264,7 +264,20 @@ void TransformState::getProjMatrix(mat4& projMatrix, uint16_t nearZ, bool aligne
+     // Calculate z distance of the farthest fragment that should be rendered.
+     const double furthestDistance = cameraToSeaLevelDistance / (1 - tanMultiple);
+     // Add a bit extra to avoid precision problems when a fragment's distance is exactly `furthestDistance`
+-    const double farZ = furthestDistance * 1.01;
++    double farZ = furthestDistance * 1.01;
++
++    // With terrain, GL JS (`_calculateNearFarZ`, `nearZ = height / 50`) derives the planes from the lowest terrain point
++    // and the horizon; the fog uses the same far plane.
++    if (tileElevationRange != nullptr) {
++        double fogNear = 0.0;
++        double fogFar = 0.0;
++        if (getFogDepthRange(fogNear, fogFar)) {
++            farZ = fogFar;
++            if (nearZ == 1) {
++                nearZ = static_cast<uint16_t>(std::max(1.0, std::floor(size.height / 50.0)));
++            }
++        }
++    }
+ 
+     // Make sure the camera state is up-to-date
+     updateCameraState();
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index 3a99413fc259..d9c24e75ec24 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -15,6 +15,7 @@
+ #include <mln/renderer/layer_tweaker.hpp>
+ #include <mln/renderer/paint_parameters.hpp>
+ #include <mln/renderer/render_pass.hpp>
++#include <mln/renderer/terrain_stitch.hpp>
+ #include <mln/renderer/terrain_tile_manager.hpp>
+ #include <mln/renderer/render_sky.hpp>
+ #include <mln/renderer/update_parameters.hpp>
+@@ -26,6 +27,7 @@
+ #include <array>
+ #include <cmath>
+ #include <numbers>
++#include <set>
+ #include <unordered_set>
+ 
+ namespace mln {
+@@ -46,48 +48,92 @@ struct TerrainMesh {
+     std::vector<uint16_t> indices;
+ };
+ 
++/// The DEM a terrain tile samples: the (coarser) DEM tile and the square of it the terrain tile covers, in DEM pixels.
++/// Null `data` is a tile the source does not have (open sea): flat at sea level, as GL JS treats missing DEM.
++struct TileDem {
++    const DEMData* data = nullptr;
++    double offsetX = 0.0;
++    double offsetY = 0.0;
++    double size = 0.0;
++
++    /// The elevation in metres at (u, v) in 0..1 across the terrain tile.
++    double elevation(double u, double v) const {
++        return data != nullptr ? data->getElevation(offsetX + u * size, offsetY + v * size) : 0.0;
++    }
++};
++
++/// The terrain tile's DEM (see `TileDem`) from the DEM tile `source`, as GL JS's DEM matrix selects it.
++TileDem tileDemFor(const CanonicalTileID& canonical, const std::optional<TerrainTileManager::SourceTile>& source) {
++    TileDem dem;
++    if (source) {
++        const int shift = canonical.z - source->id.z;
++        dem.data = source->data.get();
++        dem.size = static_cast<double>(source->data->dim) / static_cast<double>(1ull << shift);
++        dem.offsetX = static_cast<double>(canonical.x - (source->id.x << shift)) * dem.size;
++        dem.offsetY = static_cast<double>(canonical.y - (source->id.y << shift)) * dem.size;
++    }
++    return dem;
++}
++
++/// The edge of a coarser neighbour this tile's edge is stitched to: the neighbour's edge heights (its mesh vertices,
++/// metres) and where this tile's edge starts and ends along it.
++struct EdgeStitch {
++    std::vector<double> heights;
++    double u0 = 0.0;
++    double u1 = 1.0;
++};
++
+ /// Builds a grid over one terrain tile: xy in tile units (0..EXTENT), z the elevation in metres (the camera's
+-/// world-to-camera matrix scales z by pixels-per-metre, like every 3D layer). The terrain tile covers the square
+-/// `size` DEM pixels wide at (`offsetX`, `offsetY`) of its DEM tile (GL JS samples a sub-rectangle of the coarser DEM
+-/// tile the same way). The relief shading comes from the draped hillshade layer, as in GL JS; the mesh carries none.
+-TerrainMesh buildTerrainMesh(
+-    const DEMData* dem, double offsetX, double offsetY, double size, double exaggeration, const CanonicalTileID& tile) {
+-    // A null `dem` is a tile the source does not have (open sea): flat at sea level, as GL JS treats missing DEM.
++/// world-to-camera matrix scales z by pixels-per-metre, like every 3D layer). The relief shading comes from the
++/// draped hillshade layer, as in GL JS; the mesh carries none. Edges that border a coarser tile take their heights
++/// from that tile's mesh edge, so the two meets without a crack (GL JS hides the crack with the skirt only).
++TerrainMesh buildTerrainMesh(const TileDem& dem,
++                             double exaggeration,
++                             const std::array<std::optional<EdgeStitch>, 4>& stitch) {
+     const std::size_t n = TerrainGridPoints;
+-    // Ground width of this tile at its own latitude.
+-    const double tilesAcross = static_cast<double>(1ull << tile.z);
+-    const double tileLat = std::atan(std::sinh(std::numbers::pi * (1.0 - 2.0 * (tile.y + 0.5) / tilesAcross)));
+-    const double metersPerTile = util::M2PI * util::EARTH_RADIUS_M * std::cos(tileLat) / tilesAcross;
+     const double extent = static_cast<double>(util::EXTENT);
+ 
+     std::vector<double> elevation(n * n);
+     for (std::size_t j = 0; j < n; j++) {
+         for (std::size_t i = 0; i < n; i++) {
+-            const double u = static_cast<double>(i) / static_cast<double>(TerrainGridSegments);
+-            const double v = static_cast<double>(j) / static_cast<double>(TerrainGridSegments);
+-            elevation[j * n + i] = dem != nullptr ? dem->getElevation(offsetX + u * size, offsetY + v * size) : 0.0;
++            elevation[j * n + i] = dem.elevation(static_cast<double>(i) / static_cast<double>(TerrainGridSegments),
++                                                 static_cast<double>(j) / static_cast<double>(TerrainGridSegments));
+         }
+     }
++    // Stitched edges. North and south take the corners; west and east keep their own corner vertices out of it.
++    const auto stitched = [&](int side, std::size_t k) {
++        const double t = static_cast<double>(k) / static_cast<double>(TerrainGridSegments);
++        const auto& edge = *stitch[static_cast<std::size_t>(side)];
++        return terrain_stitch::interpolateEdge(edge.heights, edge.u0 + (edge.u1 - edge.u0) * t);
++    };
++    for (std::size_t k = 0; k < n; ++k) {
++        if (stitch[terrain_stitch::North]) elevation[k] = stitched(terrain_stitch::North, k);
++        if (stitch[terrain_stitch::South]) elevation[(n - 1) * n + k] = stitched(terrain_stitch::South, k);
++    }
++    for (std::size_t k = 1; k + 1 < n; ++k) {
++        if (stitch[terrain_stitch::West]) elevation[k * n] = stitched(terrain_stitch::West, k);
++        if (stitch[terrain_stitch::East]) elevation[k * n + (n - 1)] = stitched(terrain_stitch::East, k);
++    }
+ 
+     TerrainMesh mesh;
+-    mesh.vertices.resize(n * n * 3 * sizeof(float));
++    mesh.vertices.resize(n * n * 4 * sizeof(float));
+     auto* out = reinterpret_cast<float*>(mesh.vertices.data());
+     for (std::size_t j = 0; j < n; j++) {
+         for (std::size_t i = 0; i < n; i++) {
+             const double e = elevation[j * n + i];
+-            float* vertex = out + (j * n + i) * 3;
++            float* vertex = out + (j * n + i) * 4;
+             vertex[0] = static_cast<float>(static_cast<double>(i) / static_cast<double>(TerrainGridSegments) * extent);
+             vertex[1] = static_cast<float>(static_cast<double>(j) / static_cast<double>(TerrainGridSegments) * extent);
+             vertex[2] = static_cast<float>(e * exaggeration);
++            vertex[3] = 0.0f; // not a skirt vertex
+         }
+     }
+     mesh.vertexCount = n * n;
+ 
+     // Skirt (GL JS `_buildSkirts`): a frame hanging below each edge, so hairline gaps where tiles of different zoom
+     // meet (their edge vertices differ) are covered. GL JS uses a fifth of the tile width.
+-    const double skirtMeters = metersPerTile / 5.0;
+     const std::size_t skirtVertexBase = mesh.vertexCount;
+-    mesh.vertices.resize((n * n + 4 * n) * 3 * sizeof(float));
++    mesh.vertices.resize((n * n + 4 * n) * 4 * sizeof(float));
+     out = reinterpret_cast<float*>(mesh.vertices.data());
+     // Edge vertex indices, per side, in order along the edge.
+     const auto edgeIndex = [&](int side, std::size_t k) -> std::size_t {
+@@ -100,11 +146,12 @@ TerrainMesh buildTerrainMesh(
+     };
+     for (int side = 0; side < 4; ++side) {
+         for (std::size_t k = 0; k < n; ++k) {
+-            const float* src = out + edgeIndex(side, k) * 3;
+-            float* dst = out + (skirtVertexBase + static_cast<std::size_t>(side) * n + k) * 3;
++            const float* src = out + edgeIndex(side, k) * 4;
++            float* dst = out + (skirtVertexBase + static_cast<std::size_t>(side) * n + k) * 4;
+             dst[0] = src[0];
+             dst[1] = src[1];
+-            dst[2] = src[2] - static_cast<float>(skirtMeters);
++            dst[2] = src[2];
++            dst[3] = 1.0f; // lowered by the skirt length in the vertex shader (GL JS `u_ele_delta`)
+         }
+     }
+     mesh.vertexCount = n * n + 4 * n;
+@@ -185,7 +232,15 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+     // the finer tile and shared edges agree.
+     for (const auto& updated : terrain->takeUpdatedTiles()) {
+         layerGroup->removeDrawablesIf([&](gfx::Drawable& drawable) {
+-            return drawable.getTileID() && terrain->sourceTileFor(drawable.getTileID()->canonical) == updated;
++            if (!drawable.getTileID()) {
++                return false;
++            }
++            if (terrain->sourceTileFor(drawable.getTileID()->canonical) == updated) {
++                return true;
++            }
++            // The mesh also follows the edge of a coarser neighbour it is stitched to.
++            const auto info = stitchInfo.find(*drawable.getTileID());
++            return info != stitchInfo.end() && std::ranges::find(info->second.sources, updated) != info->second.sources.end();
+         });
+     }
+ 
+@@ -224,15 +279,57 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+     const std::unordered_set<OverscaledTileID> covered(tileCover.begin(), tileCover.end());
+     layerGroup->removeDrawablesIf(
+         [&](gfx::Drawable& drawable) { return drawable.getTileID() && !covered.contains(*drawable.getTileID()); });
++    for (auto it = stitchInfo.begin(); it != stitchInfo.end();) {
++        it = covered.contains(it->first) ? std::next(it) : stitchInfo.erase(it);
++    }
+ 
+     cover = tileCover;
+ 
++    std::set<std::tuple<uint8_t, uint32_t, uint32_t>> coveredCanonical;
++    for (const auto& id : tileCover) {
++        coveredCanonical.emplace(id.canonical.z, id.canonical.x, id.canonical.y);
++    }
++    const auto isCovered = [&](const CanonicalTileID& id) { return coveredCanonical.contains({id.z, id.x, id.y}); };
++
+     std::unique_ptr<gfx::DrawableBuilder> builder;
+     for (const auto& tileID : tileCover) {
++        const auto& canonical = tileID.canonical;
++
++        // Edges that border a coarser tile are stitched to it, so the signature of what the mesh depends on includes
++        // the neighbours and the DEM tiles they currently use: when one of them changes, the mesh is rebuilt.
++        std::array<std::optional<CanonicalTileID>, 4> coarse;
++        std::array<std::optional<TerrainTileManager::SourceTile>, 4> coarseSource;
++        StitchInfo stitchNow;
++        stitchNow.signature = 1469598103934665603ULL;
++        const auto mix = [&](uint64_t value) { stitchNow.signature = (stitchNow.signature ^ value) * 1099511628211ULL; };
++        for (int side = 0; side < 4; ++side) {
++            coarse[side] = terrain_stitch::coarserNeighbour(canonical, side, isCovered);
++            if (!coarse[side]) {
++                continue;
++            }
++            const auto& c = *coarse[side];
++            mix(static_cast<uint64_t>(side) + 1);
++            mix((static_cast<uint64_t>(c.z) << 56) ^ (static_cast<uint64_t>(c.x) << 28) ^ c.y);
++            coarseSource[side] = terrain->getSourceTile(c);
++            if (coarseSource[side]) {
++                const auto& id = coarseSource[side]->id;
++                mix((static_cast<uint64_t>(id.z) << 56) ^ (static_cast<uint64_t>(id.x) << 28) ^ id.y);
++            } else {
++                mix(~0ULL);
++            }
++            if (const auto ideal = terrain->sourceTileFor(c)) {
++                stitchNow.sources.push_back(*ideal);
++            }
++        }
++
+         if (layerGroup->getDrawableCount(RenderPass::Translucent, tileID) > 0) {
+-            continue;
++            const auto info = stitchInfo.find(tileID);
++            if (info != stitchInfo.end() && info->second.signature == stitchNow.signature) {
++                continue;
++            }
++            layerGroup->removeDrawablesIf(
++                [&](gfx::Drawable& drawable) { return drawable.getTileID() && *drawable.getTileID() == tileID; });
+         }
+-        const auto& canonical = tileID.canonical;
+         const auto source = terrain->getSourceTile(canonical);
+         if (!source && !terrain->isMissing(canonical)) {
+             continue; // still loading
+@@ -251,26 +348,34 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+             builder->setVertexAttrId(shaders::idTerrainPosVertexAttribute);
+         }
+ 
+-        // The terrain tile is a square of the (coarser) DEM tile it samples, as GL JS's DEM matrix selects.
+-        double offsetX = 0.0;
+-        double offsetY = 0.0;
+-        double sampleSize = 0.0;
+-        if (source) {
+-            const int shift = canonical.z - source->id.z;
+-            const double dim = static_cast<double>(source->data->dim);
+-            sampleSize = dim / static_cast<double>(1ull << shift);
+-            offsetX = static_cast<double>(canonical.x - (source->id.x << shift)) * sampleSize;
+-            offsetY = static_cast<double>(canonical.y - (source->id.y << shift)) * sampleSize;
++        // The mesh samples its square of the (coarser) DEM tile, and follows the edge of coarser neighbours.
++        std::array<std::optional<EdgeStitch>, 4> stitch;
++        for (int side = 0; side < 4; ++side) {
++            if (!coarse[side] || (!coarseSource[side] && !terrain->isMissing(*coarse[side]))) {
++                continue; // no neighbour mesh yet (still loading)
++            }
++            const TileDem neighbourDem = tileDemFor(*coarse[side], coarseSource[side]);
++            EdgeStitch edge;
++            edge.heights.resize(TerrainGridPoints);
++            for (std::size_t k = 0; k < TerrainGridPoints; ++k) {
++                const double p = static_cast<double>(k) / static_cast<double>(TerrainGridSegments);
++                // The neighbour's facing edge: its south edge for our north edge, and so on.
++                switch (side) {
++                    case terrain_stitch::North: edge.heights[k] = neighbourDem.elevation(p, 1.0); break;
++                    case terrain_stitch::South: edge.heights[k] = neighbourDem.elevation(p, 0.0); break;
++                    case terrain_stitch::West: edge.heights[k] = neighbourDem.elevation(1.0, p); break;
++                    default: edge.heights[k] = neighbourDem.elevation(0.0, p); break;
++                }
++            }
++            edge.u0 = terrain_stitch::coarseEdgeParameter(canonical, *coarse[side], side, 0.0);
++            edge.u1 = terrain_stitch::coarseEdgeParameter(canonical, *coarse[side], side, 1.0);
++            stitch[static_cast<std::size_t>(side)] = std::move(edge);
+         }
+-        auto mesh = buildTerrainMesh(source ? source->data.get() : nullptr,
+-                                     offsetX,
+-                                     offsetY,
+-                                     sampleSize,
+-                                     updateParameters.terrainExaggeration,
+-                                     canonical);
++        stitchInfo[tileID] = std::move(stitchNow);
++        auto mesh = buildTerrainMesh(tileDemFor(canonical, source), updateParameters.terrainExaggeration, stitch);
+         const auto vertexCount = mesh.vertexCount;
+         const auto indexCount = mesh.indices.size();
+-        builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float3);
++        builder->setRawVertices(std::move(mesh.vertices), vertexCount, gfx::AttributeDataType::Float4);
+         SegmentVector segments;
+         segments.emplace_back(0, 0, vertexCount, indexCount);
+         builder->setSegments(gfx::Triangles(), std::move(mesh.indices), segments.data(), segments.size());
+@@ -319,7 +424,10 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+         static_assert(sizeof(TerrainFogUBO) == 4 * 16);
+         TerrainFogUBO fogUBO{};
+         fogUBO.params = {1.0f, 0.0f, 1.0f, 0.0f};
+-        fogUBO.depthRange = {1.0f, 2.0f, 0.0f, 0.0f};
++        // GL JS `Terrain#getSkirtLength(zoom)`: a fifth of the tile width at the map zoom, in metres at the equator.
++        const auto skirtLength = static_cast<float>(util::M2PI * util::EARTH_RADIUS_M /
++                                                    std::pow(2.0, std::max(state.getZoom(), 0.0)) / 5.0);
++        fogUBO.depthRange = {1.0f, 2.0f, skirtLength, 0.0f};
+         double nearDistance = 1.0;
+         double farDistance = 2.0;
+         if (evaluatedSky != nullptr && !globeShader && state.getFogDepthRange(nearDistance, farDistance)) {
+@@ -329,7 +437,7 @@ void TerrainPass::update(gfx::ShaderRegistry& shaders,
+             fogUBO.fogColor = {sky.fogColor.r, sky.fogColor.g, sky.fogColor.b, sky.fogColor.a};
+             fogUBO.horizonColor = {sky.horizonColor.r, sky.horizonColor.g, sky.horizonColor.b, sky.horizonColor.a};
+             fogUBO.params = {sky.fogGroundBlend, static_cast<float>(opacity), sky.horizonFogBlend, 0.0f};
+-            fogUBO.depthRange = {static_cast<float>(nearDistance), static_cast<float>(farDistance), 0.0f, 0.0f};
++            fogUBO.depthRange = {static_cast<float>(nearDistance), static_cast<float>(farDistance), skirtLength, 0.0f};
+         }
+         if (!fogUniformBuffer) {
+             fogUniformBuffer = context.createUniformBuffer(&fogUBO, sizeof(fogUBO), false, false);
+diff --git a/src/mln/renderer/terrain_pass.hpp b/src/mln/renderer/terrain_pass.hpp
+index 89403a5e3902..0833905eda6a 100644
+--- a/src/mln/renderer/terrain_pass.hpp
++++ b/src/mln/renderer/terrain_pass.hpp
+@@ -66,6 +66,12 @@ private:
+     std::shared_ptr<TerrainTileManager> terrain;
+     std::optional<Tileset> tileset;
+     std::function<void()> onTileLoaded;
++    /// What a tile's mesh depends on beyond its own DEM: the coarser neighbours its edges are stitched to.
++    struct StitchInfo {
++        uint64_t signature = 0;
++        std::vector<CanonicalTileID> sources; // the DEM tiles those neighbours sample
++    };
++    std::map<OverscaledTileID, StitchInfo> stitchInfo;
+     uint8_t demZoom = 0; // the terrain tile cover zoom (its DEM tiles are one zoom coarser, GL JS deltaZoom)
+     uint16_t tileSize = 512;
+     double builtZoom = -1;
+diff --git a/src/mln/renderer/terrain_stitch.hpp b/src/mln/renderer/terrain_stitch.hpp
+new file mode 100644
+index 000000000000..ff1f9e254b41
+--- /dev/null
++++ b/src/mln/renderer/terrain_stitch.hpp
+@@ -0,0 +1,73 @@
++#pragma once
++
++#include <mln/tile/tile_id.hpp>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <functional>
++#include <optional>
++#include <vector>
++
++namespace mln {
++namespace terrain_stitch {
++
++/// Sides of a terrain tile, in the order the mesh builder uses.
++enum Side : int { North = 0, South = 1, West = 2, East = 3 };
++
++/// The covering tile that borders `tile` on `side` and is coarser (a lower zoom), if there is one. Where the
++/// neighbour is at the same zoom or finer (or not covered) the two meshes already meet, or the other tile adapts.
++/// `isCovered` says whether a canonical tile is part of the terrain tile cover.
++inline std::optional<CanonicalTileID> coarserNeighbour(const CanonicalTileID& tile,
++                                                       int side,
++                                                       const std::function<bool(const CanonicalTileID&)>& isCovered) {
++    const int64_t tilesAcross = static_cast<int64_t>(1) << tile.z;
++    int64_t x = tile.x;
++    int64_t y = tile.y;
++    switch (side) {
++        case North: --y; break;
++        case South: ++y; break;
++        case West: --x; break;
++        default: ++x; break;
++    }
++    if (x < 0 || y < 0 || x >= tilesAcross || y >= tilesAcross) {
++        return std::nullopt; // outside the world (world wraps are not stitched)
++    }
++    if (isCovered(CanonicalTileID(tile.z, static_cast<uint32_t>(x), static_cast<uint32_t>(y)))) {
++        return std::nullopt; // same zoom
++    }
++    for (int z = static_cast<int>(tile.z) - 1; z >= 0; --z) {
++        const int shift = static_cast<int>(tile.z) - z;
++        const CanonicalTileID ancestor(static_cast<uint8_t>(z), static_cast<uint32_t>(x >> shift), static_cast<uint32_t>(y >> shift));
++        if (isCovered(ancestor)) {
++            return ancestor;
++        }
++    }
++    return std::nullopt; // finer neighbours: they adapt to this tile
++}
++
++/// Where along the coarse tile's facing edge (0..1) the point at `t` (0..1) along the fine tile's `side` edge lies.
++/// The edges run along x for north/south and along y for west/east.
++inline double coarseEdgeParameter(const CanonicalTileID& fine, const CanonicalTileID& coarse, int side, double t) {
++    const bool alongX = side == North || side == South;
++    const double fineIndex = alongX ? fine.x : fine.y;
++    const double coarseIndex = alongX ? coarse.x : coarse.y;
++    const double position = (fineIndex + t) / std::ldexp(1.0, fine.z); // 0..1 across the world
++    return position * std::ldexp(1.0, coarse.z) - coarseIndex;
++}
++
++/// The height of the coarse mesh's edge at parameter `u` (0..1): the mesh's edge is the straight line between its
++/// vertices, whose heights are `edge`.
++inline double interpolateEdge(const std::vector<double>& edge, double u) {
++    if (edge.empty()) {
++        return 0.0;
++    }
++    const double position = std::clamp(u, 0.0, 1.0) * static_cast<double>(edge.size() - 1);
++    const auto k = static_cast<std::size_t>(std::floor(position));
++    const std::size_t next = std::min(k + 1, edge.size() - 1);
++    const double f = position - static_cast<double>(k);
++    return edge[k] * (1.0 - f) + edge[next] * f;
++}
++
++} // namespace terrain_stitch
++} // namespace mln
+diff --git a/src/mln/renderer/tile_pyramid.cpp b/src/mln/renderer/tile_pyramid.cpp
+index c7303ccf0b29..b447404ab720 100644
+--- a/src/mln/renderer/tile_pyramid.cpp
++++ b/src/mln/renderer/tile_pyramid.cpp
+@@ -104,7 +104,12 @@ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& l
+ 
+     const auto type = sourceImpl.type;
+     // Determine the overzooming/underzooming amounts and required tiles.
++    // With terrain GL JS rounds the zoom of raster-dem sources like raster ones (`roundZoom` is true for both).
++    const bool terrain = parameters.transformState.getTileElevationRange() != nullptr;
+     int32_t overscaledZoom = util::coveringZoomLevel(zoom, type, tileSize);
++    if (terrain && type == SourceType::RasterDEM) {
++        overscaledZoom = static_cast<int32_t>(std::round(zoom + std::log2(512.0 / tileSize)));
++    }
+     int32_t tileZoom = overscaledZoom;
+     int32_t panZoom = zoomRange.max;
+ 
+@@ -121,7 +126,11 @@ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& l
+                                                      .tileLodScale = parameters.tileLodScale,
+                                                      .tileLodPitchThreshold = parameters.tileLodPitchThreshold,
+                                                      .tileLodMode = parameters.tileLodMode,
+-                                                     .terrainVariableZoom = true}; // with terrain, as GL JS does
++                                                     .terrainVariableZoom = true, // with terrain, as GL JS does
++                                                     .roundZoom = type == SourceType::Raster ||
++                                                                  type == SourceType::RasterDEM ||
++                                                                  type == SourceType::Video,
++                                                     .centerZoomShift = std::log2(512.0 / tileSize)};
+ 
+     if (std::cmp_greater_equal(overscaledZoom, zoomRange.min)) {
+         int32_t idealZoom = std::min<int32_t>(zoomRange.max, overscaledZoom);
+diff --git a/src/mln/shaders/vulkan/terrain.cpp b/src/mln/shaders/vulkan/terrain.cpp
+index dad9b9f8d247..762713de0e3f 100644
+--- a/src/mln/shaders/vulkan/terrain.cpp
++++ b/src/mln/shaders/vulkan/terrain.cpp
+@@ -7,7 +7,7 @@ namespace shaders {
+ using TerrainShaderSource = ShaderSource<BuiltIn::TerrainShader, gfx::Backend::Type::Vulkan>;
+ 
+ const std::array<AttributeInfo, 1> TerrainShaderSource::attributes = {
+-    AttributeInfo{0, gfx::AttributeDataType::Float3, idTerrainPosVertexAttribute},
++    AttributeInfo{0, gfx::AttributeDataType::Float4, idTerrainPosVertexAttribute},
+ };
+ const std::array<TextureInfo, 1> TerrainShaderSource::textures = {
+     TextureInfo{0, idTerrainDrapeTexture},
+diff --git a/src/mln/util/tile_cover.cpp b/src/mln/util/tile_cover.cpp
+index f7ce1efa2b7f..533da9bfaeae 100644
+--- a/src/mln/util/tile_cover.cpp
++++ b/src/mln/util/tile_cover.cpp
+@@ -711,7 +711,8 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+     // the camera-to-centre distance (the centre sits on the terrain, at the centre elevation).
+     const globe::TileZoomConstants terrainZoomConstants(transform.getFieldOfView() * 180.0 / std::numbers::pi);
+     const double terrainFovDegrees = transform.getFieldOfView() * 180.0 / std::numbers::pi;
+-    const double terrainCenterZoom = transform.getZoom() + (z - std::floor(transform.getZoom()));
++    const double terrainCenterZoom = transform.getZoom() +
++                                     (state.centerZoomShift ? *state.centerZoomShift : (z - std::floor(transform.getZoom())));
+     const double terrainDistanceZ = std::max(std::abs(cameraCoord[2] - centerElevation * metersToTileUnits), 1e-9);
+     // The centre is the map's lat/lng at the centre elevation (GL JS `worldFromLngLat(center, elevation)`), not the
+     // screen-centre ray hit on sea level, which lies kilometres away at high pitch when the centre is elevated.
+@@ -749,12 +750,13 @@ std::vector<OverscaledTileID> tileCover(const TileCoverParameters& state,
+         bool shouldSplitTile;
+         if (terrainLod) {
+             const vec3 toTile = node.aabb.distanceXYZ(cameraCoord);
+-            const double desired = std::floor(globe::calculateTileZoom(terrainZoomConstants,
++            const double tileZoomValue = globe::calculateTileZoom(terrainZoomConstants,
+                                                                        terrainCenterZoom,
+                                                                        std::hypot(toTile[0], toTile[1]),
+                                                                        terrainDistanceZ,
+                                                                        terrainDistanceToCenter3d,
+-                                                                       terrainFovDegrees));
++                                                                       terrainFovDegrees);
++            const double desired = state.roundZoom ? std::round(tileZoomValue) : std::floor(tileZoomValue);
+             const auto targetZoom = static_cast<uint8_t>(std::clamp(desired, 0.0, static_cast<double>(maxZoom)));
+             shouldSplitTile = node.zoom < targetZoom;
+         } else if (state.tileLodMode == TileLodMode::Distance) {
+diff --git a/src/mln/util/tile_cover.hpp b/src/mln/util/tile_cover.hpp
+index 5361031d7482..bb911d2cd831 100644
+--- a/src/mln/util/tile_cover.hpp
++++ b/src/mln/util/tile_cover.hpp
+@@ -44,6 +44,13 @@ struct TileCoverParameters {
+     /// the camera, as GL JS does (`allowVariableZoom` is true with terrain), so a pitched view does not need thousands
+     /// of tiles of one zoom out to the horizon. Needs a zoom range wider than a single level.
+     bool terrainVariableZoom = false;
++    /// With terrain, round each tile's zoom instead of flooring it (GL JS `roundZoom`: true for raster and raster-dem
++    /// sources, false for the terrain's own tiles).
++    bool roundZoom = false;
++    /// With terrain, how much finer the centre zoom handed to the tile-zoom function is than the map zoom:
++    /// `log2(512 / tile size)` (GL JS `transform.zoom + scaleZoom(transform.tileSize / options.tileSize)`). Unset: the
++    /// distance between the cover's zoom and the floor of the map zoom.
++    std::optional<double> centerZoomShift;
+ };
+ 
+ int32_t coveringZoomLevel(double z, style::SourceType type, uint16_t tileSize) noexcept;
+diff --git a/test/renderer/terrain_tile_manager.test.cpp b/test/renderer/terrain_tile_manager.test.cpp
+index c0aa777c5091..609e1baa9c6e 100644
+--- a/test/renderer/terrain_tile_manager.test.cpp
++++ b/test/renderer/terrain_tile_manager.test.cpp
+@@ -1,6 +1,7 @@
+ #include <mln/test/util.hpp>
+ 
+ #include <mln/geometry/dem_data.hpp>
++#include <mln/renderer/terrain_stitch.hpp>
+ #include <mln/renderer/terrain_tile_manager.hpp>
+ #include <mln/util/image.hpp>
+ #include <mln/util/tileset.hpp>
+@@ -69,3 +70,36 @@ TEST(TerrainTileManager, SourceTileIsOneZoomCoarserAndCapped) {
+     // Below the source's minimum zoom there is none.
+     EXPECT_FALSE(manager.sourceTileFor({1, 0, 0}).has_value());
+ }
++
++TEST(TerrainStitch, CoarserNeighbour) {
++    using namespace terrain_stitch;
++    // Tile 14/7964/5044 has a same-zoom west neighbour and a coarser (z13) north one.
++    const auto covered = [](const CanonicalTileID& id) {
++        return (id.z == 14 && id.x == 7963 && id.y == 5044) || (id.z == 13 && id.x == 3982 && id.y == 2521) ||
++               (id.z == 14 && id.x == 7964 && id.y == 5044);
++    };
++    const CanonicalTileID tile(14, 7964, 5044);
++    EXPECT_FALSE(coarserNeighbour(tile, West, covered).has_value());  // same zoom
++    EXPECT_FALSE(coarserNeighbour(tile, East, covered).has_value());  // not covered (finer or off screen)
++    const auto north = coarserNeighbour(tile, North, covered);
++    ASSERT_TRUE(north.has_value());
++    EXPECT_TRUE(*north == CanonicalTileID(13, 3982, 2521)); // (7964, 5043) >> 1
++    // Off the world edge: nothing.
++    EXPECT_FALSE(coarserNeighbour(CanonicalTileID(3, 0, 0), North, covered).has_value());
++}
++
++TEST(TerrainStitch, EdgeParameterAndInterpolation) {
++    using namespace terrain_stitch;
++    // A z14 tile that is the right half of its z13 parent along x: its edge spans u = 0.5 .. 1.
++    const CanonicalTileID fine(14, 7965, 5045);
++    const CanonicalTileID coarse(13, 3982, 2522);
++    EXPECT_DOUBLE_EQ(coarseEdgeParameter(fine, coarse, North, 0.0), 0.5);
++    EXPECT_DOUBLE_EQ(coarseEdgeParameter(fine, coarse, North, 1.0), 1.0);
++    EXPECT_DOUBLE_EQ(coarseEdgeParameter(fine, coarse, North, 0.5), 0.75);
++    // The coarse mesh edge is the line between its vertices.
++    const std::vector<double> edge{0.0, 10.0, 30.0};
++    EXPECT_DOUBLE_EQ(interpolateEdge(edge, 0.0), 0.0);
++    EXPECT_DOUBLE_EQ(interpolateEdge(edge, 0.25), 5.0);
++    EXPECT_DOUBLE_EQ(interpolateEdge(edge, 0.75), 20.0);
++    EXPECT_DOUBLE_EQ(interpolateEdge(edge, 1.0), 30.0);
++}
