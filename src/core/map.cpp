@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
 #include "map.hpp"
+#include <cmath>
 #include "map_p.hpp"
 
 #include "conversion_p.hpp"
@@ -1019,6 +1020,34 @@ void Map::clearTerrain() {
 QVariant Map::terrainElevation(const Coordinate &coordinate) const {
     const auto elevation = d_ptr->mapObj->queryTerrainElevation(mln::LatLng{coordinate.first, coordinate.second});
     return elevation ? QVariant(*elevation) : QVariant();
+}
+
+QVariant Map::coordinateForPixelAtElevation(const QPointF &pixel, double elevation) const {
+    const auto latLng = d_ptr->mapObj->latLngForPixelAtElevation(mln::ScreenCoordinate{pixel.x(), pixel.y()}, elevation);
+    return latLng ? QVariant::fromValue(Coordinate{latLng->latitude(), latLng->longitude()}) : QVariant();
+}
+
+QVariant Map::terrainPointForPixel(const QPointF &pixel) const {
+    const auto point = d_ptr->mapObj->terrainPointForPixel(mln::ScreenCoordinate{pixel.x(), pixel.y()});
+    if (!point) {
+        return {};
+    }
+    return QVariant::fromValue(
+        QList<double>{point->latLng.latitude(), point->latLng.longitude(), point->elevation});
+}
+
+bool Map::isGlobeRendering() const {
+    return d_ptr->mapObj->isGlobeRendering();
+}
+
+void Map::setElevationHold(bool hold) {
+    d_ptr->mapObj->setElevationHold(hold);
+}
+
+bool Map::setLocationAtPoint(const Coordinate &coordinate, const QPointF &pixel, double elevation) {
+    return d_ptr->mapObj->setLocationAtPoint(mln::LatLng{coordinate.first, coordinate.second},
+                                             mln::ScreenCoordinate{pixel.x(), pixel.y()},
+                                             std::isnan(elevation) ? std::nullopt : std::optional<double>(elevation));
 }
 
 /*!

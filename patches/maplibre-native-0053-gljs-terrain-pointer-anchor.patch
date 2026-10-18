@@ -1,0 +1,417 @@
+--- a/include/mln/map/map.hpp
++++ b/include/mln/map/map.hpp
+@@ -135,6 +135,26 @@
+     /// The camera's own altitude in metres above sea level.
+     double getCameraAltitude() const;
+ 
++    // Terrain-aware pointer anchoring (GL JS `Transform.screenPointToLocation` at an elevation and
++    // `Transform.setLocationAtPoint`, as used by the handler manager for drag-pan and scroll-zoom).
++    struct TerrainPoint {
++        LatLng latLng;
++        double elevation; ///< metres above sea level, exaggeration included
++    };
++    /// The location under `pixel` on the plane `elevation` metres above sea level; nullopt above the horizon.
++    std::optional<LatLng> latLngForPixelAtElevation(const ScreenCoordinate& pixel, double elevation) const;
++    /// The terrain surface point under `pixel` (ray marched against the DEM); nullopt without terrain, without loaded
++    /// DEM there, or above the horizon.
++    std::optional<TerrainPoint> terrainPointForPixel(const ScreenCoordinate& pixel) const;
++    /// Moves the centre (no animation) so that `latLng` is under `pixel`, solving on the plane at `elevation` metres
++    /// (the centre's plane when not given). Returns false, leaving the camera alone, when `pixel` is above the horizon.
++    bool setLocationAtPoint(const LatLng& latLng, const ScreenCoordinate& pixel, std::optional<double> elevation);
++    /// GL JS `holdElevation` / `releaseElevation`: while held, a gesture leaves the centre elevation (and so the camera)
++    /// alone; on release the centre is put back onto the terrain with the camera kept in place.
++    void setElevationHold(bool hold);
++    /// Whether the map is currently drawn as a globe (globe projection at low zoom) rather than Mercator.
++    bool isGlobeRendering() const;
++
+     // Projection
+     ScreenCoordinate pixelForLatLng(const LatLng&) const;
+     LatLng latLngForPixel(const ScreenCoordinate&) const;
+--- a/src/mln/map/map.cpp
++++ b/src/mln/map/map.cpp
+@@ -5,6 +5,7 @@
+ #include <mln/map/map_impl.hpp>
+ #include <mln/map/transform.hpp>
+ #include <mln/math/angles.hpp>
++#include <mln/util/projection.hpp>
+ #include <mln/style/projection.hpp>
+ #include <mln/style/projection_definition.hpp>
+ #include <mln/style/terrain.hpp>
+@@ -485,6 +486,66 @@
+     return impl->terrainElevationAt(latLng);
+ }
+ 
++std::optional<LatLng> Map::latLngForPixelAtElevation(const ScreenCoordinate& pixel, double elevation) const {
++    // The state-level unprojections take the pixel y up (see Transform::screenCoordinateToLatLng).
++    const TransformState& state = impl->transform.getState();
++    return state.screenCoordinateToLatLngAtElevation({pixel.x, state.getSize().height - pixel.y}, elevation, LatLng::Unwrapped);
++}
++
++std::optional<Map::TerrainPoint> Map::terrainPointForPixel(const ScreenCoordinate& pixel) const {
++    if (!impl->terrainElevation) {
++        return std::nullopt;
++    }
++    const double exaggeration = getTerrainExaggeration();
++    // GL JS reads the rendered depth; here the view ray is marched against the DEM the terrain is built from.
++    const TransformState& rayState = impl->transform.getState();
++    const auto hit = rayState.raycastTerrain(
++        {pixel.x, rayState.getSize().height - pixel.y}, [this, exaggeration](const LatLng& latLng) -> std::optional<double> {
++            const auto elevation = impl->terrainElevationAt(latLng.wrapped(), true);
++            return elevation ? std::optional<double>(*elevation * exaggeration) : std::nullopt;
++        });
++    if (!hit) {
++        return std::nullopt;
++    }
++    return TerrainPoint{hit->latLng, hit->elevation};
++}
++
++bool Map::setLocationAtPoint(const LatLng& latLng, const ScreenCoordinate& pixel, std::optional<double> elevation) {
++    const TransformState& state = impl->transform.getState();
++    const auto current = state.screenCoordinateToLatLngAtElevation({pixel.x, state.getSize().height - pixel.y},
++                                                                   elevation.value_or(state.getCenterAltitude()),
++                                                                   LatLng::Unwrapped);
++    if (!current) {
++        return false;
++    }
++    const double scale = state.getScale();
++    const Point<double> centre = mln::Projection::project(state.getLatLng(LatLng::Unwrapped), scale);
++    const Point<double> wanted = mln::Projection::project(latLng, scale);
++    const Point<double> now = mln::Projection::project(*current, scale);
++    // Shortest way round the world in x, so a drag across the antimeridian does not jump.
++    const double world = mln::Projection::worldSize(scale);
++    double dx = wanted.x - now.x;
++    dx -= world * std::round(dx / world);
++    const Point<double> target{centre.x + dx, centre.y + (wanted.y - now.y)};
++    impl->cameraMutated = true;
++    impl->transform.jumpTo(CameraOptions().withCenter(mln::Projection::unproject(target, scale)));
++    impl->onUpdate();
++    return true;
++}
++
++bool Map::isGlobeRendering() const {
++    return impl->transform.getState().isGlobeRendering();
++}
++
++void Map::setElevationHold(bool hold) {
++    if (impl->elevationHeld == hold) {
++        return;
++    }
++    impl->elevationHeld = hold;
++    impl->elevationReleased = !hold;
++    impl->onUpdate();
++}
++
+ double Map::getElevation() const {
+     return impl->transform.getElevation();
+ }
+--- a/src/mln/map/map_impl.hpp
++++ b/src/mln/map/map_impl.hpp
+@@ -89,7 +89,7 @@
+ 
+     /// 3D terrain: the drawn terrain height at `latLng` in metres, without the exaggeration, or nullopt where it is
+     /// not loaded (or there is no terrain). Fetches the DEM tiles it needs.
+-    std::optional<double> terrainElevationAt(const LatLng&);
++    std::optional<double> terrainElevationAt(const LatLng&, bool fineOnly = false);
+     /// 3D terrain: sets the camera centre's altitude from the terrain under it and keeps the camera out of the terrain.
+     void updateTerrainCamera();
+ 
+@@ -137,6 +137,8 @@
+     double terrainElevationExaggeration = 1.0;
+     uint16_t terrainTileSize = 512; // the terrain source's tile size (sets the terrain tiles' zoom)
+     bool terrainElevationApplied = false;
++    bool elevationReleased = false; ///< the hold just ended: put the centre back on the terrain, camera in place
++    bool elevationHeld = false;     ///< a gesture holds the centre elevation (GL JS holdElevation)
+ };
+ 
+ // Forward declaration of this method is required for the MapProjection class
+--- a/src/mln/map/map_impl.cpp
++++ b/src/mln/map/map_impl.cpp
+@@ -184,7 +184,7 @@
+     rendererFrontend.update(std::make_shared<UpdateParameters>(std::move(params)));
+ }
+ 
+-std::optional<double> Map::Impl::terrainElevationAt(const LatLng& latLng) {
++std::optional<double> Map::Impl::terrainElevationAt(const LatLng& latLng, bool fineOnly) {
+     if (!terrainElevation) {
+         return std::nullopt;
+     }
+@@ -193,6 +193,16 @@
+     const auto source = terrainElevation->sourceTileFor(
+         CanonicalTileID(TerrainTileManager::terrainZoomFor(transform.getZoom(), terrainTileSize), 0, 0));
+     const uint8_t demZoom = source ? source->z : 0;
++    if (fineOnly) {
++        // Gesture anchoring: the finest DEM tile that is loaded here, stepping down one zoom at a time (the renderer
++        // draws distant terrain from coarser tiles too), never the 300 m average of the coarse fallback.
++        for (int z = demZoom; z >= std::max(0, static_cast<int>(demZoom) - 6); --z) {
++            if (const auto sample = terrainElevation->sampleElevation(latLng.wrapped(), static_cast<uint8_t>(z), static_cast<uint8_t>(z))) {
++                return sample;
++            }
++        }
++        return std::nullopt;
++    }
+     return terrainElevation->sampleElevation(latLng.wrapped(), demZoom, std::min(coarseZoom, demZoom));
+ }
+ 
+@@ -237,6 +247,24 @@
+     if (!centreElevation) {
+         return;
+     }
++    if (elevationHeld) {
++        // GL JS holdElevation(): a gesture leaves the centre elevation (and the camera with it) alone.
++        return;
++    }
++    if (elevationReleased) {
++        // GL JS putCenterBackOnTerrain(): the gesture ended; slide the centre along the view ray onto the terrain, the
++        // camera pose (and so the picture) unchanged.
++        elevationReleased = false;
++        const bool placed = transform.putCenterOnTerrainKeepingCamera(
++            [this, exaggeration](const LatLng& latLng) -> std::optional<double> {
++                const auto elevation = terrainElevationAt(latLng, true);
++                return elevation ? std::optional<double>(*elevation * exaggeration) : std::nullopt;
++            });
++        if (placed) {
++            terrainElevationApplied = true;
++            return;
++        }
++    }
+     transform.setElevation(*centreElevation * exaggeration);
+     terrainElevationApplied = true;
+ 
+--- a/src/mln/map/transform.hpp
++++ b/src/mln/map/transform.hpp
+@@ -110,6 +110,11 @@
+      */
+     bool raiseCameraAboveTerrain(const std::function<std::optional<double>(const LatLng&)>& elevationAt,
+                                  double marginMeters);
++    /// GL JS `putCenterBackOnTerrain` / `recalculateZoomAndCenter`: moves the centre along the view ray onto the terrain
++    /// (`elevationAt`, metres, exaggeration included) with the camera's position and orientation unchanged, so the picture
++    /// does not change; zoom is re-solved for the new camera-to-centre distance. Returns false (leaving the camera alone)
++    /// when the terrain is not available or the view ray does not reach it.
++    bool putCenterOnTerrainKeepingCamera(const std::function<std::optional<double>(const LatLng&)>& elevationAt);
+ 
+     // North Orientation
+     void setProjectionDefinition(const ProjectionDefinition&);
+--- a/src/mln/map/transform.cpp
++++ b/src/mln/map/transform.cpp
+@@ -612,6 +612,66 @@
+     return true;
+ }
+ 
++bool Transform::putCenterOnTerrainKeepingCamera(const std::function<std::optional<double>(const LatLng&)>& elevationAt) {
++    if (state.isGlobeRendering()) {
++        return false;
++    }
++    const LatLng centre = state.getLatLng(LatLng::Unwrapped);
++    const double pitch = state.getPitch();
++    if (pitch > util::deg2rad(85.5)) {
++        return false;
++    }
++    const double compass = -state.getBearing(); // the state stores the bearing negated
++    const double metersPerPixel = Projection::getMetersPerPixelAtLatitude(centre.latitude(), state.getZoom());
++    const double toCenterPx = state.getCameraToCenterDistance();
++    const double distance = toCenterPx * metersPerPixel;
++    const double cameraAlt = state.getCenterAltitude() + distance * std::cos(pitch);
++    const double metersPerDegreeLat = util::deg2rad(util::EARTH_RADIUS_M);
++    const double metersPerDegreeLon = metersPerDegreeLat * std::cos(util::deg2rad(centre.latitude()));
++    if (metersPerDegreeLon < 1.0) {
++        return false;
++    }
++    // The camera's ground position: behind the centre, against the view direction.
++    const double horizontal = distance * std::sin(pitch);
++    const LatLng camera{centre.latitude() - horizontal * std::cos(compass) / metersPerDegreeLat,
++                        centre.longitude() - horizontal * std::sin(compass) / metersPerDegreeLon};
++
++    // Where the view ray reaches the terrain: the point along it at the terrain's own height (fixed-point).
++    double height = state.getCenterAltitude();
++    LatLng hit = centre;
++    for (int i = 0; i < 8; ++i) {
++        const double reach = (cameraAlt - height) * std::tan(pitch);
++        if (!(cameraAlt - height > 1.0)) {
++            return false;
++        }
++        hit = LatLng{camera.latitude() + reach * std::cos(compass) / metersPerDegreeLat,
++                     camera.longitude() + reach * std::sin(compass) / metersPerDegreeLon};
++        const auto elevation = elevationAt(hit.wrapped());
++        if (!elevation) {
++            return false;
++        }
++        const bool converged = std::abs(*elevation - height) < 0.25;
++        height = *elevation;
++        if (converged) {
++            break;
++        }
++    }
++    const double newHeight = cameraAlt - height;
++    if (!(newHeight > 1.0)) {
++        return false;
++    }
++    const double newDistance = newHeight / std::cos(pitch);
++    const double newMetersPerPixel = newDistance / toCenterPx;
++    const double equatorMetersPerPixelAtZoom0 = std::cos(util::deg2rad(hit.latitude())) * util::M2PI *
++                                                util::EARTH_RADIUS_M / util::tileSize_D;
++    const double newZoom = util::clamp(std::log2(equatorMetersPerPixelAtZoom0 / newMetersPerPixel),
++                                       state.getMinZoomAtLatitude(hit.latitude()),
++                                       state.getMaxZoom());
++    state.setLatLngZoom(hit, newZoom);
++    state.setCenterAltitude(height);
++    return true;
++}
++
+ // MARK: - North Orientation
+ 
+ void Transform::setProjectionDefinition(const ProjectionDefinition& definition) {
+--- a/src/mln/map/transform_state.hpp
++++ b/src/mln/map/transform_state.hpp
+@@ -289,6 +289,24 @@
+                                                     uint8_t atZoom,
+                                                     bool onCenterPlane = false) const;
+ 
++    /// The location under a screen point on the horizontal plane `elevation` metres above sea level (GL JS
++    /// `transform.screenPointToLocation(p, terrain)` / `screenPointToLocationAtElevation`). nullopt when the ray misses
++    /// the plane (the point is above the horizon, or past the far plane).
++    std::optional<LatLng> screenCoordinateToLatLngAtElevation(const ScreenCoordinate&,
++                                                              double elevation,
++                                                              LatLng::WrapMode = LatLng::Unwrapped) const;
++
++    /// GL JS `screenTerrainPointToMercatorCoordinate` / `_raycastTerrain`: marches the view ray through a screen point
++    /// against the terrain (`elevationAt`: metres above sea level, exaggeration included, nullopt where not known) and
++    /// returns where it first enters the terrain from above, with the terrain height there. nullopt when the ray
++    /// misses, the camera is inside the terrain, or the terrain is not known along the ray.
++    struct TerrainHit {
++        LatLng latLng;
++        double elevation;
++    };
++    std::optional<TerrainHit> raycastTerrain(const ScreenCoordinate&,
++                                             const std::function<std::optional<double>(const LatLng&)>& elevationAt) const;
++
+     double zoomScale(double zoom) const;
+     double scaleZoom(double scale) const;
+ 
+--- a/src/mln/map/transform_state.cpp
++++ b/src/mln/map/transform_state.cpp
+@@ -1032,6 +1032,125 @@
+     return projection->unproject(coord.p, 1. / util::tileSize_D, wrapMode);
+ }
+ 
++std::optional<LatLng> TransformState::screenCoordinateToLatLngAtElevation(const ScreenCoordinate& point,
++                                                                         double elevation,
++                                                                         LatLng::WrapMode wrapMode) const {
++    if (size.isEmpty()) {
++        return std::nullopt;
++    }
++    if (isGlobeRendering()) {
++        return VerticalPerspectiveProjection::screenCoordinateToLatLng(*this, point, wrapMode);
++    }
++
++    // As screenCoordinateToTileCoordinate: two points on the view ray, intersected with the plane z = elevation
++    // (the matrices take z in metres).
++    const double flippedY = size.height - point.y;
++    vec4 coord0;
++    vec4 coord1;
++    vec4 point0 = {{point.x, flippedY, 0, 1}};
++    vec4 point1 = {{point.x, flippedY, 1, 1}};
++    matrix::transformMat4(coord0, point0, getInvertedMatrix());
++    matrix::transformMat4(coord1, point1, getInvertedMatrix());
++
++    const double z0 = coord0[2] / coord0[3];
++    const double z1 = coord1[2] / coord1[3];
++    if (!(z0 > z1)) {
++        return std::nullopt; // the ray does not descend: above the horizon
++    }
++    const double t = (elevation - z0) / (z1 - z0);
++    if (!std::isfinite(t) || t < 0.0 || t > 1.0) {
++        return std::nullopt;
++    }
++    const Point<double> p0 = Point<double>(coord0[0], coord0[1]) / coord0[3];
++    const Point<double> p1 = Point<double>(coord1[0], coord1[1]) / coord1[3];
++    const Point<double> p = util::interpolate(p0, p1, t) / scale;
++    return projection->unproject(p, 1. / util::tileSize_D, wrapMode);
++}
++
++std::optional<TransformState::TerrainHit> TransformState::raycastTerrain(
++    const ScreenCoordinate& point,
++    const std::function<std::optional<double>(const LatLng&)>& elevationAt) const {
++    if (size.isEmpty() || isGlobeRendering()) {
++        return std::nullopt;
++    }
++    const double flippedY = size.height - point.y;
++    vec4 coord0;
++    vec4 coord1;
++    vec4 point0 = {{point.x, flippedY, 0, 1}};
++    vec4 point1 = {{point.x, flippedY, 1, 1}};
++    matrix::transformMat4(coord0, point0, getInvertedMatrix());
++    matrix::transformMat4(coord1, point1, getInvertedMatrix());
++    const double z0 = coord0[2] / coord0[3];
++    const double z1 = coord1[2] / coord1[3];
++    if (!(z0 > z1)) {
++        return std::nullopt; // the ray does not descend
++    }
++    const Point<double> p0 = Point<double>(coord0[0], coord0[1]) / coord0[3];
++    const Point<double> p1 = Point<double>(coord1[0], coord1[1]) / coord1[3];
++    const auto at = [&](double t) {
++        return projection->unproject(util::interpolate(p0, p1, t) / scale, 1. / util::tileSize_D, LatLng::Unwrapped);
++    };
++    const auto heightAt = [&](double t) { return z0 + (z1 - z0) * t; };
++
++    // Terrain tops out below ~9 km and bottoms out near sea level: only that band of the ray can meet it.
++    constexpr double maxTerrain = 9000.0;
++    constexpr double minTerrain = -500.0;
++    const double tStart = std::clamp((maxTerrain - z0) / (z1 - z0), 0.0, 1.0);
++    const double tEnd = std::clamp((minTerrain - z0) / (z1 - z0), 0.0, 1.0);
++    if (!(tStart < tEnd)) {
++        return std::nullopt;
++    }
++    // About one sample per 4 m of ground travelled (a DEM cell is ~10 m at the finest zoom).
++    const LatLng a = at(tStart);
++    const LatLng b = at(tEnd);
++    const double metersPerDegree = util::deg2rad(util::EARTH_RADIUS_M);
++    const double groundMeters = std::hypot((b.latitude() - a.latitude()) * metersPerDegree,
++                                           (b.longitude() - a.longitude()) * metersPerDegree *
++                                               std::cos(util::deg2rad(a.latitude())));
++    const int samples = std::clamp(static_cast<int>(std::ceil(groundMeters / 4.0)), 8, 4000);
++
++    // `below(t)`: the ray is under the terrain at t; nullopt where the terrain is unknown.
++    const auto below = [&](double t) -> std::optional<bool> {
++        const auto elevation = elevationAt(at(t));
++        if (!elevation) {
++            return std::nullopt;
++        }
++        return heightAt(t) <= *elevation;
++    };
++
++    double previous = tStart;
++    bool above = false;
++    for (int i = 0; i <= samples; ++i) {
++        const double t = tStart + (tEnd - tStart) * static_cast<double>(i) / static_cast<double>(samples);
++        const auto isBelow = below(t);
++        if (!isBelow) {
++            return std::nullopt;
++        }
++        if (!*isBelow) {
++            above = true;
++        } else if (above) {
++            double lo = previous;
++            double hi = t;
++            for (int k = 0; k < 24; ++k) {
++                const double mid = 0.5 * (lo + hi);
++                const auto midBelow = below(mid);
++                if (!midBelow) {
++                    return std::nullopt;
++                }
++                (*midBelow ? hi : lo) = mid;
++            }
++            const LatLng hit = at(hi);
++            const auto elevation = elevationAt(hit);
++            if (!elevation) {
++                return std::nullopt;
++            }
++            return TerrainHit{hit, *elevation};
++        }
++        previous = t;
++    }
++    return std::nullopt;
++}
++
+ mat4 TransformState::coordinatePointMatrix(const mat4& projMatrix) const {
+     mat4 proj = projMatrix;
+     matrix::scale(proj, proj, util::tileSize_D, util::tileSize_D, 1);

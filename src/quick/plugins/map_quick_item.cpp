@@ -323,6 +323,65 @@ double MapQuickItem::terrainElevation(double latitude, double longitude) const {
     return elevation.isValid() ? elevation.toDouble() : std::numeric_limits<double>::quiet_NaN();
 }
 
+QVariantMap MapQuickItem::terrainPointAt(const QPointF &pixel) const {
+    Q_D(const MapQuickItem);
+
+    if (d->m_map == nullptr) {
+        return {};
+    }
+    const QVariant point = d->m_map->terrainPointForPixel(pixel);
+    if (!point.isValid()) {
+        return {};
+    }
+    const auto values = point.value<QList<double>>();
+    return {{"latitude", values[0]}, {"longitude", values[1]}, {"elevation", values[2]}};
+}
+
+QVariantMap MapQuickItem::coordinateAtElevation(const QPointF &pixel, double elevation) const {
+    Q_D(const MapQuickItem);
+
+    if (d->m_map == nullptr) {
+        return {};
+    }
+    const double plane = std::isnan(elevation) ? d->m_map->elevation() : elevation;
+    const QVariant coordinate = d->m_map->coordinateForPixelAtElevation(pixel, plane);
+    if (!coordinate.isValid()) {
+        return {};
+    }
+    const Coordinate c = coordinate.value<Coordinate>();
+    return {{"latitude", c.first}, {"longitude", c.second}};
+}
+
+bool MapQuickItem::globeRendering() const {
+    Q_D(const MapQuickItem);
+
+    return d->m_map != nullptr && d->m_map->isGlobeRendering();
+}
+
+void MapQuickItem::setElevationHold(bool hold) {
+    Q_D(MapQuickItem);
+
+    if (d->m_map != nullptr) {
+        d->m_map->setElevationHold(hold);
+    }
+}
+
+bool MapQuickItem::setLocationAtPoint(double latitude, double longitude, const QPointF &pixel, double elevation) {
+    Q_D(MapQuickItem);
+
+    if (d->m_map == nullptr) {
+        return false;
+    }
+    if (!d->m_map->setLocationAtPoint({latitude, longitude}, pixel, elevation)) {
+        return false;
+    }
+    const Coordinate coordinate = d->m_map->coordinate();
+    d->m_coordinate = {coordinate.first, coordinate.second};
+    update();
+    emit coordinateChanged();
+    return true;
+}
+
 double MapQuickItem::elevation() const {
     Q_D(const MapQuickItem);
 

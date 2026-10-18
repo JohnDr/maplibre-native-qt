@@ -102,6 +102,19 @@ public:
     Q_INVOKABLE void flyTo(const QVariantMap &camera, const QVariantMap &animation = QVariantMap());
     // Terrain height in metres at a position, without exaggeration; NaN while its elevation tile is loading.
     Q_INVOKABLE double terrainElevation(double latitude, double longitude) const;
+    // GL JS terrain gesture anchoring. Returns {latitude, longitude, elevation} of the terrain point under a pixel
+    // (empty map when there is no terrain/DEM or the pixel is above the horizon).
+    Q_INVOKABLE QVariantMap terrainPointAt(const QPointF &pixel) const;
+    // Moves the centre (no animation) so latitude/longitude is under \a pixel, solved on the plane \a elevation
+    // metres above sea level (NaN: the centre plane). Returns false above the horizon.
+    // Holds/releases the centre elevation for a gesture over terrain (GL JS holdElevation/releaseElevation).
+    Q_INVOKABLE void setElevationHold(bool hold);
+    // True while the map is drawn as a globe (globe projection at low zoom), false when Mercator.
+    Q_INVOKABLE bool globeRendering() const;
+    Q_INVOKABLE bool setLocationAtPoint(double latitude, double longitude, const QPointF &pixel, double elevation);
+    // {latitude, longitude} under a pixel on the plane \a elevation metres up (NaN: the centre plane); empty above
+    // the horizon.
+    Q_INVOKABLE QVariantMap coordinateAtElevation(const QPointF &pixel, double elevation) const;
     // Number of frames the map has rendered since creation (for a frames-per-second readout).
     Q_INVOKABLE int renderedFrames() const;
     // Average CPU time (encoding + rendering) per rendered frame in milliseconds since the previous call; NaN if no

@@ -141,6 +141,20 @@ public:
     void clearTerrain();
     [[nodiscard]] QVariant terrainElevation(const Coordinate &coordinate) const;
 
+    // GL JS terrain gesture anchoring (Transform.screenPointToLocation at an elevation / setLocationAtPoint).
+    // The location under \a pixel on the plane \a elevation metres above sea level; invalid above the horizon.
+    [[nodiscard]] QVariant coordinateForPixelAtElevation(const QPointF &pixel, double elevation) const;
+    // The terrain surface point under \a pixel as (latitude, longitude, elevation in metres); invalid without
+    // terrain/DEM or above the horizon.
+    [[nodiscard]] QVariant terrainPointForPixel(const QPointF &pixel) const;
+    // Moves the centre (no animation) so \a coordinate is under \a pixel, solved at \a elevation metres (the centre
+    // plane when NaN). Returns false above the horizon.
+    bool setLocationAtPoint(const Coordinate &coordinate, const QPointF &pixel, double elevation);
+    // GL JS holdElevation/releaseElevation for the duration of a gesture over terrain.
+    void setElevationHold(bool hold);
+    // True while the map is drawn as a globe (the globe projection at low zoom), false once it is Mercator.
+    [[nodiscard]] bool isGlobeRendering() const;
+
     // Sky (style-spec `sky`, as MapLibre GL JS `map.setSky`): the horizon gradient, the terrain fog and, with the
     // globe projection, the atmosphere. \a properties holds the style-spec sky properties (`sky-color`,
     // `horizon-color`, `fog-color`, `fog-ground-blend`, `horizon-fog-blend`, `sky-horizon-blend`,
