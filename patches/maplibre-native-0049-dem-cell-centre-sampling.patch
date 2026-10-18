@@ -1,0 +1,119 @@
+diff --git a/src/mln/geometry/dem_data.hpp b/src/mln/geometry/dem_data.hpp
+index 9d697373eec4..2c97799ddf1b 100644
+--- a/src/mln/geometry/dem_data.hpp
++++ b/src/mln/geometry/dem_data.hpp
+@@ -24,6 +24,13 @@ public:
+     /// Mirrors GL JS `DEMData#getElevation`, adapted to this class's one-pixel border.
+     double getElevation(double x, double y) const;
+ 
++    /// The elevation, in metres, at a point of the tile given in pixel EDGES: (0, 0) is the top-left corner of the first
++    /// pixel and (`dim`, `dim`) the bottom-right corner of the last, so a tile-fraction `f` is `f * dim`. DEM pixel `i`
++    /// holds the value at its centre, `i + 0.5` (GL JS: `DEM_CELL_CENTER_OFFSET = -0.5` on the CPU, `uv * dim + 1.5` in
++    /// the terrain vertex shader). Use this, not `getElevation`, for anything placed on the map by position: terrain
++    /// meshes, elevation queries, camera elevation. Reads the 1-pixel border at the tile edges.
++    double getElevationAtPoint(double x, double y) const { return getElevation(x - 0.5, y - 0.5); }
++
+     const PremultipliedImage* getImage() const { return &*image; }
+     const std::shared_ptr<PremultipliedImage>& getImagePtr() const { return image; }
+ 
+diff --git a/src/mln/renderer/terrain_pass.cpp b/src/mln/renderer/terrain_pass.cpp
+index d9c24e75ec24..d71972cdde7f 100644
+--- a/src/mln/renderer/terrain_pass.cpp
++++ b/src/mln/renderer/terrain_pass.cpp
+@@ -58,7 +58,7 @@ struct TileDem {
+ 
+     /// The elevation in metres at (u, v) in 0..1 across the terrain tile.
+     double elevation(double u, double v) const {
+-        return data != nullptr ? data->getElevation(offsetX + u * size, offsetY + v * size) : 0.0;
++        return data != nullptr ? data->getElevationAtPoint(offsetX + u * size, offsetY + v * size) : 0.0;
+     }
+ };
+ 
+diff --git a/src/mln/renderer/terrain_tile_manager.cpp b/src/mln/renderer/terrain_tile_manager.cpp
+index 87446db23198..13177716d031 100644
+--- a/src/mln/renderer/terrain_tile_manager.cpp
++++ b/src/mln/renderer/terrain_tile_manager.cpp
+@@ -68,7 +68,7 @@ double TerrainTileManager::getElevation(const LatLng& latLng, uint8_t zoom) {
+     double y;
+     tileCoordinate(latLng, zoom, x, y);
+     const double dim = static_cast<double>(data->dim);
+-    return data->getElevation((x - id.x) * dim, (y - id.y) * dim);
++    return data->getElevationAtPoint((x - id.x) * dim, (y - id.y) * dim);
+ }
+ 
+ std::optional<double> TerrainTileManager::sampleElevation(const LatLng& latLng, uint8_t zoom, uint8_t fallbackZoom) {
+@@ -85,7 +85,7 @@ std::optional<double> TerrainTileManager::sampleElevation(const LatLng& latLng,
+             double y;
+             tileCoordinate(latLng, z, x, y);
+             const double dim = static_cast<double>(data->dim);
+-            return data->getElevation((x - id.x) * dim, (y - id.y) * dim);
++            return data->getElevationAtPoint((x - id.x) * dim, (y - id.y) * dim);
+         }
+         if (!isFailed(id)) {
+             stillLoading = true;
+diff --git a/test/geometry/dem_data.test.cpp b/test/geometry/dem_data.test.cpp
+index d8dab4178c7f..2f52c74265a9 100644
+--- a/test/geometry/dem_data.test.cpp
++++ b/test/geometry/dem_data.test.cpp
+@@ -179,3 +179,31 @@ TEST(DEMData, SharedEdgeIsContinuousAfterBackfill) {
+     // The border pixel is addressable below zero as well (used for edge slopes).
+     EXPECT_DOUBLE_EQ(demRight.getElevation(-1.0, 3.0), static_cast<double>(demRight.get(-1, 3)));
+ }
++
++// GL JS places DEM pixel i at tile coordinate (i + 0.5) / dim: sampling at the pixel centre returns the pixel's value, the
++// tile edges lie between two pixels, and the 1-pixel border is enough for the whole [0, dim] range.
++TEST(DEMData, ElevationAtPointUsesPixelCentres) {
++    PremultipliedImage image = fakeImage({16, 16});
++    DEMData demdata(image, Tileset::RasterEncoding::Mapbox);
++
++    for (int32_t x = 0; x < 16; x++) {
++        for (int32_t y = 0; y < 16; y++) {
++            EXPECT_DOUBLE_EQ(demdata.getElevationAtPoint(x + 0.5, y + 0.5), demdata.get(x, y));
++        }
++    }
++    // The tile edge (0) is halfway between the border pixel and pixel 0; the far edge between pixel dim-1 and the border.
++    EXPECT_DOUBLE_EQ(demdata.getElevationAtPoint(0.0, 3.5), 0.5 * (demdata.get(-1, 3) + demdata.get(0, 3)));
++    EXPECT_DOUBLE_EQ(demdata.getElevationAtPoint(16.0, 3.5), 0.5 * (demdata.get(15, 3) + demdata.get(16, 3)));
++}
++
++TEST(DEMData, ElevationAtPointSharedEdgeAgrees) {
++    PremultipliedImage left = fakeImage({8, 8});
++    PremultipliedImage right = fakeImage({8, 8});
++    DEMData demLeft(left, Tileset::RasterEncoding::Terrarium);
++    DEMData demRight(right, Tileset::RasterEncoding::Terrarium);
++    demLeft.backfillBorder(demRight, 1, 0);
++    demRight.backfillBorder(demLeft, -1, 0);
++    for (double y = 0.5; y <= 6.5; y += 0.5) {
++        EXPECT_DOUBLE_EQ(demLeft.getElevationAtPoint(8.0, y), demRight.getElevationAtPoint(0.0, y)) << "y=" << y;
++    }
++}
+diff --git a/test/renderer/terrain_tile_manager.test.cpp b/test/renderer/terrain_tile_manager.test.cpp
+index 609e1baa9c6e..c3a79ccf92e9 100644
+--- a/test/renderer/terrain_tile_manager.test.cpp
++++ b/test/renderer/terrain_tile_manager.test.cpp
+@@ -103,3 +103,25 @@ TEST(TerrainStitch, EdgeParameterAndInterpolation) {
+     EXPECT_DOUBLE_EQ(interpolateEdge(edge, 0.75), 20.0);
+     EXPECT_DOUBLE_EQ(interpolateEdge(edge, 1.0), 30.0);
+ }
++
++TEST(TerrainTileManager, GetElevationUsesDemPixelCentres) {
++    // Terrarium: elevation = R * 256 + G + B / 256 - 32768, so R = 128 and G = x gives a ramp with elevation == pixel x.
++    PremultipliedImage image({8, 8});
++    for (uint32_t y = 0; y < 8; ++y) {
++        for (uint32_t x = 0; x < 8; ++x) {
++            auto* pixel = image.data.get() + (y * 8 + x) * 4;
++            pixel[0] = 128;
++            pixel[1] = static_cast<uint8_t>(x);
++            pixel[2] = 0;
++            pixel[3] = 255;
++        }
++    }
++    auto dem = std::make_shared<DEMData>(image, Tileset::RasterEncoding::Terrarium);
++    TestTerrainTileManager manager(nullptr, Tileset{});
++    manager.injected = dem;
++
++    // GL JS places DEM pixel i at tile fraction (i + 0.5) / dim: a point at the centre of pixel 3 reads exactly 3.
++    const double fraction = (3.0 + 0.5) / 8.0;
++    const double lng = -180.0 + (2.0 + fraction) / 4.0 * 360.0; // tile x = 2 at zoom 2
++    EXPECT_NEAR(manager.getElevation({10.0, lng}, 2), 3.0, 1e-6);
++}
