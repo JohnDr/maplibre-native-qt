@@ -111,6 +111,10 @@ public:
     Q_INVOKABLE void setElevationHold(bool hold);
     // True while the map is drawn as a globe (globe projection at low zoom), false when Mercator.
     Q_INVOKABLE bool globeRendering() const;
+    // The map's own camera centre / zoom. The `coordinate` and `zoomLevel` properties hold what was last set through
+    // this item, so they are stale after an animation (flyTo / easeTo with a duration) and after a style load.
+    Q_INVOKABLE QVariantList liveCoordinate() const;
+    Q_INVOKABLE double liveZoom() const;
     Q_INVOKABLE bool setLocationAtPoint(double latitude, double longitude, const QPointF &pixel, double elevation);
     // {latitude, longitude} under a pixel on the plane \a elevation metres up (NaN: the centre plane); empty above
     // the horizon.

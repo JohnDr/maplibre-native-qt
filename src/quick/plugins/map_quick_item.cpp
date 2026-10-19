@@ -323,6 +323,22 @@ double MapQuickItem::terrainElevation(double latitude, double longitude) const {
     return elevation.isValid() ? elevation.toDouble() : std::numeric_limits<double>::quiet_NaN();
 }
 
+QVariantList MapQuickItem::liveCoordinate() const {
+    Q_D(const MapQuickItem);
+
+    if (d->m_map != nullptr && (d->m_syncState & CameraOptionsSync) == 0) {
+        const Coordinate coordinate = d->m_map->coordinate();
+        return {coordinate.first, coordinate.second};
+    }
+    return d->m_coordinate;
+}
+
+double MapQuickItem::liveZoom() const {
+    Q_D(const MapQuickItem);
+
+    return (d->m_map != nullptr && (d->m_syncState & CameraOptionsSync) == 0) ? d->m_map->zoom() : d->m_zoomLevel;
+}
+
 QVariantMap MapQuickItem::terrainPointAt(const QPointF &pixel) const {
     Q_D(const MapQuickItem);
 
