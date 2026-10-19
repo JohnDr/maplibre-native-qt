@@ -99,7 +99,7 @@ cd vendor/maplibre-native && ~/dev/tmp/build-maplibre-native-core-tests/mbgl-tes
 ```
 
 Qt-level test: `ctest` in each library tree (`QT_QPA_PLATFORM=xcb QSG_RENDER_LOOP=basic`).
-Status 2026-10-18 (patch 0055): all core unit tests pass on Vulkan (1110) and OpenGL (1145); the earlier "known failures" were fork regressions, now fixed. OpenGL tree: `~/dev/tmp/build-maplibre-native-core-tests-opengl` (`-DMLN_WITH_OPENGL=ON -DMLN_WITH_VULKAN=OFF`, needs `libgles-dev`). Run suites one at a time (fixed HTTP test port). Any change to shared `shaders/*.glsl` or shared UBOs must regenerate `include/mln/shaders/gl/*.hpp` and pass OpenGL too.
+Status 2026-10-19 (patches 0055, 0056; re-verified): all core unit tests pass on Vulkan (1110) and OpenGL (1145); the earlier "known failures" were fork regressions, now fixed. OpenGL tree: `~/dev/tmp/build-maplibre-native-core-tests-opengl` (`-DMLN_WITH_OPENGL=ON -DMLN_WITH_VULKAN=OFF`, needs `libgles-dev`). Run suites one at a time (fixed HTTP test port). Any change to shared `shaders/*.glsl` or shared UBOs must regenerate `include/mln/shaders/gl/*.hpp` and pass OpenGL too.
 
 Render tests (per group, because one process over all groups exhausts thread-local keys and aborts):
 `ninja -C ~/dev/tmp/build-maplibre-native-core-tests mbgl-render-test-runner`, then for each dir in
