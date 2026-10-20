@@ -14,11 +14,11 @@ index ea7cfd5dc957..95395b2b585c 100644
 -        // A drape tile's fingerprint is GL JS's `RTTFingerprint`: the style (layers, sources, images), and the source
 -        // tiles drawn into it with their data revision. It is re-rendered only when that changes, not on every
 -        // source tile load anywhere in the view.
-+        const TransformState& transformState = updateParameters->transformState;
-+        const double zoom = transformState.getZoom();
++        const TransformState& transform = updateParameters->transformState;
++        const double zoom = transform.getZoom();
 +        const bool zoomChanged = zoom != lastDrapeZoom;
 +        lastDrapeZoom = zoom;
-+        const bool moving = zoomChanged || transformState.isChanging();
++        const bool moving = zoomChanged || transform.isChanging();
 +
 +        // GL JS `RTTFingerprint` (rtt_fingerprint.ts): what a drape tile's texture was rendered from, compared in
 +        // order of severity: `zoom` (rendered at another zoom, so zoom-dependent style properties differ),

@@ -535,7 +535,7 @@ index 5361031d7482..bb911d2cd831 100644
 +    /// With terrain, how much finer the centre zoom handed to the tile-zoom function is than the map zoom:
 +    /// `log2(512 / tile size)` (GL JS `transform.zoom + scaleZoom(transform.tileSize / options.tileSize)`). Unset: the
 +    /// distance between the cover's zoom and the floor of the map zoom.
-+    std::optional<double> centerZoomShift;
++    std::optional<double> centerZoomShift{};
  };
  
  int32_t coveringZoomLevel(double z, style::SourceType type, uint16_t tileSize) noexcept;

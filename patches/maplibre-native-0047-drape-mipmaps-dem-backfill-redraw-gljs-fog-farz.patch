@@ -56,8 +56,8 @@ index 8f011d6c29e1..8693cb1d7089 100644
 -
 -    // Near plane: GL JS `cameraToSeaLevelDistance` of the fog matrix (mercator_transform.ts `_calcMatrices`).
 -    nearDistance = std::max(cameraToCenterDistance / 2.0, cameraToCenterDistance + z / std::cos(limitedPitch));
-+    const double pitch = getPitch();
-+    const double limitedPitch = util::clamp(pitch, 0.0, maxMercatorHorizonAngle);
++    const double pitchAngle = getPitch();
++    const double limitedPitch = util::clamp(pitchAngle, 0.0, maxMercatorHorizonAngle);
 +    const double pixelsPerMeter = 1.0 / Projection::getMetersPerPixelAtLatitude(getLatLng().latitude(), getZoom());
 +    const double elevation = getElevation();
 +
@@ -88,14 +88,14 @@ index 8f011d6c29e1..8693cb1d7089 100644
 +    const double lowestPlane = minElevation < 0 ? cameraToLowestPointDistance : cameraToSeaLevelDistance;
 +
 +    // Distance, along the view ray, from the centre to the top edge of the screen and to the horizon (law of sines).
-+    const double groundAngle = pi / 2.0 + pitch;
++    const double groundAngle = pi / 2.0 + pitchAngle;
 +    const double zfov = fov * (std::abs(std::cos(roll)) * size.height + std::abs(std::sin(roll)) * size.width) / size.height;
 +    const double fovAboveCenter = zfov * (0.5 + offset.y / size.height);
 +    const double topHalfSurfaceDistance = std::sin(fovAboveCenter) * lowestPlane /
 +                                          std::sin(util::clamp(pi - groundAngle - fovAboveCenter, 0.01, pi - 0.01));
 +
 +    // GL JS `getMercatorHorizon`: the horizon above the centre in pixels.
-+    const double horizon = cameraToCenterDistance * std::min(std::tan(pi / 2.0 - pitch) * 0.85, std::tan(maxMercatorHorizonAngle - pitch));
++    const double horizon = cameraToCenterDistance * std::min(std::tan(pi / 2.0 - pitchAngle) * 0.85, std::tan(maxMercatorHorizonAngle - pitchAngle));
 +    const double horizonAngle = std::atan(horizon / cameraToCenterDistance);
 +    const double minFovCenterToHorizon = pi / 2.0 - maxMercatorHorizonAngle;
 +    const double fovCenterToHorizon = horizonAngle > minFovCenterToHorizon ? 2.0 * horizonAngle * (0.5 + offset.y / (horizon * 2.0))

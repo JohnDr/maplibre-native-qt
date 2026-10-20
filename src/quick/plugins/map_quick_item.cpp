@@ -749,6 +749,8 @@ void MapQuickItemPrivate::applyTerrain() {
         }
     } catch (const std::exception &error) {
         qWarning("MapLibre terrain: %s", error.what());
+    } catch (...) {
+        qWarning("MapLibre terrain: unknown error");
     }
 }
 

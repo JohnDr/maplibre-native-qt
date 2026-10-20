@@ -176,7 +176,7 @@ index 000000000000..2b1a255ddbba
 +class AsyncRequest;
 +class DEMData;
 +class FileSource;
-+struct Response;
++class Response;
 +
 +/// Fetches and caches `raster-dem` tiles for the terrain, independent of any layer, and samples their elevation.
 +/// The terrain counterpart of GL JS's `TerrainTileManager`, with a terrain-owned tile set: a `raster-dem` source is
@@ -184,7 +184,7 @@ index 000000000000..2b1a255ddbba
 +class TerrainTileManager {
 +public:
 +    TerrainTileManager(FileSource* fileSource, Tileset tileset);
-+    ~TerrainTileManager();
++    virtual ~TerrainTileManager();
 +
 +    void setTileset(Tileset);
 +
