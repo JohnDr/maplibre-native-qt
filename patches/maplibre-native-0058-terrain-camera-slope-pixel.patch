@@ -1,0 +1,15 @@
+diff --git a/test/map/terrain_camera.test.cpp b/test/map/terrain_camera.test.cpp
+index c76c3cdc6958..7bcf6b471b00 100644
+--- a/test/map/terrain_camera.test.cpp
++++ b/test/map/terrain_camera.test.cpp
+@@ -189,7 +189,9 @@ TEST(TerrainCamera, RaycastSlopeHitLiesOnTerrainAndOnTheRay) {
+     const ElevationFn slope = [](const LatLng& ll) {
+         return std::optional<double>(0.25 * (ll.latitude() - 46.0) * kMetersPerDegree);
+     };
+-    const ScreenCoordinate pixel{400.0, 300.0};
++    // y=350 is ~120 m up the slope; y=300 sits exactly on the slope's sea-level crossing, where the
++    // hit elevation is 0 to within float error and its sign differs between platforms.
++    const ScreenCoordinate pixel{400.0, 350.0};
+     const auto hit = state.raycastTerrain(pixel, slope);
+     ASSERT_TRUE(hit.has_value());
+     EXPECT_NEAR(*slope(hit->latLng), hit->elevation, 1e-3);
