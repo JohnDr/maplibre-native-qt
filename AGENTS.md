@@ -4,13 +4,17 @@
 
 **Split of responsibility:**
 
-- **MapLibreEarth (the app) is built and run through Qt Creator, always.** Use the
-  Qt Creator MCP tools (`qt-creator_switch_build_config`, `qt-creator_build`,
-  `qt-creator_run_project` / `qt-creator_debug`). Never do ad-hoc command-line app
-  builds or invent alternate app build dirs.
+- **Windows: MapLibreEarth (the app) is built and run through Qt Creator, always.**
+  Use the Qt Creator MCP tools (`qt-creator_switch_build_config`,
+  `qt-creator_build`, `qt-creator_run_project` / `qt-creator_debug`). Never do
+  ad-hoc command-line app builds or invent alternate app build dirs.
+- **macOS / Linux: the Qt Creator MCP is not required.** Build and run the app
+  from the command line in that platform's canonical tree — see the MapLibreEarth
+  `AGENTS.md` and its `wiki/runbooks/build-macos.md` /
+  `wiki/runbooks/linux-terrain-test-and-debug.md`.
 - **This library (QMapLibre) and other dependencies are built from the command
-  line** into the canonical CMake trees below. Do **not** try to drive the library
-  through the Qt Creator MCP (only the app is on the MCP path).
+  line** into the canonical CMake trees below, on every platform. Do **not** try
+  to drive the library through the Qt Creator MCP.
 
 ## If you cannot follow an instruction — ask John
 
@@ -26,7 +30,7 @@ find yourself wanting to build or run the app outside Qt Creator (ad-hoc
 command-line app builds, launching the app exe directly, hand-copying runtime
 DLLs). In all such cases: ask first.
 
-## The handoff guarantee
+## The handoff guarantee — Windows
 
 When you hand the app back, John may run **either** Debug **or** Release. Both must
 already be on the latest code, because the app resolves its QMapLibre runtime and
@@ -47,7 +51,11 @@ Release plugin). So, after **any** library change:
 | Release | `C:\hda\dev\tmp\install\maplibre-native-qt` |
 | Debug   | `C:\hda\dev\tmp\install-maplibre-native-qt-debug` |
 
-## Canonical library build dirs (generator: NMake Makefiles JOM)
+On **macOS** there is no Debug/Release split: one `RelWithDebInfo` install
+(`~/dev/tmp/install-maplibre-native-qt-macos`) serves both app configurations.
+Refresh it once and rebuild the app.
+
+## Canonical library build dirs — Windows (generator: NMake Makefiles JOM)
 
 - Release: `C:\hda\dev\tmp\build-maplibre-native-qt-Desktop_Qt_6_12_0_MSVC2022_64bit-Release`
 - Debug:   `C:\hda\dev\tmp\build-maplibre-native-qt-Desktop_Qt_6_12_0_MSVC2022_64bit-Debug`
@@ -60,7 +68,21 @@ cmake --build   <Debug tree>
 cmake --install <Debug tree>   --config Debug   --prefix C:\hda\dev\tmp\install-maplibre-native-qt-debug
 ```
 
-## Sanity check before handoff
+## Canonical library build dirs — macOS (generator: Ninja)
+
+One `RelWithDebInfo` tree, Metal backend, arm64 on Apple Silicon (universal if you
+drop `-DCMAKE_OSX_ARCHITECTURES`):
+
+```bash
+export QT_ROOT_DIR="$HOME/Qt/6.12.0/macos"
+cmake --preset macOS -B "$HOME/dev/tmp/build-maplibre-native-qt-macos" \
+  -DCMAKE_INSTALL_PREFIX="$HOME/dev/tmp/install-maplibre-native-qt-macos" \
+  -DCMAKE_OSX_ARCHITECTURES=arm64
+cmake --build   "$HOME/dev/tmp/build-maplibre-native-qt-macos"
+cmake --install "$HOME/dev/tmp/build-maplibre-native-qt-macos"
+```
+
+## Sanity check before handoff — Windows
 
 - The install plugins must contain the expected API:
   `declarative_maplibre.dll` / `declarative_maplibred.dll` under
@@ -69,10 +91,14 @@ cmake --install <Debug tree>   --config Debug   --prefix C:\hda\dev\tmp\install-
 
 ## Forbidden build paths
 
-MinGW app builds, Ninja app builds, `build-pr1-opengl`, `build-QmlEarth-*`, example
-builds, and any other one-off trees. The only sanctioned dirs are the two library
-trees above, the app's Qt Creator dirs (in `MapLibreEarth/AGENTS.md`), and the
-Android trees listed in the wiki.
+**On Windows:** MinGW app builds, Ninja app builds, `build-pr1-opengl`,
+`build-QmlEarth-*`, example builds, and any other one-off trees. The only
+sanctioned dirs are the two library trees above, the app's Qt Creator dirs (in
+`MapLibreEarth/AGENTS.md`), and the Android trees listed in the wiki.
+
+**On macOS/Linux:** use the command-line library tree from the runbook
+(`build-maplibre-native-qt-macos`, `build-maplibre-native-qt-{Release,Debug}`) and
+the app tree named in the platform runbook; do not invent alternates.
 
 ## Where the app lives
 

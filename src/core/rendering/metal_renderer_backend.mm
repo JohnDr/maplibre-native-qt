@@ -231,7 +231,7 @@ MetalRendererBackend::~MetalRendererBackend() = default;
 
 void MetalRendererBackend::setSize(mln::Size size_) {
     // Propagate size to the Renderable base class
-    mln::gfx::Renderable::size = size_;
+    setRenderableSize(size_);
 
     getResource<QtMetalRenderableResource>().setBackendSize(size_);
 }
