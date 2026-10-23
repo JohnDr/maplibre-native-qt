@@ -99,7 +99,10 @@ Artifacts are **static** libraries (Qt for iOS is static here), not frameworks:
 `src/core/Release/libQMapLibre.a`, `src/quick/Release/libQMapLibreQuickPrivate.a`,
 `src/{location,widgets}/Release/libQMapLibre{Location,Widgets}.a`, and the QML module
 `src/quick/plugins/MapLibre/` (`libdeclarative_maplibre.a`, `qmldir`, `declarative_maplibre.qmltypes`).
-A device build would use `QT_ROOT_DIR="$HOME/Qt/6.12.0/ios_device"` (arm64 only as well).
+The **device** build uses `QT_ROOT_DIR="$HOME/Qt/6.12.0/ios_device"` (arm64 only as well), built
+2026-10-23: tree `~/dev/tmp/build-maplibre-native-qt-ios-device`, install prefix
+`~/dev/tmp/install-maplibre-native-qt-ios-device`. Qt 6.12's iOS libraries are built for **iOS 18.0**
+(`vtool` on a `QtCore` archive member), so both device and simulator artefacts need iOS 18+ at runtime.
 
 ## Sanity check before handoff — Windows
 
