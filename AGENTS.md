@@ -82,6 +82,25 @@ cmake --build   "$HOME/dev/tmp/build-maplibre-native-qt-macos"
 cmake --install "$HOME/dev/tmp/build-maplibre-native-qt-macos"
 ```
 
+## Canonical library build dir — iOS (simulator)
+
+`~/dev/tmp/build-maplibre-native-qt-ios-sim` — the first iOS tree, built 2026-10-23. Full notes:
+MapLibreEarth wiki, `wiki/runbooks/build-macos.md` → "iOS (simulator) library tree".
+
+```bash
+export QT_ROOT_DIR="$HOME/Qt/6.12.0/ios_simulator_arm64"
+cmake --preset iOS-ccache -B "$HOME/dev/tmp/build-maplibre-native-qt-ios-sim" \
+  -DCMAKE_OSX_ARCHITECTURES=arm64   # required: the Qt-installer iOS kits are single-arch, so the
+                                    # preset's arm64;x86_64 configures but fails at link
+cmake --build "$HOME/dev/tmp/build-maplibre-native-qt-ios-sim" --config Release
+```
+
+Artifacts are **static** libraries (Qt for iOS is static here), not frameworks:
+`src/core/Release/libQMapLibre.a`, `src/quick/Release/libQMapLibreQuickPrivate.a`,
+`src/{location,widgets}/Release/libQMapLibre{Location,Widgets}.a`, and the QML module
+`src/quick/plugins/MapLibre/` (`libdeclarative_maplibre.a`, `qmldir`, `declarative_maplibre.qmltypes`).
+A device build would use `QT_ROOT_DIR="$HOME/Qt/6.12.0/ios_device"` (arm64 only as well).
+
 ## Sanity check before handoff — Windows
 
 - The install plugins must contain the expected API:
@@ -98,7 +117,9 @@ sanctioned dirs are the two library trees above, the app's Qt Creator dirs (in
 
 **On macOS/Linux:** use the command-line library tree from the runbook
 (`build-maplibre-native-qt-macos`, `build-maplibre-native-qt-{Release,Debug}`) and
-the app tree named in the platform runbook; do not invent alternates.
+the app tree named in the platform runbook; do not invent alternates. The iOS
+simulator tree `~/dev/tmp/build-maplibre-native-qt-ios-sim` is canonical now too
+(see above).
 
 ## Where the app lives
 
